@@ -22,7 +22,7 @@ sysctl -w kernel.sched_migration_cost_ns=50000
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 
-MODEL_PATH=${MODEL_PATH:-/home/weight/GLM-5.2-W8A8C8-mxfp8}
+MODEL_PATH=${MODEL_PATH:-/home/weights/GLM-5.2-W8A8C8-mxfp8}
 # dummy 模式: 目录已含 config.json/tokenizer/量化配置(quantization_config)等除权重外的
 # 全部文件, 仅缺 .safetensors; 随机权重启动, 量化方式由 config.json 自动识别
 # 权重就绪后 LOAD_FORMAT=auto 切回真实加载
