@@ -361,6 +361,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        # Ascend DRAM dual-pool: wrap the allocator after the kv manager exists
+        # (the DRAM receive pool is allocated inside it). No-op otherwise.
+        self._maybe_install_dram_allocator()
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -381,6 +384,67 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
+
+    def _maybe_install_dram_allocator(self) -> None:
+        """Wrap the KV allocator for HBM+DRAM dual-pool receive (ascend only).
+
+        The wrapper replaces every reference to the bare allocator across the
+        scheduler/worker object graph so that all free() calls are split by
+        pool: globally encoded DRAM indices must never enter the inner
+        allocator state. The BFS also covers speculative (EAGLE/MTP) draft
+        workers, which share this same allocator for their KV indices.
+        """
+        dram_pool = getattr(self.kv_manager, "dram_pool", None)
+        if dram_pool is None:
+            return
+        from sglang.srt.disaggregation.ascend.allocator_wrapper import (
+            AscendDramFallbackAllocator,
+        )
+
+        inner = self.scheduler.token_to_kv_pool_allocator
+        wrapper = AscendDramFallbackAllocator(
+            inner, dram_pool, self.num_reserved_decode_tokens
+        )
+        # Bounded BFS over scheduler -> workers/model_runners/tree_cache:
+        # replace only references that are still the bare inner allocator.
+        import logging as _logging
+
+        _logger = _logging.getLogger(__name__)
+        replaced = []
+        visited = set()
+        frontier = [self.scheduler]
+        for _ in range(4):
+            next_frontier = []
+            for obj in frontier:
+                if id(obj) in visited:
+                    continue
+                visited.add(id(obj))
+                if getattr(obj, "token_to_kv_pool_allocator", None) is inner:
+                    obj.token_to_kv_pool_allocator = wrapper
+                    replaced.append(type(obj).__name__)
+                for attr in (
+                    "tp_worker",
+                    "worker",
+                    "target_worker",
+                    "draft_worker",
+                    "model_runner",
+                    "tree_cache",
+                ):
+                    child = getattr(obj, attr, None)
+                    if child is not None and id(child) not in visited:
+                        next_frontier.append(child)
+            frontier = next_frontier
+        self.token_to_kv_pool_allocator = wrapper
+        _logger.info(f"[DRAM] allocator wrapper installed on: {replaced}")
+
+    def _prealloc_available_size(self) -> int:
+        """Admission capacity for prealloc: dual-pool receive semantics
+        (HBM minus promote debt + DRAM capacity); identical to
+        available_size() for every non-DRAM backend."""
+        allocator = self.token_to_kv_pool_allocator
+        if hasattr(allocator, "available_size_for_prealloc"):
+            return allocator.available_size_for_prealloc()
+        return allocator.available_size()
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
@@ -1431,7 +1495,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 available_size += self.tree_cache.evictable_size()
         else:
-            available_size = self.token_to_kv_pool_allocator.available_size()
+            # Dual-pool receive capacity when the ascend DRAM pool is enabled,
+            # plain available_size() otherwise (radix cache is mutually
+            # exclusive with the DRAM pool, so the evict term never coexists).
+            available_size = self._prealloc_available_size()
             # Include evictable decode-radix cache entries in the budget -- they
             # can be freed on demand before allocation.
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
@@ -1638,7 +1705,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         assert kv_loc is not None, (
             f"KV cache is full! Bug in memory estimation. "
-            f"available={self.token_to_kv_pool_allocator.available_size()}, "
+            f"available={self._prealloc_available_size()}, "
             f"evictable={self.tree_cache.evictable_size()}, "
             f"protected={self.tree_cache.protected_size()}, "
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
@@ -2086,6 +2153,29 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
+                prealloc_queue = getattr(
+                    self.scheduler, "disagg_decode_prealloc_queue", None
+                )
+                mgr = getattr(prealloc_queue, "kv_manager", None)
+                if hasattr(mgr, "promote_dram_pages"):
+                    logger.info(
+                        f"[DRAM] promote hook fired: rid={decode_req.req.rid} "
+                        f"poll=Success"
+                    )
+                    # Ascend DRAM pool: lift DRAM-resident KV to HBM before the
+                    # request becomes schedulable (NPU attention reads HBM
+                    # only). On transient HBM shortage keep it queued until
+                    # the scheduler retracts running requests.
+                    if not mgr.promote_dram_pages(
+                        decode_req.req,
+                        self.scheduler.req_to_token_pool,
+                        self.scheduler.token_to_kv_pool,
+                        self.scheduler.token_to_kv_pool_allocator,
+                        draft_kv_pool=getattr(
+                            prealloc_queue, "draft_token_to_kv_pool", None
+                        ),
+                    ):
+                        continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption

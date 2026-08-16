@@ -13,6 +13,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _validate_decode_dram_pool(server_args: ServerArgs) -> None:
+    """Fail-loud checks for the ascend DRAM receive pool (see
+    disaggregation/ascend/dram_pool.py for the design)."""
+    size_gb = server_args.disaggregation_decode_dram_pool_size
+    if size_gb <= 0:
+        return
+    if server_args.disaggregation_transfer_backend != "ascend":
+        raise ValueError(
+            "--disaggregation-decode-dram-pool-size requires "
+            "--disaggregation-transfer-backend ascend, got "
+            f"{server_args.disaggregation_transfer_backend!r}."
+        )
+    if os.environ.get("ASCEND_MF_TRANSFER_PROTOCOL", "").lower() != "device_urma":
+        raise ValueError(
+            "--disaggregation-decode-dram-pool-size requires environment "
+            "ASCEND_MF_TRANSFER_PROTOCOL=device_urma (cross-node URMA; RDMA "
+            "cannot target the host-memory DRAM pool)."
+        )
+    if server_args.disaggregation_decode_enable_offload_kvcache:
+        raise ValueError(
+            "--disaggregation-decode-dram-pool-size is incompatible with "
+            "--disaggregation-decode-enable-offload-kvcache."
+        )
+    if server_args.disaggregation_decode_enable_radix_cache:
+        raise ValueError(
+            "--disaggregation-decode-dram-pool-size is incompatible with "
+            "--disaggregation-decode-enable-radix-cache (globally encoded "
+            "DRAM token indices break radix tree page semantics)."
+        )
+    if server_args.enable_hisparse:
+        raise ValueError(
+            "--disaggregation-decode-dram-pool-size is incompatible with "
+            "--enable-hisparse."
+        )
+
+
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
@@ -53,6 +89,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
     if server_args.disaggregation_mode == "decode":
+        _validate_decode_dram_pool(server_args)
         if server_args.disaggregation_decode_enable_radix_cache:
             if server_args.enable_hisparse:
                 raise ValueError(

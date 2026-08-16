@@ -5,7 +5,9 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import torch
 
+from sglang.srt.disaggregation.ascend.dram_pool import AscendDramPool
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
@@ -15,6 +17,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,47 @@ _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
 class AscendKVManager(MooncakeKVManager):
+    def __init__(self, args, disaggregation_mode, server_args, is_mla_backend=False):
+        # The DRAM receive pool must exist before super().__init__ because the
+        # base constructor registers all buffers to the transfer engine and
+        # pd_extension must be ready for the ZMQ registration.
+        self.dram_pool = self._maybe_create_dram_pool(args, disaggregation_mode, server_args)
+        if self.dram_pool is not None:
+            ptrs, lens, item_lens = self.dram_pool.get_contiguous_buf_infos()
+            # DRAM pool addresses ride the generic optional extension frame;
+            # token indices are globally encoded: [0, n_hbm) HBM, else DRAM.
+            args.pd_extension = {
+                "dram_kv_ptrs": ptrs,
+                "dram_item_lens": item_lens,
+                "n_hbm_tokens": self.dram_pool.n_hbm_tokens,
+            }
+            logger.info(
+                f"[DRAM] manager init: pool created, dram_layers={len(ptrs)} "
+                f"n_hbm_tokens={self.dram_pool.n_hbm_tokens} dram_tokens={self.dram_pool.size} "
+                f"base=0x{self.dram_pool.base:x} dva=0x{self.dram_pool.dva:x}"
+            )
+        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+
+    @staticmethod
+    def _maybe_create_dram_pool(args, disaggregation_mode, server_args):
+        size_gb = getattr(server_args, "disaggregation_decode_dram_pool_size", 0)
+        if size_gb <= 0 or disaggregation_mode != DisaggregationMode.DECODE:
+            return None
+        if not args.kv_item_lens or not args.kv_data_lens:
+            return None
+        # item_lens here already includes speculative draft layers (appended
+        # by _init_kv_manager), so the DRAM pool mirrors target+draft. Draft
+        # pools share the target pool's token indices, hence the boundary is
+        # derived from the first (target) layer only.
+        n_hbm_tokens = args.kv_data_lens[0] // args.kv_item_lens[0]
+        return AscendDramPool(
+            npu_id=args.gpu_id,
+            pool_size_gb=size_gb,
+            page_size=args.page_size,
+            item_lens=args.kv_item_lens,
+            n_hbm_tokens=n_hbm_tokens,
+        )
+
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (
             super()._requires_exact_state_index_match(st)
@@ -65,8 +109,23 @@ class AscendKVManager(MooncakeKVManager):
         ):
             ptrs.extend(component_ptrs)
             lens.extend(component_lens)
+        if self.dram_pool is not None:
+            # Host-memory registration automatically builds the device mapping
+            # (DVA) and URMA MR: once registered the pool is remotely writable.
+            dram_ptrs, dram_lens, _ = self.dram_pool.get_contiguous_buf_infos()
+            ptrs.extend(dram_ptrs)
+            lens.extend(dram_lens)
+            logger.info(
+                f"[DRAM] register: appended {len(dram_ptrs)} dram layers, "
+                f"first=0x{dram_ptrs[0]:x} len={dram_lens[0]}"
+            )
         if ptrs:
             self.engine.batch_register(ptrs, lens)
+
+    def deregister_buffer_to_engine(self):
+        super().deregister_buffer_to_engine()
+        if self.dram_pool is not None:
+            self.dram_pool.uninitialize()
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
@@ -100,6 +159,23 @@ class AscendKVManager(MooncakeKVManager):
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
+    def _get_dram_dst_info(self, mooncake_session_id: str):
+        """Decode-side DRAM pool (per-layer ptrs, global-encoding boundary).
+
+        Fetched from the registration table instead of a new send_kvcache
+        parameter, so the shared mooncake transfer_worker stays unchanged.
+        """
+        info = self.decode_kv_args_table.get(mooncake_session_id)
+        ext = getattr(info, "pd_extension", None) if info is not None else None
+        if not ext:
+            logger.info(f"[DRAM] send_kvcache: no pd_extension for session {mooncake_session_id}")
+            return None, None
+        logger.info(
+            f"[DRAM] send_kvcache: ext found, dram_layers={len(ext['dram_kv_ptrs'])} "
+            f"n_hbm_tokens={ext['n_hbm_tokens']} session={mooncake_session_id}"
+        )
+        return ext["dram_kv_ptrs"], ext["n_hbm_tokens"]
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -120,6 +196,7 @@ class AscendKVManager(MooncakeKVManager):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
+        dram_dst_ptrs, n_hbm = self._get_dram_dst_info(mooncake_session_id)
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
@@ -130,11 +207,17 @@ class AscendKVManager(MooncakeKVManager):
                 src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
                     self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
                 )
+                sliced_dram_ptrs = (
+                    self.get_mla_kv_ptrs_with_pp(None, dram_dst_ptrs)[1]
+                    if dram_dst_ptrs
+                    else [None] * layers_current_pp_stage
+                )
                 layers_params = [
                     (
                         src_kv_ptrs[layer_id],
                         sliced_dst_kv_ptrs[layer_id],
                         self.kv_args.kv_item_lens[layer_id],
+                        sliced_dram_ptrs[layer_id],
                     )
                     for layer_id in range(layers_current_pp_stage)
                 ]
@@ -146,12 +229,19 @@ class AscendKVManager(MooncakeKVManager):
                     dst_v_ptrs,
                     layers_current_pp_stage,
                 ) = self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                if dram_dst_ptrs:
+                    _, _, dram_k_ptrs, dram_v_ptrs, _ = self.get_mha_kv_ptrs_with_pp(
+                        None, dram_dst_ptrs
+                    )
+                else:
+                    dram_k_ptrs = dram_v_ptrs = [None] * layers_current_pp_stage
 
                 layers_params = [
                     (
                         src_k_ptrs[layer_id],
                         dst_k_ptrs[layer_id],
                         self.kv_args.kv_item_lens[layer_id],
+                        dram_k_ptrs[layer_id],
                     )
                     for layer_id in range(layers_current_pp_stage)
                 ] + [
@@ -159,6 +249,7 @@ class AscendKVManager(MooncakeKVManager):
                         src_v_ptrs[layer_id],
                         dst_v_ptrs[layer_id],
                         self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id],
+                        dram_v_ptrs[layer_id],
                     )
                     for layer_id in range(layers_current_pp_stage)
                 ]
@@ -169,31 +260,70 @@ class AscendKVManager(MooncakeKVManager):
                     self.kv_args.kv_data_ptrs[layer_id],
                     dst_kv_ptrs[layer_id],
                     self.kv_args.kv_item_lens[layer_id],
+                    dram_dst_ptrs[layer_id] if dram_dst_ptrs else None,
                 )
                 for layer_id in range(num_layers)
             ]
 
         def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, item_len: int
+            src_ptr: int, dst_ptr: int, item_len: int, dram_ptr: Optional[int]
         ) -> List[Tuple[int, int, int]]:
+            # dst_kv_indices are globally encoded: [0, n_hbm) addresses the
+            # HBM pool via dst_ptr, [n_hbm, ...) the DRAM pool via dram_ptr.
+            # A contiguous block may straddle the boundary and is split so
+            # every emitted block uses exactly one base pointer.
             transfer_blocks = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
+                first, last = int(decode_index[0]), int(decode_index[-1])
+                if dram_ptr is None or first < n_hbm == (last < n_hbm):
+                    base, off = (dst_ptr, 0) if first < n_hbm else (dram_ptr, n_hbm)
+                    if first >= n_hbm:
+                        logger.info(
+                            f"[DRAM] xfer block: DRAM dst=0x{base + (first - off) * item_len:x} "
+                            f"len={item_len * len(prefill_index)} idx=[{first}..{last}]"
+                        )
+                    transfer_blocks.append(
+                        (
+                            src_ptr + int(prefill_index[0]) * item_len,
+                            base + (first - off) * item_len,
+                            item_len * len(prefill_index),
+                        )
+                    )
+                    continue
+                mid = int(np.searchsorted(decode_index, n_hbm))
+                logger.info(
+                    f"[DRAM] xfer block split at n_hbm={n_hbm}: "
+                    f"hbm_part={mid} dram_part={len(prefill_index) - mid} idx=[{first}..{last}]"
+                )
+                transfer_blocks.append(
+                    (
+                        src_ptr + int(prefill_index[0]) * item_len,
+                        dst_ptr + first * item_len,
+                        item_len * mid,
+                    )
+                )
+                d1 = int(decode_index[mid])
+                transfer_blocks.append(
+                    (
+                        src_ptr + int(prefill_index[mid]) * item_len,
+                        dram_ptr + (d1 - n_hbm) * item_len,
+                        item_len * (len(prefill_index) - mid),
+                    )
+                )
             return transfer_blocks
 
         # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
+        def process_layer(src_ptr: int, dst_ptr: int, item_len: int, dram_ptr) -> int:
+            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len, dram_ptr)
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
+        def process_layers(layers_params: List[Tuple[int, int, int, Optional[int]]]) -> int:
             transfer_blocks = []
-            for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+            for src_ptr, dst_ptr, item_len, dram_ptr in layers_params:
+                transfer_blocks.extend(
+                    set_transfer_blocks(src_ptr, dst_ptr, item_len, dram_ptr)
+                )
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
@@ -203,8 +333,9 @@ class AscendKVManager(MooncakeKVManager):
                     src_ptr,
                     dst_ptr,
                     item_len,
+                    dram_ptr,
                 )
-                for (src_ptr, dst_ptr, item_len) in layers_params
+                for (src_ptr, dst_ptr, item_len, dram_ptr) in layers_params
             ]
             for future in concurrent.futures.as_completed(futures):
                 status = future.result()
@@ -218,6 +349,90 @@ class AscendKVManager(MooncakeKVManager):
             return process_layers(layers_params)
 
         return 0
+
+    @staticmethod
+    def _co_segments(a, b):
+        """Cut aligned index arrays into segments contiguous in both, so each
+        (src, dst) pair of a promote entry is addressable by one base+len."""
+        cuts = [0]
+        for i in range(1, len(a)):
+            if a[i] != a[i - 1] + 1 or b[i] != b[i - 1] + 1:
+                cuts.append(i)
+        cuts.append(len(a))
+        return [(cuts[k], cuts[k + 1] - cuts[k]) for k in range(len(cuts) - 1)]
+
+    def promote_dram_pages(
+        self, req, req_to_token_pool, hbm_kv_pool, allocator, draft_kv_pool=None
+    ) -> bool:
+        """Synchronously lift a request's DRAM-resident KV pages back to HBM
+        (offload sparse_copy AIV kernel, DVA -> HBM), rewiring req_to_token.
+
+        Called at transfer-commit time, before the request becomes schedulable
+        (NPU attention reads HBM only). Returns False when HBM is temporarily
+        short: the caller keeps the request in the transfer queue and retries
+        after the scheduler retracts running requests.
+
+        Speculative decoding (EAGLE/MTP): draft layers share the target pool's
+        token indices, so they are mirrored in the same DRAM pool and must be
+        promoted together with the target layers.
+        """
+        if self.dram_pool is None:
+            return True
+        n_hbm = self.dram_pool.n_hbm_tokens
+        length = getattr(req, "kv_committed_len", 0)
+        if length <= 0:
+            return True
+        row = req_to_token_pool.req_to_token[req.req_pool_idx][:length]
+        dram_mask = row >= n_hbm
+        num = int(dram_mask.sum().item())
+        if num == 0:
+            return True
+        import time as _time
+
+        t0 = _time.time()
+        hbm_loc = allocator.alloc_hbm(num)  # force-HBM, bypasses the watermark
+        if hbm_loc is None:
+            logger.info(
+                f"promote deferred (HBM short): rid={req.rid}, dram_tokens={num}"
+            )
+            return False
+        dram_tokens = row[dram_mask].clone()
+        dram_np = dram_tokens.cpu().numpy()
+        hbm_np = hbm_loc.cpu().numpy()
+        hbm_ptrs, _, item_lens = hbm_kv_pool.get_contiguous_buf_infos()
+        num_target_layers = len(hbm_ptrs)
+        if draft_kv_pool is not None:
+            # Draft layers are appended after the target layers, matching the
+            # registration order (and the DRAM pool layout) in _init_kv_manager.
+            draft_ptrs, _, draft_item_lens = draft_kv_pool.get_contiguous_buf_infos()
+            hbm_ptrs = list(hbm_ptrs) + list(draft_ptrs)
+            item_lens = list(item_lens) + list(draft_item_lens)
+        logger.info(
+            f"[DRAM] promote start: rid={req.rid} dram_tokens={num} "
+            f"target_layers={num_target_layers} total_layers={len(item_lens)} "
+            f"dram_idx=[{int(dram_np[0])}..{int(dram_np[-1])}] "
+            f"hbm_idx=[{int(hbm_np[0])}..{int(hbm_np[-1])}]"
+        )
+        entries = []
+        for start, cnt in self._co_segments(dram_np, hbm_np):
+            for layer_id, item_len in enumerate(item_lens):
+                src = self.dram_pool.layer_src_dva(layer_id, int(dram_np[start]) - n_hbm)
+                dst = hbm_ptrs[layer_id] + int(hbm_np[start]) * item_len
+                entries.append((src, dst, cnt * item_len))
+        ret = self.dram_pool.promote(entries, self.kv_args.gpu_id)
+        if ret != 0:
+            allocator.free(hbm_loc)
+            return False
+        # The AIV copy must land before the DRAM pages are recycled, otherwise
+        # a newly-allocated transfer could race with the in-flight copy.
+        torch.npu.synchronize()
+        row[dram_mask] = hbm_loc.to(row.device)
+        self.dram_pool.free_tokens(dram_tokens)
+        logger.info(
+            f"[DRAM] promote done: rid={req.rid} tokens={num} entries={len(entries)} "
+            f"elapsed={(_time.time() - t0) * 1e3:.1f}ms"
+        )
+        return True
 
     def _is_generic_kvcache_state_type(self, st) -> bool:
         # DSV4 per-pool components also use the page-indexed send path.

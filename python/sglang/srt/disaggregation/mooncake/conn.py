@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
@@ -145,6 +146,9 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    # Generic optional per-backend payload appended as the final ZMQ frame
+    # (e.g. the ascend DRAM pool addresses). None for all existing backends.
+    pd_extension: Optional[dict] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -189,7 +193,20 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
+            # Optional trailing extension frame: old senders never emit it and
+            # old receivers read fixed frame indices, so both stay compatible.
+            pd_extension=(
+                json.loads(msg[18].decode("utf-8"))
+                if len(msg) > 18 and msg[18] != b""
+                else None
+            ),
         )
+        # Debug-only: ascend DRAM pool tracing; silent for every other backend.
+        if len(msg) > 18 and msg[18] != b"":
+            logger.info(
+                f"[DRAM] register_kv_args: received pd_extension from "
+                f"{msg[3].decode('ascii')}"
+            )
 
 
 class MooncakeKVManager(CommonKVManager):
@@ -2413,6 +2430,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
             else:
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
+            # Generic optional per-backend payload, always emitted as the final
+            # frame (empty when unused) so the frame count stays stable.
+            pd_extension = getattr(self.kv_mgr.kv_args, "pd_extension", None)
+            pd_extension_frame = (
+                json.dumps(pd_extension).encode("utf-8") if pd_extension else b""
+            )
+            if pd_extension:
+                logger.info(
+                    f"[DRAM] register_kv_args: sending pd_extension "
+                    f"keys={sorted(pd_extension.keys())} session={self.session_id}"
+                )
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             try:
@@ -2437,6 +2465,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            pd_extension_frame,
                         ]
                     )
             except zmq.ZMQError:

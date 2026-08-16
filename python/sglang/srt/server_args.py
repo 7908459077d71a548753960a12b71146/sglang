@@ -3093,6 +3093,11 @@ class ServerArgs:
         "Enable async KV cache offloading on decode server (PD mode).",
         NS("disagg"),
     ] = False
+    disaggregation_decode_dram_pool_size: A[
+        int,
+        "Decode-side DRAM receive pool size in GB (PD mode, ascend backend). Prefill writes KV cache directly into this memfabric offload pool over DEVICE_URMA when HBM is short; pages are promoted back to HBM (AIV sparse_copy) at transfer commit. 0 disables.",
+        NS("disagg"),
+    ] = 0
     num_reserved_decode_tokens: A[
         int,
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",

@@ -84,6 +84,9 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Generic optional per-backend payload shipped via the trailing ZMQ
+    # registration frame (ascend DRAM pool uses it); None for other backends.
+    pd_extension: Optional[dict] = None
 
 
 class KVPoll:
