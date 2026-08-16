@@ -62,7 +62,7 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 
 export HCCL_OP_EXPANSION_MODE=AIV
 
-export PYTHONPATH=/home/zkk/sglang/python:$PYTHONPATH
+export PYTHONPATH=`pwd`/python:$PYTHONPATH
 
 # --------------------- PD 拓扑: P 单机 8 卡 + D 单机 8 卡 ---------------------
 P_IP=('141.61.50.31')
