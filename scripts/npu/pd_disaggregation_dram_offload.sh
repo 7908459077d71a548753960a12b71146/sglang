@@ -49,8 +49,6 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export HCCL_SOCKET_IFNAME=enp196s0f0
-export GLOO_SOCKET_IFNAME=enp196s0f0
 export STREAMS_PER_DEVICE=32
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
@@ -79,6 +77,22 @@ LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
+
+# HCCL/Gloo 网口: 默认自动探测持有 P/D IP 的网卡; 探测不对可手动指定 SOCKET_IFNAME=xxx
+if [[ -z "${SOCKET_IFNAME:-}" ]]; then
+    for ip in "${P_IP[@]}" "${D_IP[@]}";
+    do
+        IF=$(ip -o addr | awk -v ip="$ip" '$4==ip"/" {print $2; exit}')
+        if [[ -n "$IF" ]]; then SOCKET_IFNAME=$IF; break; fi
+    done
+fi
+if [[ -n "$SOCKET_IFNAME" ]]; then
+    export HCCL_SOCKET_IFNAME=$SOCKET_IFNAME
+    export GLOO_SOCKET_IFNAME=$SOCKET_IFNAME
+    echo "HCCL/GLOO socket ifname -> ${SOCKET_IFNAME}"
+else
+    echo "WARN: no NIC holding P/D IP found, HCCL/GLOO_SOCKET_IFNAME not set" >&2
+fi
 
 for i in "${!P_IP[@]}";
 do
