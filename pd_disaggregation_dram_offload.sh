@@ -23,21 +23,8 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 
 MODEL_PATH=${MODEL_PATH:-/home/weights/GLM-5.2-W8A8C8-mxfp8}
-# dummy 模式: 目录已含 config.json/tokenizer/量化配置(quantization_config)等除权重外的
-# 全部文件, 仅缺 .safetensors; 随机权重启动, 量化方式由 config.json 自动识别
-# 权重就绪后 LOAD_FORMAT=auto 切回真实加载
-LOAD_FORMAT=${LOAD_FORMAT:-dummy}
 DRAM_POOL_GB=${DRAM_POOL_GB:-64}          # Decode DRAM 接收池大小 (GB)
 MEM_FRACTION=${MEM_FRACTION:-0.78}       # 压小可提前触发 KV 落 DRAM
-
-if [[ "$LOAD_FORMAT" == "dummy" ]]; then
-    # dummy 不支持 --model-loader-extra-config（loader.py 直接 raise）; 量化方式由 config.json 自动识别
-    LOADER_ARGS=(--load-format dummy)
-    QUANT_ARGS=()
-else
-    LOADER_ARGS=(--model-loader-extra-config '{"enable_multithread_load": true}')
-    QUANT_ARGS=(--quantization modelslim)
-fi
 
 unset https_proxy
 unset http_proxy
@@ -101,7 +88,7 @@ do
         echo "Prefill -> ${P_IP[$i]}"
 
         sglang serve \
-            ${LOADER_ARGS[@]} \
+            --model-loader-extra-config '{"enable_multithread_load": true}' \
             --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
             --disaggregation-bootstrap-port $((8998+$i)) \
             --model-path $MODEL_PATH \
@@ -109,7 +96,7 @@ do
             --trust-remote-code \
             --attention-backend ascend \
             --device npu \
-            ${QUANT_ARGS[@]} \
+            --quantization modelslim \
             --dtype bfloat16 \
             --tp-size 8 \
             --mem-fraction-static $MEM_FRACTION \
@@ -135,14 +122,14 @@ do
         export HCCL_BUFFSIZE=2000
 
         sglang serve \
-            ${LOADER_ARGS[@]} \
+            --model-loader-extra-config '{"enable_multithread_load": true}' \
             --disaggregation-mode decode --disaggregation-transfer-backend ascend \
             --model-path $MODEL_PATH \
             --tokenizer-path $MODEL_PATH \
             --trust-remote-code \
             --attention-backend ascend \
             --device npu \
-            ${QUANT_ARGS[@]} \
+            --quantization modelslim \
             --dtype bfloat16 \
             --tp-size 8 \
             --mem-fraction-static $MEM_FRACTION \
