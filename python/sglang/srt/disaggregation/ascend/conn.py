@@ -413,12 +413,20 @@ class AscendKVManager(MooncakeKVManager):
         import time as _time
 
         t0 = _time.time()
-        hbm_loc = allocator.alloc_hbm(num)  # force-HBM, bypasses the watermark
-        if hbm_loc is None:
+        # HBM allocation is page-granular: the paged allocator floors a
+        # sub-page request to zero pages and returns an EMPTY tensor (not
+        # None), which would slip past the None guard. Round up to whole
+        # pages and slice; the page tail is recovered page-granularly at
+        # request free time (free() uniquifies by page).
+        page_size = int(getattr(allocator, "page_size", 1) or 1)
+        alloc_tokens = ((num + page_size - 1) // page_size) * page_size
+        hbm_loc = allocator.alloc_hbm(alloc_tokens)  # force-HBM, bypasses the watermark
+        if hbm_loc is None or hbm_loc.numel() < num:
             logger.info(
-                f"promote deferred (HBM short): rid={req.rid}, dram_tokens={num}"
+                f"[DRAM] promote deferred (HBM short): rid={req.rid}, dram_tokens={num}"
             )
             return False
+        hbm_loc = hbm_loc[:num]
         dram_tokens = row[dram_mask].clone()
         dram_np = dram_tokens.cpu().numpy()
         hbm_np = hbm_loc.cpu().numpy()
