@@ -409,6 +409,7 @@ NIXL/Mori 后端因不经过被修改的 Mooncake 层，完全不受影响。
 | M2 | `HalMemExport ... ret: 8` → `RegisterMemory failed ret: 12/c`，注册失败 | `expandable_segments:True` 下 VMM 分配的小 KV 层被 batch_register 合并成大 slice，物理不连续 → HalMemExport 失败 | 失败时 **ExportInner 降级**为仅本地注册（保留 MR/VA，URMA 传输不受影响；fabric 句柄交换路径不再必需） |
 | M3 | `Export: Assert pos != slices_.end, input slice(idx:0) not exist` → `ExportSliceExchangeInfo failed: -2` | 合并 slice 后按原 idx 查找失败 | Export(slice) 失败回退 legacy 空名字格式 |
 | M4 | sparse_copy 拼包路径 507035 向量核错误（同 B6） | 多条目单次队列下发异常 | 逐条目独立队列往返 |
+| M5 | P→D DRAM 直写失败：`BatchCopyByAutoGroup failed to auto infer copy direction, dest=0x1c000`（HBM-only 健康探测正常，落 DRAM 的请求必现） | smem 写路径 dst 必须经 remoteSlices_ 映射（TransformAddr）：`mapped = slice对端地址 + slice内偏移`。DRAM host slice 走空 name 降级导出，对端 ImportSliceInfo 硬编码 `address=nullptr` → 映射塌缩为纯偏移（0x1c000=114688）→ 地址分类失败；且 TransformAddr 用 `lower_bound`（首个 key≥dst）在 dst 落 slice 内部时命中下一个 slice，仅靠全局地址连续同构侥幸 | ① 导出侧（vmm Export host/降级路径）`info.address` 改填 **DVA**（HalHostRegister 建立、本端 promote 同源）；② ImportSliceInfo 空 name 分支用该 DVA 作 `vAddress_`（不再 nullptr）；③ legacy Import 对 host slice 返回 vAddress_(DVA) 作对端映射地址；④ TransformAddr 改 `prev(upper_bound)` 包含式查找 |
 
 ### O 系列：运维/环境经验
 
