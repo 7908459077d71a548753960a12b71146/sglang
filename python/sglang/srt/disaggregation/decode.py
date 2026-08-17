@@ -2169,7 +2169,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     if not mgr.promote_dram_pages(
                         decode_req.req,
                         self.scheduler.req_to_token_pool,
-                        self.scheduler.token_to_kv_pool,
+                        prealloc_queue.token_to_kv_pool,
                         self.scheduler.token_to_kv_pool_allocator,
                         draft_kv_pool=getattr(
                             prealloc_queue, "draft_token_to_kv_pool", None

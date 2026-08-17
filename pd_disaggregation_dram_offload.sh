@@ -59,7 +59,7 @@ D_IP=('141.61.49.195')
 # 跨机 URMA 传输 + DRAM 池远端直写（P/D 两侧均需, 仅 A5 支持）
 export ASCEND_MF_TRANSFER_PROTOCOL=device_urma
 # session store, P/D 两侧均可达（挂在 Prefill 节点）
-export ASCEND_MF_STORE_URL="tcp://141.61.50.31:24669"
+export MF_CONFIG_STORE_URL="tcp://141.61.50.31:24669"
 # offload 组件依赖库（如已装到默认路径可不设）
 # export MEMFABRIC_HYBRID_EXTEND_LIB_PATH=/path/to/libmf_hybm_accoffload.so
 
