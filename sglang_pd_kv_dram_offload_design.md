@@ -4,6 +4,10 @@
 > 目标地址支持 **HBM 地址 + DRAM 地址** 两类；Decode 启动/注册时把 HBM+DRAM 两类地址
 > 都传输给 Prefill；Decode 节点的 KV cache 管理（页分配/释放/提升）兼容 HBM+DRAM 双池。
 > 全部基于 memfabric（smem_trans DEVICE_URMA + offload URMA_POOL + sparse_copy）实现。
+>
+> **修订（2026-08-18）**：按联调实测修正全局编码为**页本位**（D3/M2/M4/M5 重写，
+> 修正 §9-B7 页/token 单位混用）；补充 memfabric 侧联调修复（§8）；新增 §9 联调问题
+> 与修复记录（B/M/O 三系列）。
 
 ---
 
@@ -84,12 +88,12 @@ send_kvcache:                                    pop_preallocated:
 |---|---|---|
 | D1 DRAM 分配方 | sglang Decode 侧调用 memfabric `offload` 组件 | release/1.2 起 smem_trans 无分配接口；offload URMA_POOL 池天然 device 可见（AIV 可直读 DVA） |
 | D2 DRAM 页定位 | "**接收期临时落点**"：DRAM 页仅在传输窗口存在，commit 时同步 promote 回 HBM | NPU attention 无 DRAM 直读能力（G6/hisparse fail-loud）；同步 promote 语义简单、正确性易验证；异步化留作后续优化 |
-| D3 页归属表达 | **全局页号编码**：`dst_kv_indices` 中 `[0,N_hbm)` 为 HBM 页、`[N_hbm,N_tot)` 为 DRAM 页 | 复用现有 `send_metadata`/`TransferInfo`/`group_concurrent_contiguous` 全链路，ZMQ 每请求消息结构零改动；仅在寻址处分流 |
-| D4 DRAM 池布局 | 与 HBM KV 池**同构镜像**（per-layer 连续，item_len 一致） | Prefill 侧寻址公式 `base + idx*item_len` 两池统一；MLA `kv_buf_groups` 多 buffer 组同样按组镜像 |
+| D3 页归属表达【实测修正】 | **全局页号编码（页本位）**。关键单位约定（调试踩坑确认，详见 §9）：NPU 分页池为页主序布局 `(layer, size//page+1, page_size, ...)`，`kv_item_lens` 是**每页字节数**（非每 token）；PD 传输链路全程**页索引**（`kv_to_page_indices`）。因此 `n_hbm_tokens = kv_data_lens[0]//kv_item_lens[0]` 是 HBM **页数**（如 103 可分配页+1 备用页=104，对应 allocator token 空间 13184=103×128）。DRAM 页在 `req_to_token` 中以**合成 token** 表达：`token=(n_hbm+local_page)*page_size+intra_page`（≥n_hbm×page_size，落在 allocator 真实 token 空间之外，不与活跃 HBM token 冲突；P 侧 `token//page_size` 即还原全局页号） | 复用现有 `send_metadata`/`TransferInfo`/`group_concurrent_contiguous` 全链路，ZMQ 每请求消息结构零改动；仅在寻址处分流。**严禁把 token 数当页数用**（曾致 MTE errcode 95/507035 越界写，§9 B7） |
+| D4 DRAM 池布局 | 与 HBM KV 池**同构镜像**（per-layer 连续；item_len=每页字节，段长=页数×每页字节） | Prefill 侧寻址公式 `base + global_page*item_len` 两池统一；MLA `kv_buf_groups` 多 buffer 组同样按组镜像 |
 | D5 aux/state 落点 | 首版**仍走 HBM**（不落 DRAM） | aux（首 token 元数据）与 state 池很小，DRAM 化收益低、改动面大 |
 | D6 与 hicache 关系 | 首版与 `--disaggregation-decode-enable-offload-kvcache` **互斥**（fail-loud） | 两者都管理 decode 侧 KV 与 host 内存的交互，叠加语义未定义；后续再评估组合 |
 | D7 DRAM 池容量配置【已确认】 | 按 **GB 绝对值**配置（`--disaggregation-decode-dram-pool-size`，默认 0=禁用）；初始化完成即打印换算结果：`GB 数 → 页数 → 可容纳 token 数` | 直传 offload reserve/alloc（本身 GB 对齐）无换算损失；DRAM 为共享资源（OS/其他进程），绝对值便于整机规划与 fail-loud 校验；打印换算弥补"能缓多少请求"语义不直观的短板。跨模型压测迁移需求出现时再考虑 ratio 别名（先例：hicache_ratio/hicache_size 双参数并存） |
-| D8 接收落池策略【已确认】 | **自动水位，零新增参数**：`可直写预算 = HBM空闲页 − pending_promote_pages − num_reserved_decode_tokens//page_size`（后两者均为运行时已知量/已有参数）；`落 HBM 页数 = min(缺口, max(0, 预算))` | 水位本质是"HBM 剩余先还 promote 债 + 留给 running 增长"，可完全派生，无需用户调参；效果自适应三段：轻载全落 HBM（单跳）、满负荷自动全落 DRAM（HBM 完全留给 running/提升，接收不与之竞争）、中间按预算部分落 |
+| D8 接收落池策略【已确认】 | **自动水位，零新增参数**（token 单位）：`预算(tokens) = inner.available_size() − dram_pool.allocated_tokens() − num_reserved_decode_tokens`；`预算 ≥ 需求 → 全落 HBM`；`预算 < 需求 → 整请求落 DRAM`；DRAM 也满 → 回退 HBM 原语义（排队/预分配失败如常） | 水位本质是"HBM 剩余先还 promote 债 + 留给 running 增长"，可完全派生，无需用户调参；整请求落 DRAM 避免 HBM/DRAM 混排请求的 promote 碎片化 |
 | D9 侵入性边界【已确认】 | **公共文件只加"默认关闭时零行为变化"的通用机制与 no-op 钩子；DRAM 全部逻辑收拢在 `disaggregation/ascend/` 内**（新文件 + 子类覆盖 + allocator wrapper 组合，不复制公共代码） | DRAM 是 ascend/memfabric 专属能力，不应焊进跨后端共享的 `mooncake/conn.py`/`decode.py` 核心路径；隔离保证：`dram_pool_size=0`（默认）时所有后端、所有路径与现状行为完全一致 |
 | D10 投机推理（EAGLE/MTP）适配【已确认】 | **draft 层随主池一并 DRAM 化**：draft 层 ptrs 在 `_init_kv_manager` 中 append 于主池之后且**共享同一 token 索引与同一 allocator**（eagle_worker_v2 `alloc_memory_pool` 证实），故 ①DRAM 池布局天然含 draft 层（item_lens 全量镜像）；②promote 时 draft 层与主池层一起提升；③allocator wrapper 通过**有界 BFS** 替换 scheduler→target/draft worker→model_runner 全链引用，draft 侧 free 同样分流 | 共享索引使 draft 层与主池层在传输寻址、全局编码、提升上完全同构，无需独立 DRAM 池；draft 用裸 allocator free 会把 DRAM 编码索引污染进 draft 池 free list，必须全链替换 |
 
@@ -115,27 +119,33 @@ D9 公共文件零 DRAM 专属逻辑（低侵入原则）；D10 支持投机推�
 
 **新文件**：`python/sglang/srt/disaggregation/ascend/dram_pool.py`
 
-职责与接口（仿照 examples/trans_offload 的用法）：
+职责与接口（最终实现，**页本位**，见 D3 单位约定）：
 
 ```python
 class AscendDramPool:
-    def __init__(self, npu_id, num_pages, page_size, layer_layout):
-        # layer_layout 来自 HBM 池 get_contiguous_buf_infos() 的 (ptrs, lens, item_lens)
-        # 池总大小 = sum(lens) 向上对齐 GB(offload reserve/alloc 强制 GB 对齐)
-        # offload.initialize(URMA_POOL) + offload.malloc
-    def get_contiguous_buf_infos(self) -> (ptrs, lens, item_lens):  # per-layer HVA, 与 HBM 池同构
-    def get_dva(self) -> int                    # offload.get_dva(base), promote 源基址
-    def alloc_pages(self, n) -> Tensor[int64]   # 全局页号 [N_hbm, N_tot), free-list 管理
-    def free_pages(self, global_pages)          # 归还(仅接受 DRAM 段页号)
-    def num_free_pages(self) -> int
-    def addr_of(self, layer_id, global_page) -> (hva, offset)  # 寻址换算
-    def uninitialize(self)                      # offload.free + offload.uninitialize
+    def __init__(self, npu_id, pool_size_gb, page_size, item_lens, n_hbm_tokens):
+        # item_lens = HBM 池 get_contiguous_buf_infos() 的每页字节（页主序布局）
+        # self.size = 池页数 = GB*2^30 // sum(item_lens)   # 页数, 非token数!
+        # offload.initialize(URMA_POOL, Scene.LOCAL) + offload.malloc(size*sum(item_lens))
+        # layer_offsets[l] = l 号层段基址偏移;  dva = offload.get_dva(base)
+    def alloc(self, need_tokens) -> Tensor       # 页粒度 free-list;
+        # 返回合成 token: (n_hbm + local_page)*page_size + intra  (排序后天然落在
+        # HBM allocator token 空间之外; P 侧 kv_to_page_indices 还原全局页号)
+    def free_tokens(self, tokens) -> int          # 阈值 >= n_hbm*page_size 判 DRAM;
+        # 页 = token//page_size − n_hbm, 归还 free-list
+    def available_size(self) -> int               # = 空闲页数 * page_size (token口径)
+    def allocated_tokens(self) -> int             # promote 债 (token口径)
+    def get_contiguous_buf_infos(self)            # per-layer (HVA, 页数*item_len, item_len)
+    def layer_src_dva(self, layer_id, page_off)   # promote 源: dva + offset + page_off*item_len
+    def promote(self, entries, device_id)         # sparse_copy(srcPtrs, dstPtrs, lens, cnt, dev)
+    def uninitialize(self)                        # offload.free + offload.uninitialize
 ```
 
 初始化完成即打印换算日志（D7 已确认）：
 
 ```text
-[DRAM pool] size=8GB, page_size=1, layers=62, num_pages=8192, capacity≈8192 tokens
+[DRAM pool] size=8GB, page_size=128, layers=234, pages=4866, capacity≈622848 tokens, base=0x..., dva=0x...
+[DRAM] manager init: pool created, dram_layers=234 n_hbm_pages=104 dram_pages=4866 base=0x... dva=0x...
 ```
 
 **原因**：G2。页粒度 free-list 参考 `PagedTokenToKVPoolAllocator`（`mem_cache/allocator/paged.py:105`）
@@ -163,14 +173,21 @@ mooncake（GPU 主力）与 ascend（NIXL/Mori 各自独立实现，不受影响
 
 ```python
 class AscendDramFallbackAllocator:          # 包装 decode 现有 token_to_kv_pool_allocator
-    def alloc/alloc_extend/alloc_decode(...):   # D8 水位: HBM 部分透传内层, 溢出页取自 dram_pool
-        #   可直写预算 = 内层.available_pages() − pending_promote_pages − reserved_pages
-        #   返回值 = HBM页号 ++ (dram_pool页号 + N_hbm)   # 全局页号编码, 对调用方透明
-    def free(...):                              # 按全局页号分流: <N_hbm 透传内层, >=N_hbm 归还 dram_pool
-    def available_size():                       # = 内层available − pending_promote需求(DRAM页非可用容量, 是缓冲)
-    def alloc_hbm_for_promote(n):               # promote 专用: 强制 HBM, 不落 DRAM
-    pending_promote_pages: int                  # 统计量, 供水位与预算共用
+    def alloc(self, need_size):                 # D8 水位(token): 预算=inner.available −
+        #   dram债 − reserved; 够→透传内层; 不够→整请求落 dram_pool.alloc;
+        #   DRAM也满→回退 inner.alloc(原语义)
+    def alloc_extend(...):                      # prefix=0 的分页预分配同水位逻辑
+    def free(self, free_index):                 # 按池分流: dram_pool.free_tokens 先收;
+        #   阈值 n_hbm_tokens*page_size (页数×页大小! §9 B7), < 阈值透传内层
+    def available_size(self):                   # = max(0, inner.available − dram债)
+    def available_size_for_prealloc(self):      # = 上式 + dram_pool.available (接收口径)
+    def alloc_hbm(self, need_size):             # promote 专用: 强制 HBM 透传 inner.alloc
+    def __getattr__(self, name):                # 其余(page_size/get_kvcache/...)转发内层
 ```
+
+构造时单位自检（fail-loud，不修改边界）：`inner.size ≤ n_hbm_tokens × page_size`
+必须成立（n_hbm 含 allocator 页 + 池备用页）；曾出现把 token 数误写进页边界的
+错误"修复"（`n_hbm_tokens = inner.size`），已撤销（§9 B7）。
 
 | 效果 | 说明 |
 |---|---|
@@ -194,23 +211,31 @@ if hasattr(mgr, "promote_dram_pages"):
         continue    # HBM 暂缺: 留在 transfer queue, 等 retract 腾页后重试
 ```
 
-实现（`ascend/conn.py` + `dram_pool.py`，commit 内同步执行，D2 已确认）：
+实现（`ascend/conn.py` + `dram_pool.py`，commit 内同步执行，D2 已确认，**全程页本位**）：
 
 ```python
 def promote_dram_pages(req, req_to_token_pool, hbm_kv_pool, allocator, draft_kv_pool=None):
-    dram_tokens, dram_pages = 挑出 req_to_token 中 >= N_hbm 的槽位与页号
-    if len(dram_tokens) == 0: return True
-    hbm_pages = allocator.alloc_hbm(len(dram_tokens))  # 强制 HBM; None→return False 留队重试
-    hbm_ptrs, _, item_lens = hbm_kv_pool.get_contiguous_buf_infos()
-    if draft_kv_pool is not None:      # D10: draft 层与主池层一起提升(共享索引)
-        hbm_ptrs += draft_ptrs; item_lens += draft_item_lens
-    # 按连续 token 段 × 每层 组成条目, 一次 sparse_copy 调用:
-    #   src = dram_dva + layer_offset + (dram_token-N_hbm)*item_len
-    #   dst = hbm_ptr[layer] + hbm_token*item_len
-    offload.sparse_copy(srcPtrs, dstPtrs, lens, cnt, device)
-    torch.npu.synchronize()            # AIV 拷贝落定后才能回收 DRAM 页(防与新传输竞态)
-    req_to_token[req, dram_tokens] = hbm_pages          # 就地替换
-    dram_pool.free_pages(dram_pages)
+    n_hbm = dram_pool.n_hbm_tokens          # HBM 页数(legacy属性名,勿混淆)
+    page_size = dram_pool.page_size
+    row = req_to_token[req][:committed_len]
+    dram_mask = row >= n_hbm * page_size    # 阈值必须页换算(§9 B7)
+    if 无DRAM token: return True
+    dram_np = row[dram_mask].cpu().numpy()
+    gpages = unique(dram_np // page_size); lpages = gpages - n_hbm   # 全局页→局部页
+    hbm_loc = allocator.alloc_hbm(len(lpages) * page_size)  # 整页分配(空张量守卫,§9 B4)
+    hbm_pages = hbm_loc[::page_size] // page_size           # token运行→页号
+    if draft_kv_pool: hbm_ptrs += draft_ptrs; item_lens += draft_item_lens  # D10
+    for (页段 start,cnt) in _co_segments(lpages, hbm_pages):  # 双数组共连续切分
+        for layer_id, item_len in enumerate(item_lens):
+            src = dram_pool.layer_src_dva(layer_id, lpages[start])       # DVA
+            dst = hbm_ptrs[layer_id] + hbm_pages[start] * item_len       # 页寻址!
+            entries.append((src, dst, cnt * item_len))
+    torch.npu.synchronize()                # 隔离探针: 先于AIV拷贝同步
+    offload.sparse_copy(srcPtrs, dstPtrs, lens, cnt, dev)
+    torch.npu.synchronize()                # AIV 拷贝落定后才能回收 DRAM 页(防与新传输竞态)
+    k = searchsorted(gpages, dram_np // page_size)         # 每token的DRAM页序号
+    row[dram_mask] = hbm_pages[k]*page_size + dram_np % page_size  # 保页内偏移, int32(§9 B5)
+    dram_pool.free_tokens(dram_tokens)     # 合成token按页归还
 ```
 
 **原因**：G6。sparse_copy 源用 DVA、目标用 HBM 设备地址（与 examples/trans_offload 验证过的
@@ -261,14 +286,15 @@ Prefill: engine init + 本侧 src 池 batch_register
        → 收注册帧缓存 KVArgsRegisterInfo(含 pd_extension)
 
 [每请求]
-Decode : _pre_alloc(零改动): allocator.alloc(...) 经 wrapper 按水位落池 → 全局页号 → req_to_token
-       → send_metadata(dst_kv_indices=全局页号, 消息结构不变)
+Decode : _pre_alloc(零改动): allocator.alloc(...) 经 wrapper 按水位落池
+       → HBM token(allocator原生) 或 DRAM 合成 token((n_hbm+page)*page_size+intra) → req_to_token
+       → send_metadata(dst_kv_indices, 消息结构不变)
 Prefill: transfer_worker(零改动) → AscendKVManager.send_kvcache(自查 pd_extension):
-         块按 N_hbm 分界 → HBM/DRAM 混合寻址
+         kv_to_page_indices 取页号 → 按 n_hbm 分界 → HBM/DRAM 混合寻址(页×每页字节)
        → batch_transfer_sync_write(混合 dst) --DEVICE_URMA--> Decode HBM + DRAM 直写
        → status(ZMQ) → Decode
-Decode : pop_transferred → commit(2行钩子) → promote: sparse_copy(DVA→HBM)
-       → req_to_token 就地替换 → 释放 DRAM 页 → 请求可调度(attention 只读 HBM, 零改动)
+Decode : pop_transferred → commit(2行钩子) → promote: 页本位 sparse_copy(DVA→HBM)
+       → req_to_token 就地替换(保页内偏移) → 释放 DRAM 页 → 请求可调度(attention 只读 HBM, 零改动)
 
 [结束]
 请求完成/abort: allocator.free(零改动) 经 wrapper 自动分流两池
@@ -301,7 +327,7 @@ NIXL/Mori 后端因不经过被修改的 Mooncake 层，完全不受影响。
 | promote 同步开销 | commit 内同步 sparse_copy（D2 已确认），长序列大页时增加调度延迟 | 首版接受；后续按需异步化（预提升/流水） |
 | HBM 仍为瓶颈 | DRAM 只扩"接收容量"，运行态 KV 仍需 HBM；promote 需要瞬时 HBM 页 | wrapper `available_size` 口径已扣 pending_promote 需求 + 现有 retract 语义 |
 | 双重写放大 | 落 DRAM 的页经历"跨机写 DRAM + promote 搬 HBM"两跳 | 仅在 HBM 不足时触发；常态全走 HBM 单跳 |
-| wrapper 与 allocator 接口面 | wrapper 只拦截 alloc/alloc_extend/free/available_size/alloc_hbm，其余经 `__getattr__` 转发内层（DRAM 页不参与内层 `merge_and_sort_free` 排序）；实施时以 decode.py 实际调用集为准做接口核对 | — |
+| wrapper 与 allocator 接口面 | wrapper 拦截 alloc/alloc_extend/free/available_size/available_size_for_prealloc/alloc_hbm，其余经 `__getattr__` 转发内层（DRAM 页不参与内层 `merge_and_sort_free` 排序）；free 分流阈值必须页换算 `n_hbm*page_size`（§9 B7/B8） | — |
 | 投机推理（D10） | draft 层与主池共享 token 索引/allocator（eagle_worker_v2 `alloc_memory_pool`）：draft 层 DRAM 寻址/promote 与主池同构；draft 侧 free 若走裸 allocator 会污染 | promote 拼接 draft 层条目；安装点 BFS 替换 scheduler→target/draft worker→model_runner 全链 allocator 引用 |
 | spec worker 引用替换时序 | DecodePreallocQueue 创建晚于 worker init，spec worker 内部已绑定裸引用 | BFS 安装点按"引用身份相等"替换（`is inner`），覆盖构造期绑定的所有副本 |
 | decode 侧 radix cache | 全局页号与 radix tree 页语义不兼容 | M7 与 `disaggregation_decode_enable_radix_cache` 互斥校验（该特性本身实验性） |
@@ -346,4 +372,55 @@ NIXL/Mori 后端因不经过被修改的 Mooncake 层，完全不受影响。
 公共文件合计 ~20 行，且不含任何 DRAM 数据结构或寻址逻辑；
 `dram_pool_size=0`（默认）时全部为死分支，任何后端行为与现状一致。
 
-memfabric 侧：无新增改动（能力已在 commit 1ea9da46 就绪）。
+**memfabric 侧（联调中修复，仓库 `mem-pool/memfabric_hybrid` 分支 br_trans_offload）**：
+
+| 文件 | 修改 | 对应问题（§9） |
+|---|---|---|
+| `src/hybm/csrc/mm/hybm_vmm_based_segment.cpp` | 修复 `hybm_mem_type memType` 重复声明编译错误；RegisterMemory 失败（HalMemExport ret 8）时 **ExportInner 降级**为仅本地注册（保留 MR/VA 供 URMA 传输）；Export(slice) 失败回退 legacy 空名字格式，避免注册交换失败 | M1/M2/M3 |
+| `src/acc_offload/csrc/operators/acc_offload_sparse_copy.h` | 多条目拷贝从"拼包单次队列"改为**逐条目独立队列往返**，规避向量核 507035 | M4 |
+
+---
+
+## 9. 联调问题与修复记录（2026-08-17 ~ 08-18）
+
+按发现顺序编号；B 系列为 sglang 侧，M 系列为 memfabric 侧，O 系列为运维/环境。
+**B7（页/token 单位混用）是全局编码的核心修正**，D3/M2/M4/M5 均按其结论重写。
+
+### B 系列：sglang 侧
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| B1 | `AttributeError: 'Scheduler' object has no attribute 'token_to_kv_pool'`（decode.py `pop_transferred`） | D 节点 scheduler 未暴露 token_to_kv_pool 属性（P 侧才有） | scheduler.py 中补 `token_to_kv_pool` 属性定义 |
+| B2 | P 侧 `send_kvcache` 块拆分 IndexError（`decode_index[mid]`） | 链式比较 `first < n_hbm == last < n_hbm` 在 Python 中语义为 `(first<n_hbm) and (n_hbm==(last<n_hbm))`，恒 False → 所有块（含纯 HBM 块）都进 split 分支 | 加括号显式分组：`same_pool = (first < n_hbm) == (last < n_hbm)` |
+| B3 | P 节点启动 `RuntimeError: basic_string::_S_construct null not valid` | `MF_CONFIG_STORE_URL`/`ASCEND_MF_STORE_URL` 未设置，None 传入 C++ binding 构造 std::string | transfer_engine.py 先取环境变量（双名字回退），缺失即 fail-loud 报明确错误 |
+| B4 | D 节点 promote `IndexError: list index out of range` | 分页 allocator 对不足一页的请求（如 4 token）向下取整为 0 页，返回**空张量**（非 None）绕过守卫 | HBM 分配按页向上取整（`ceil(num/page)*page`）+ `numel()` 守卫 |
+| B5 | `RuntimeError ... error code 161002`（aclnnIndexPutImpl） | `hbm_loc` 是 int64，`req_to_token` 是 int32，aclnn index_put 双侧 dtype 必须一致 | 回写前显式 `.to(torch.int32)`（后统一经 numpy int32） |
+| B6 | `npuSynchronizeDevice ... device error type 3, error code 507035`（向量核错误） | sparse_copy 多条目"拼包"单次队列下发触发向量核异常 | memfabric 侧改逐条目独立队列往返（M4），sglang 侧保留 |
+| **B7** | **promote RANGE VIOLATION / ENCODING MISMATCH / MTE "DDR address out of range" errcode 95→507035** | **页/token 单位混用**：①NPU 分页池页主序布局，`kv_item_lens` 是**每页字节**（234 层合计 14,057,472 B/页，÷128=109,824 B/token），传输链路页索引；②`n_hbm=104` 是 HBM **页数**（103×128=13184 token+备用页），被当 token 数用；③DRAM 合成 token 旧编码 `page*128+intra+104` 数值落在 HBM 页号区间 → P 侧把 DRAM 页写进 HBM 池（数据错位），D 侧从 DRAM 假页提升垃圾数据；④`dram_mask = row >= 104` 把合法 HBM token 104..13183 误判为 DRAM → 用垃圾覆盖好 KV；⑤promote `dst = hbm_ptr + token_idx*每页字节` 越界约 7GB | **全链路改页本位**（本次重写）：`dram_pool.size`=页数（容量恢复 128 倍）；合成 token `(n_hbm+page)*page_size+intra`（≥n_hbm×page_size 不与 HBM token 冲突）；mask/free 阈值页换算；promote 按页段 co-segment、`dst = hbm_ptr + hbm_page*item_len`、行回写保页内偏移；校验探针页单位（`inner.size ≤ n_hbm*page_size`） |
+| B8 | 中间错误"修复"：`fixing n_hbm_tokens: 104 → 13184` 后 P 侧寻址仍错 | 把 allocator 的 token 数写进页边界（单位混入），且该修改**不同步 P 侧 pd_extension**（P 仍按 104 分界） | 撤销该修改；保留 layer0 推导的页数边界 + wrapper 构造时单位自检（fail-loud） |
+| B9 | warmup 后 P/D 卡住（核利用率 0，无 `register_kv_args: received pd_extension`） | 见 O1/O2/O3 组合 | 逐一排除后恢复 |
+| B10 | transformers 包刷屏 `[transformers] Accessing forward_npu ...` | transformers 日志级别低 | 设 transformers logger ERROR |
+
+### M 系列：memfabric 侧
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| M1 | 编译错误 `redeclaration of hybm_mem_type memType`（hybm_vmm_based_segment.cpp:367） | 同作用域重复声明 | 去重 |
+| M2 | `HalMemExport ... ret: 8` → `RegisterMemory failed ret: 12/c`，注册失败 | `expandable_segments:True` 下 VMM 分配的小 KV 层被 batch_register 合并成大 slice，物理不连续 → HalMemExport 失败 | 失败时 **ExportInner 降级**为仅本地注册（保留 MR/VA，URMA 传输不受影响；fabric 句柄交换路径不再必需） |
+| M3 | `Export: Assert pos != slices_.end, input slice(idx:0) not exist` → `ExportSliceExchangeInfo failed: -2` | 合并 slice 后按原 idx 查找失败 | Export(slice) 失败回退 legacy 空名字格式 |
+| M4 | sparse_copy 拼包路径 507035 向量核错误（同 B6） | 多条目单次队列下发异常 | 逐条目独立队列往返 |
+
+### O 系列：运维/环境经验
+
+| # | 现象 | 根因/处置 |
+|---|---|---|
+| O1 | `HcommThreadAlloc` 返回码 15，重启失败 | HCOM/URMA 残留资源 | 冷重启 P/D 节点 + 清理 `/dev/shm` 残留文件 |
+| O2 | P 节点 `MEM_FRACTION=0.91+` 触发 AIV kernel 507035 | prefill 激活 + deepep buffer 挤占 HBM 不足 | P 侧降到 0.85；调试期 D 压到 0.7800（HBM 池仅 ~128 token，强制请求落 DRAM 观察全流程） |
+| O3 | P 节点 DeepEP 纯机内 normal dispatch 路径挂死/崩溃 | NPU 构建 deepep 稳定性问题 | P 侧用默认 MoE a2a backend（none） |
+| O4 | 启动顺序要求 | memfabric config store 由 P rank0 创建 | **P 先启动且健康后再启 D**；P/D config.json 层数必须一致 |
+| O5 | device_urma 必需环境 | VMM 内存走 retain handle + fabric share handle | `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` + `MF_HYBM_USE_VMM_SEGMENT=1` + `MF_CONFIG_STORE_URL`；调试期 `ASCEND_LAUNCH_BLOCKING=1` |
+
+### 验证日志关键字（B7 修复后）
+
+- 正常：`[DRAM pool] ... pages=`（页数，8GB 池约 4866）；`pool alloc: ... token_range=` 起点 ≥ n_hbm×page_size（如 13312）；`promote start: ... hbm_page=[..]` ∈ [0, 104)；`send_kvcache: writing N/N dst tokens to DRAM pool`
+- 应消失：`promote RANGE VIOLATION` / `ENCODING MISMATCH` / `fixing n_hbm_tokens` / `DDR address out of range` / `507035`
