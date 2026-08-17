@@ -24,7 +24,11 @@ export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 
 MODEL_PATH=${MODEL_PATH:-/home/weights/GLM-5.2-W8A8C8-mxfp8}
 DRAM_POOL_GB=${DRAM_POOL_GB:-64}          # Decode DRAM 接收池大小 (GB)
-MEM_FRACTION=${MEM_FRACTION:-0.91}       # 压小可提前触发 KV 落 DRAM
+# P/D 解耦: P(prefill) 8192-token 大 batch 需要大量激活内存, fraction 过高会在
+# MoE dispatch(AIV kernel) 内存耗尽 -> 507035 向量核异常; D(decode) batch 小,
+# 可用高 fraction 换更大 HBM KV 池
+P_MEM_FRACTION=${P_MEM_FRACTION:-0.85}
+D_MEM_FRACTION=${D_MEM_FRACTION:-0.91}
 
 unset https_proxy
 unset http_proxy
@@ -91,7 +95,7 @@ do
             --quantization modelslim \
             --dtype bfloat16 \
             --tp-size 8 \
-            --mem-fraction-static $MEM_FRACTION \
+            --mem-fraction-static $P_MEM_FRACTION \
             --chunked-prefill-size 8192 \
             --max-running-requests 64 \
             --host 0.0.0.0 \
@@ -124,7 +128,7 @@ do
             --quantization modelslim \
             --dtype bfloat16 \
             --tp-size 8 \
-            --mem-fraction-static $MEM_FRACTION \
+            --mem-fraction-static $D_MEM_FRACTION \
             --chunked-prefill-size 8192 \
             --disable-cuda-graph \
             --max-running-requests 64 \
