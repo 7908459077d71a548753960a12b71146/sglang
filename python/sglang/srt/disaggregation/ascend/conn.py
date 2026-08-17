@@ -279,7 +279,14 @@ class AscendKVManager(MooncakeKVManager):
             transfer_blocks = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 first, last = int(decode_index[0]), int(decode_index[-1])
-                if dram_ptr is None or first < n_hbm == (last < n_hbm):
+                # NOTE: parenthesized on purpose — the chained form
+                # `first < n_hbm == (last < n_hbm)` means
+                # `(first < n_hbm) and (n_hbm == (last < n_hbm))`, which is
+                # always False and would send every block (including pure
+                # HBM ones) into the split branch below, crashing with
+                # IndexError on decode_index[mid].
+                same_pool = (first < n_hbm) == (last < n_hbm)
+                if dram_ptr is None or same_pool:
                     base, off = (dst_ptr, 0) if first < n_hbm else (dram_ptr, n_hbm)
                     if first >= n_hbm:
                         logger.info(
