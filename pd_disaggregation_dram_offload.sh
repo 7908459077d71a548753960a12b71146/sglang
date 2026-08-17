@@ -23,7 +23,7 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 
 MODEL_PATH=${MODEL_PATH:-/home/weights/GLM-5.2-W8A8C8-mxfp8}
-DRAM_POOL_GB=${DRAM_POOL_GB:-64}          # Decode DRAM 接收池大小 (GB)
+DRAM_POOL_GB=${DRAM_POOL_GB:-8}           # Decode DRAM 接收池大小 (GB)
 # P/D 解耦: P(prefill) 8192-token 大 batch 需要大量激活内存, fraction 过高会在
 # MoE dispatch(AIV kernel) 内存耗尽 -> 507035 向量核异常; D(decode) batch 小,
 # 可用高 fraction 换更大 HBM KV 池
