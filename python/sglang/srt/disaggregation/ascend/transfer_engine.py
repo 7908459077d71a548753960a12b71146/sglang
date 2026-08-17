@@ -39,8 +39,17 @@ class AscendTransferEngine(MooncakeTransferEngine):
         self.hostname = hostname
         self.npu_id = npu_id
 
-        # Centralized storage address of the AscendTransferEngine
-        self.store_url = os.getenv("ASCEND_MF_STORE_URL")
+        # Centralized storage address of the AscendTransferEngine.
+        # Read both names like the memfabric C++ side does
+        # (GetEnvStr("MF_CONFIG_STORE_URL", "ASCEND_MF_STORE_URL") in
+        # mf_env_define.h); passing None down would crash the C++ binding
+        # with "basic_string::_S_construct null not valid".
+        self.store_url = os.getenv("MF_CONFIG_STORE_URL") or os.getenv("ASCEND_MF_STORE_URL")
+        if not self.store_url:
+            raise RuntimeError(
+                "AscendTransferEngine requires MF_CONFIG_STORE_URL (or legacy "
+                "ASCEND_MF_STORE_URL) to be set, e.g. tcp://<store_ip>:<port>"
+            )
         if disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = "Prefill"
         elif disaggregation_mode == DisaggregationMode.DECODE:
