@@ -183,9 +183,9 @@ class AscendDramPool:
         dst_ptrs = torch.tensor([e[1] for e in entries], dtype=torch.int64).to(dev)
         lens = torch.tensor([e[2] for e in entries], dtype=torch.int32).to(dev)
         cnt = torch.tensor(len(entries), dtype=torch.int32).to(dev)
-        ret = mf_offload.sparse_copy(
-            src_ptrs.data_ptr(), dst_ptrs.data_ptr(), lens.data_ptr(), cnt.data_ptr(), device_id
-        )
+        # The python wrapper takes device tensors + torch.device and derives
+        # data_ptr()/device index itself (mf_acc_offload.sparse_copy).
+        ret = mf_offload.sparse_copy(src_ptrs, dst_ptrs, lens, cnt, dev)
         if ret != 0:
             logger.error(f"sparse_copy promote failed, ret={ret}, entries={len(entries)}")
         return ret
