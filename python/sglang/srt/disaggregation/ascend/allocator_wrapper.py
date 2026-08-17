@@ -28,6 +28,23 @@ class AscendDramFallbackAllocator:
         self.inner = inner
         self.dram_pool = dram_pool
         self.reserved_tokens = num_reserved_decode_tokens
+        # Units: dram_pool.n_hbm_tokens is the HBM PAGE count (NPU paged
+        # pools report kv_item_lens as per-PAGE bytes; the PD wire encoding
+        # is page-indexed) while inner.size is the allocator's TOKEN count.
+        # The allocator must fit inside the registered HBM pages:
+        #   inner.size <= n_hbm_tokens * page_size
+        # (n_hbm covers the allocator pages plus the pool's spare page).
+        # Do NOT "fix" n_hbm to inner.size — that mixes tokens into the page
+        # boundary and breaks the prefill sender's DRAM addressing.
+        n_hbm_tokens = int(dram_pool.n_hbm_tokens)
+        page_size = int(dram_pool.page_size)
+        inner_size = int(getattr(inner, "size", 0) or 0)
+        if inner_size > n_hbm_tokens * page_size:
+            logger.error(
+                f"[DRAM] allocator size={inner_size} exceeds HBM page space "
+                f"{n_hbm_tokens * page_size} (n_hbm_pages={n_hbm_tokens}, "
+                f"page_size={page_size}) — page encoding boundary is wrong"
+            )
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         budget = (
@@ -101,11 +118,16 @@ class AscendDramFallbackAllocator:
         if free_index.numel() == 0:
             return
         # Split by pool so the inner allocator only ever frees pure HBM pages.
+        # DRAM synthetic tokens start at n_hbm_tokens * page_size (the HBM
+        # allocator's real token space ends below that), so the split
+        # threshold must be page-scaled — n_hbm_tokens alone is a PAGE count.
         dram_n = self.dram_pool.free_tokens(free_index)
         if dram_n == free_index.numel():
             logger.info(f"[DRAM] wrapper free: all-DRAM tokens={dram_n}")
             return
-        hbm = free_index[free_index < self.dram_pool.n_hbm_tokens]
+        hbm = free_index[
+            free_index < self.dram_pool.n_hbm_tokens * self.dram_pool.page_size
+        ]
         logger.info(
             f"[DRAM] wrapper free split: total={free_index.numel()} dram={dram_n} hbm={hbm.numel()}"
         )

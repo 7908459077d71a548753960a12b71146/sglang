@@ -46,8 +46,10 @@ class AscendKVManager(MooncakeKVManager):
         self.dram_pool = self._maybe_create_dram_pool(args, disaggregation_mode, server_args)
         if self.dram_pool is not None:
             ptrs, lens, item_lens = self.dram_pool.get_contiguous_buf_infos()
-            # DRAM pool addresses ride the generic optional extension frame;
-            # token indices are globally encoded: [0, n_hbm) HBM, else DRAM.
+            # DRAM pool addresses ride the generic optional extension frame.
+            # Page encoding (the sender path is page-indexed via
+            # kv_to_page_indices and kv_item_lens are per-PAGE bytes):
+            # [0, n_hbm_tokens) HBM pages, [n_hbm_tokens, ...) DRAM pages.
             args.pd_extension = {
                 "dram_kv_ptrs": ptrs,
                 "dram_item_lens": item_lens,
@@ -55,7 +57,8 @@ class AscendKVManager(MooncakeKVManager):
             }
             logger.info(
                 f"[DRAM] manager init: pool created, dram_layers={len(ptrs)} "
-                f"n_hbm_tokens={self.dram_pool.n_hbm_tokens} dram_tokens={self.dram_pool.size} "
+                f"n_hbm_pages={self.dram_pool.n_hbm_tokens} "
+                f"dram_pages={self.dram_pool.size} "
                 f"base=0x{self.dram_pool.base:x} dva=0x{self.dram_pool.dva:x}"
             )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
@@ -70,7 +73,11 @@ class AscendKVManager(MooncakeKVManager):
         # item_lens here already includes speculative draft layers (appended
         # by _init_kv_manager), so the DRAM pool mirrors target+draft. Draft
         # pools share the target pool's token indices, hence the boundary is
-        # derived from the first (target) layer only.
+        # derived from the first (target) layer only. NOTE: NPU paged pools
+        # report kv_item_lens as PER-PAGE bytes (page-major layout), so this
+        # division yields the HBM PAGE count — the wire encoding boundary.
+        # It covers the allocator's token space (size//page pages) plus the
+        # pool's spare page, e.g. 103 allocatable + 1 spare = 104.
         n_hbm_tokens = args.kv_data_lens[0] // args.kv_item_lens[0]
         return AscendDramPool(
             npu_id=args.gpu_id,
@@ -421,41 +428,64 @@ class AscendKVManager(MooncakeKVManager):
         short: the caller keeps the request in the transfer queue and retries
         after the scheduler retracts running requests.
 
+        Units: the NPU paged pools are page-major and report kv_item_lens as
+        PER-PAGE bytes; the wire encoding (prefill sender) is page-indexed.
+        req_to_token holds token indices, where DRAM-resident tokens are the
+        synthetic page-encoded values produced by AscendDramPool.alloc:
+            token = (n_hbm + local_page) * page_size + intra_page
+        This function therefore works on PAGES end to end: it derives DRAM
+        pages from the synthetic tokens, allocates whole HBM pages and copies
+        per (page-run, layer) with per-page item_lens.
+
         Speculative decoding (EAGLE/MTP): draft layers share the target pool's
         token indices, so they are mirrored in the same DRAM pool and must be
         promoted together with the target layers.
         """
         if self.dram_pool is None:
             return True
+        # n_hbm is the HBM PAGE count (legacy attribute name); DRAM synthetic
+        # tokens start at n_hbm * page_size, beyond the HBM allocator's real
+        # token space, so the mask below can never catch a live HBM token.
         n_hbm = self.dram_pool.n_hbm_tokens
+        page_size = int(self.dram_pool.page_size)
         length = getattr(req, "kv_committed_len", 0)
         if length <= 0:
             return True
         row = req_to_token_pool.req_to_token[req.req_pool_idx][:length]
-        dram_mask = row >= n_hbm
+        dram_mask = row >= n_hbm * page_size
         num = int(dram_mask.sum().item())
         if num == 0:
             return True
         import time as _time
 
         t0 = _time.time()
-        # HBM allocation is page-granular: the paged allocator floors a
-        # sub-page request to zero pages and returns an EMPTY tensor (not
-        # None), which would slip past the None guard. Round up to whole
-        # pages and slice; the page tail is recovered page-granularly at
-        # request free time (free() uniquifies by page).
-        page_size = int(getattr(allocator, "page_size", 1) or 1)
-        alloc_tokens = ((num + page_size - 1) // page_size) * page_size
-        hbm_loc = allocator.alloc_hbm(alloc_tokens)  # force-HBM, bypasses the watermark
-        if hbm_loc is None or hbm_loc.numel() < num:
-            logger.info(
-                f"[DRAM] promote deferred (HBM short): rid={req.rid}, dram_tokens={num}"
-            )
-            return False
-        hbm_loc = hbm_loc[:num]
         dram_tokens = row[dram_mask].clone()
         dram_np = dram_tokens.cpu().numpy()
+        # Global DRAM pages (ascending, unique) -> local pool page indices.
+        gpages = np.unique(dram_np // page_size)
+        lpages = gpages - n_hbm
+        num_pages = len(lpages)
+        # HBM allocation is page-granular: the paged allocator floors a
+        # sub-page request to zero pages and returns an EMPTY tensor (not
+        # None), which would slip past the None guard. Allocate whole pages;
+        # the page tail is recovered page-granularly at request free time
+        # (free() uniquifies by page).
+        alloc_tokens = num_pages * page_size
+        hbm_loc = allocator.alloc_hbm(alloc_tokens)  # force-HBM, bypasses the watermark
+        if hbm_loc is None or hbm_loc.numel() < alloc_tokens:
+            logger.info(
+                f"[DRAM] promote deferred (HBM short): rid={req.rid}, dram_pages={num_pages}"
+            )
+            return False
         hbm_np = hbm_loc.cpu().numpy()
+        if int(hbm_np[0]) % page_size:
+            logger.error(
+                f"[DRAM] promote HBM alloc not page-aligned: first={int(hbm_np[0])} "
+                f"page_size={page_size} — paged allocator invariant broken"
+            )
+        # Page ids of the allocated HBM run (paged allocator returns
+        # page-aligned contiguous tokens).
+        hbm_pages = hbm_np[::page_size] // page_size
         hbm_ptrs, _, item_lens = hbm_kv_pool.get_contiguous_buf_infos()
         num_target_layers = len(hbm_ptrs)
         if draft_kv_pool is not None:
@@ -466,69 +496,49 @@ class AscendKVManager(MooncakeKVManager):
             item_lens = list(item_lens) + list(draft_item_lens)
         logger.info(
             f"[DRAM] promote start: rid={req.rid} dram_tokens={num} "
-            f"target_layers={num_target_layers} total_layers={len(item_lens)} "
-            f"dram_idx=[{int(dram_np[0])}..{int(dram_np[-1])}] "
-            f"hbm_idx=[{int(hbm_np[0])}..{int(hbm_np[-1])}]"
+            f"dram_pages={num_pages} dram_page=[{int(lpages[0])}..{int(lpages[-1])}] "
+            f"hbm_page=[{int(hbm_pages[0])}..{int(hbm_pages[-1])}] "
+            f"target_layers={num_target_layers} total_layers={len(item_lens)}"
         )
         entries = []
         bad_entries = []
-        # Per-layer HBM capacity (tokens) from the registered buffer geometry;
-        # with heterogeneous per-layer item_lens (GLM-5.2), layer-0-derived
-        # n_hbm may not match every layer's capacity.
+        # Per-layer HBM capacity (PAGES) from the registered buffer geometry
+        # (kv_data_lens // kv_item_lens with per-page item_lens = page count).
         hbm_caps = [
             l // il if il else 0
             for l, il in zip(self.kv_args.kv_data_lens, self.kv_args.kv_item_lens)
         ]
-        for start, cnt in self._co_segments(dram_np, hbm_np):
+        for start, cnt in self._co_segments(lpages, hbm_pages):
             for layer_id, item_len in enumerate(item_lens):
-                tok = int(dram_np[start]) - n_hbm
-                src = self.dram_pool.layer_src_dva(layer_id, tok)
-                dst = hbm_ptrs[layer_id] + int(hbm_np[start]) * item_len
+                src = self.dram_pool.layer_src_dva(layer_id, int(lpages[start]))
+                dst = hbm_ptrs[layer_id] + int(hbm_pages[start]) * item_len
                 entries.append((src, dst, cnt * item_len))
-                # Range validation: DRAM side within pool tokens, HBM side
-                # within this layer's buffer. The plog fault "MTE DDR address
-                # out of range" (errcode 95) points at an out-of-bounds entry.
-                if tok < 0 or tok + cnt > self.dram_pool.size:
-                    bad_entries.append(("dram", layer_id, tok, cnt))
+                # Range validation in PAGE units: DRAM side within pool pages,
+                # HBM side within this layer's buffer. The plog fault "MTE DDR
+                # address out of range" (errcode 95) points at an OOB entry.
+                if int(lpages[start]) < 0 or int(lpages[start]) + cnt > self.dram_pool.size:
+                    bad_entries.append(("dram", layer_id, int(lpages[start]), cnt))
                 if layer_id < len(hbm_caps) and (
-                    int(hbm_np[start]) + cnt > hbm_caps[layer_id]
+                    int(hbm_pages[start]) + cnt > hbm_caps[layer_id]
                 ):
-                    bad_entries.append(("hbm", layer_id, int(hbm_np[start]), cnt))
+                    bad_entries.append(("hbm", layer_id, int(hbm_pages[start]), cnt))
         if bad_entries:
             logger.error(
-                f"[DRAM] promote RANGE VIOLATION: n_hbm={n_hbm} "
-                f"dram_size={self.dram_pool.size} hbm_caps min/max="
-                f"{min(hbm_caps)}/{max(hbm_caps)} layer0_cap={hbm_caps[0] if hbm_caps else -1} "
-                f"hbm_idx=[{int(hbm_np.min())}..{int(hbm_np.max())}] "
+                f"[DRAM] promote RANGE VIOLATION: n_hbm_pages={n_hbm} "
+                f"dram_pages={self.dram_pool.size} hbm_caps(pages) min/max="
+                f"{min(hbm_caps)}/{max(hbm_caps)} "
+                f"hbm_page=[{int(hbm_pages.min())}..{int(hbm_pages.max())}] "
                 f"bad(first 5)={bad_entries[:5]}"
             )
-        # Encoding-boundary sanity: n_hbm is derived from LAYER 0's geometry;
-        # with heterogeneous per-layer item_lens (MLA/DSA packing) it must
-        # still equal the allocator's real token capacity, and every layer's
-        # registered length must equal tokens*item_len with the SAME ordering
-        # as hbm_ptrs — a ptr/item_len mispairing produces out-of-range dst.
+        # Encoding-boundary sanity in matched units: the allocator's TOKEN
+        # space must fit inside the registered HBM page buffers
+        # (n_hbm pages, one of which is the pool's spare page).
         real_pool = getattr(getattr(allocator, "inner", allocator), "size", None)
-        if real_pool is not None and int(real_pool) != n_hbm:
+        if real_pool is not None and int(real_pool) > n_hbm * page_size:
             logger.error(
-                f"[DRAM] ENCODING MISMATCH: n_hbm(layer0-derived)={n_hbm} but "
-                f"allocator pool size={real_pool} — global page encoding is "
-                f"wrong (watermark, P-side DRAM addressing, promote split)"
-            )
-        mism = [
-            (l, int(pl), int(kl))
-            for l, (pl, kl) in enumerate(
-                zip(
-                    hbm_kv_pool.get_contiguous_buf_infos()[1],
-                    self.kv_args.kv_data_lens,
-                )
-            )
-            if pl != kl
-        ][:5]
-        if mism:
-            logger.error(
-                f"[DRAM] LAYER PAIRING MISMATCH (pool_len != kv_data_len), "
-                f"first 5 (layer, pool_len, kv_len)={mism} — ptrs/item_lens "
-                f"ordering inconsistent, dst addressing overflows layers"
+                f"[DRAM] ENCODING MISMATCH: allocator tokens={real_pool} exceed "
+                f"HBM page space={n_hbm * page_size} (n_hbm_pages={n_hbm}, "
+                f"page_size={page_size}) — global page encoding is wrong"
             )
         # Isolation probe: sync BEFORE the AIV copy so a device fault here
         # exonerates sparse_copy (the fault would come from concurrently
@@ -536,8 +546,7 @@ class AscendKVManager(MooncakeKVManager):
         torch.npu.synchronize()
         logger.info(
             f"[DRAM] promote pre-sync ok: rid={req.rid} committed={length} "
-            f"dram={num} hbm_idx=[{int(hbm_np.min())}..{int(hbm_np.max())}] "
-            f"hbm_caps={min(hbm_caps)}..{max(hbm_caps)} n_hbm={n_hbm}"
+            f"dram={num} pages={num_pages} n_hbm_pages={n_hbm}"
         )
         ret = self.dram_pool.promote(entries, self.kv_args.gpu_id)
         if ret != 0:
@@ -546,15 +555,23 @@ class AscendKVManager(MooncakeKVManager):
         # The AIV copy must land before the DRAM pages are recycled, otherwise
         # a newly-allocated transfer could race with the in-flight copy.
         torch.npu.synchronize()
+        # Rewire req_to_token: k-th DRAM page -> k-th HBM page, keeping the
+        # intra-page token offset. searchsorted maps each synthetic token's
+        # global page back to its position in the unique ascending gpages.
+        k = np.searchsorted(gpages, dram_np // page_size)
+        new_tokens = hbm_pages[k] * page_size + (dram_np % page_size)
         # req_to_token is int32 while allocator indices are int64; aclnn's
         # index_put requires both sides to match or it fails with 161002
         # (AclNN_Parameter_Error dtype mismatch).
-        row[dram_mask] = hbm_loc.to(row.device).to(torch.int32)
+        row[dram_mask] = (
+            torch.from_numpy(new_tokens.astype(np.int32)).to(row.device)
+        )
         self.dram_pool.free_tokens(dram_tokens)
         total_bytes = sum(e[2] for e in entries)
         logger.info(
-            f"[DRAM] promote done: rid={req.rid} tokens={num} entries={len(entries)} "
-            f"bytes={total_bytes / 1e6:.1f}MB elapsed={(_time.time() - t0) * 1e3:.1f}ms"
+            f"[DRAM] promote done: rid={req.rid} tokens={num} pages={num_pages} "
+            f"entries={len(entries)} bytes={total_bytes / 1e6:.1f}MB "
+            f"elapsed={(_time.time() - t0) * 1e3:.1f}ms"
         )
         return True
 
