@@ -24,7 +24,7 @@ export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 
 MODEL_PATH=${MODEL_PATH:-/home/weights/GLM-5.2-W8A8C8-mxfp8}
 DRAM_POOL_GB=${DRAM_POOL_GB:-64}          # Decode DRAM 接收池大小 (GB)
-MEM_FRACTION=${MEM_FRACTION:-0.922}       # 压小可提前触发 KV 落 DRAM
+MEM_FRACTION=${MEM_FRACTION:-0.91}       # 压小可提前触发 KV 落 DRAM
 
 unset https_proxy
 unset http_proxy
@@ -126,7 +126,7 @@ do
             --tp-size 8 \
             --mem-fraction-static $MEM_FRACTION \
             --chunked-prefill-size 8192 \
-            --cuda-graph-bs 16 \
+            --disable-cuda-graph \
             --max-running-requests 64 \
             --host 0.0.0.0 \
             --port 31000 \
@@ -139,6 +139,8 @@ do
         exit 1
     fi
 done
+
+            #--cuda-graph-bs 16 \
 
 # --------------- router + 压测（本机非 P/D 节点时才会走到这里）----------------
 # python -m sglang_router.launch_router \
