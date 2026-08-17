@@ -134,8 +134,17 @@ class AscendKVManager(MooncakeKVManager):
             ("aux", self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens),
         ):
             for i, (p, l) in enumerate(zip(plist, llist)):
-                if 0 < l < 64 * 1024 * 1024 or l > 1024 * 1024 * 1024:
-                    logger.debug(f"[DRAM] register manifest: {name}[{i}] 0x{p:x} len={l}")
+                if l < 256 * 1024 * 1024:
+                    logger.info(
+                        f"[DRAM] register manifest: {name}[{i}] 0x{int(p):x} len={l}"
+                    )
+        for j, (component_ptrs, component_lens) in enumerate(
+            zip(self.kv_args.state_data_ptrs or [], self.kv_args.state_data_lens or [])
+        ):
+            for i, (p, l) in enumerate(zip(component_ptrs, component_lens)):
+                logger.info(
+                    f"[DRAM] register manifest: state[{j}][{i}] 0x{int(p):x} len={l}"
+                )
         if ptrs:
             self.engine.batch_register(ptrs, lens)
 
