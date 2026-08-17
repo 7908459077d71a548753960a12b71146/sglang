@@ -88,8 +88,9 @@ do
     then
         echo "Prefill -> ${P_IP[$i]}"
 
-        export DEEPEP_HCCL_BUFFSIZE=2048
-
+        # P 为单机 8 卡: deep_ep normal 的 pure intranode dispatch 路径在当前
+        # deep_ep NPU 构建上会挂死/向量核异常(507035), 已用单机非 PD 部署复现;
+        # 单机无需 a2a, MoE 走标准 TP 路径(base.sh 16 rank 走 internode 故未踩中)
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
             --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
@@ -107,8 +108,6 @@ do
             --max-running-requests 64 \
             --host 0.0.0.0 \
             --port 31000 \
-            --moe-a2a-backend deepep \
-            --deepep-mode normal \
             --watchdog-timeout 9000 \
             --disable-cuda-graph
 
