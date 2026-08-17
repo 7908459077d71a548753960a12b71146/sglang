@@ -476,6 +476,14 @@ class AscendKVManager(MooncakeKVManager):
                 src = self.dram_pool.layer_src_dva(layer_id, int(dram_np[start]) - n_hbm)
                 dst = hbm_ptrs[layer_id] + int(hbm_np[start]) * item_len
                 entries.append((src, dst, cnt * item_len))
+        # Isolation probe: sync BEFORE the AIV copy so a device fault here
+        # exonerates sparse_copy (the fault would come from concurrently
+        # running forward kernels, e.g. deepep/attention).
+        torch.npu.synchronize()
+        logger.info(
+            f"[DRAM] promote pre-sync ok: rid={req.rid} committed={length} "
+            f"dram={num} alloc_span={int(row.shape[0])}"
+        )
         ret = self.dram_pool.promote(entries, self.kv_args.gpu_id)
         if ret != 0:
             allocator.free(hbm_loc)
