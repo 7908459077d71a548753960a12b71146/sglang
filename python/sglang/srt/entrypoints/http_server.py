@@ -2145,17 +2145,10 @@ async def _send_disaggregation_warmup_requests(
             "input_ids": [10, 11, 12, 13],
             "routed_dp_rank": dp_rank,
         }
-        t0 = time.monotonic()
         async with session.post(
             url + "/generate", json=json_data, ssl=ssl_context
         ) as response:
             await response.read()
-            logger.info(
-                "[DRAM] PD warmup request finished: dp_rank=%d status=%d elapsed=%.1fs",
-                dp_rank,
-                response.status,
-                time.monotonic() - t0,
-            )
             return response.status
 
     async with aiohttp.ClientSession(

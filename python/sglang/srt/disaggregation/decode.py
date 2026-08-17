@@ -2269,7 +2269,6 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
-        logger.info("[DRAM] Decode disagg event loop started")
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
@@ -2305,12 +2304,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Launch the current batch
             if batch:
-                logger.info(
-                    "[DRAM] D launching decode batch: bs=%d",
-                    batch.batch_size() if hasattr(batch, "batch_size") else -1,
-                )
                 batch_result = self.run_batch(batch)
-                logger.info("[DRAM] D run_batch returned (forward submitted)")
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -2320,7 +2314,6 @@ class SchedulerDisaggregationDecodeMixin:
             if self.last_batch:
                 if not disable_overlap_for_batch:
                     pop_and_process()
-                    logger.info("[DRAM] D batch result processed (forward cycle done)")
             elif batch is None:
                 self.on_idle()
 

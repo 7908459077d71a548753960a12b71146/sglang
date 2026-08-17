@@ -605,7 +605,6 @@ class SchedulerDisaggregationPrefillMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
-        logger.info("[DRAM] Prefill disagg event loop started")
         self.result_queue = deque()
 
         while True:
@@ -633,13 +632,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                logger.info(
-                    "[DRAM] P launching prefill batch: n_reqs=%d n_tokens=%d",
-                    len(batch.reqs),
-                    batch.extend_sum_seq_len if hasattr(batch, "extend_sum_seq_len") else -1,
-                )
                 batch_result = self.run_batch(batch)
-                logger.info("[DRAM] P run_batch returned (forward submitted)")
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -649,7 +642,6 @@ class SchedulerDisaggregationPrefillMixin:
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
-                logger.info("[DRAM] P batch result processed (forward cycle done)")
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
