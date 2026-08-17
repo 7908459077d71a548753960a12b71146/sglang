@@ -605,6 +605,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
+        logger.info("[DRAM] Prefill disagg event loop started")
         self.result_queue = deque()
 
         while True:

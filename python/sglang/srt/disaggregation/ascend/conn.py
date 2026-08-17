@@ -121,6 +121,10 @@ class AscendKVManager(MooncakeKVManager):
             )
         if ptrs:
             self.engine.batch_register(ptrs, lens)
+        logger.info(
+            f"[DRAM] register: batch_register done, {len(ptrs)} buffers "
+            f"({'hbm+dram' if self.dram_pool is not None else 'hbm only'})"
+        )
 
     def deregister_buffer_to_engine(self):
         super().deregister_buffer_to_engine()
@@ -381,11 +385,19 @@ class AscendKVManager(MooncakeKVManager):
         n_hbm = self.dram_pool.n_hbm_tokens
         length = getattr(req, "kv_committed_len", 0)
         if length <= 0:
+            logger.info(f"[DRAM] promote skip: rid={req.rid} nothing committed yet")
             return True
         row = req_to_token_pool.req_to_token[req.req_pool_idx][:length]
         dram_mask = row >= n_hbm
         num = int(dram_mask.sum().item())
         if num == 0:
+            # Silent-but-normal path: the whole request landed in HBM (watermark
+            # not tripped), nothing to lift. Logged so "hook fired with no
+            # follow-up" is distinguishable from a hang.
+            logger.info(
+                f"[DRAM] promote skip: rid={req.rid} len={length}, all tokens "
+                f"already in HBM (n_hbm={n_hbm})"
+            )
             return True
         import time as _time
 

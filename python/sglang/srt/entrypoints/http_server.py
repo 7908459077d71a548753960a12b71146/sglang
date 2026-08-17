@@ -2151,7 +2151,7 @@ async def _send_disaggregation_warmup_requests(
         ) as response:
             await response.read()
             logger.info(
-                "PD warmup request finished: dp_rank=%d status=%d elapsed=%.1fs",
+                "[DRAM] PD warmup request finished: dp_rank=%d status=%d elapsed=%.1fs",
                 dp_rank,
                 response.status,
                 time.monotonic() - t0,
@@ -2322,7 +2322,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                     failed_status_codes,
                 )
             logger.info(
-                "End of pd disaggregation warmup (mode=%s, success=%s, elapsed=%.1fs)",
+                "[DRAM] End of pd disaggregation warmup (mode=%s, success=%s, elapsed=%.1fs)",
                 server_args.disaggregation_mode,
                 not failed_status_codes,
                 warmup_elapsed,

@@ -510,7 +510,16 @@ class Scheduler(
         maybe_revert_pr_fix()
 
         # Launch a model worker and draft model worker if using speculative decoding
+        logger.info(
+            "[DRAM] Scheduler init: begin model worker construction (weight load, tp_rank=%d)",
+            tp_rank,
+        )
         self.init_model_worker()
+        logger.info(
+            "[DRAM] Scheduler init: model worker ready (weights loaded), begin kv cache "
+            "build with profile run, tp_rank=%d",
+            tp_rank,
+        )
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
@@ -541,6 +550,10 @@ class Scheduler(
                 if self.draft_worker is not None
                 else None
             ),
+        )
+        logger.info(
+            "[DRAM] Scheduler init: kv cache build done (profile + pools), tp_rank=%d",
+            tp_rank,
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -651,6 +664,12 @@ class Scheduler(
         self.init_batch_result_processor()
 
         self.is_initializing = False
+        logger.info(
+            "[DRAM] Scheduler init complete (mode=%s, tp_rank=%d), startup=%.1fs",
+            self.server_args.disaggregation_mode,
+            tp_rank,
+            time.perf_counter() - self.scheduler_startup_begin,
+        )
         self.init_startup_timing_summary()
 
     def init_startup_timing_begin(self) -> None:
@@ -1867,6 +1886,16 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        if recv_reqs:
+            n_gen = sum(
+                isinstance(r, (TokenizedGenerateReqInput, BatchTokenizedGenerateReqInput))
+                for r in recv_reqs
+            )
+            if n_gen:
+                logger.info(
+                    "[DRAM] Scheduler received %d generate request(s) from tokenizer",
+                    n_gen,
+                )
         if self.server_args.mm_feature_transport == "cuda_vmm":
             for recv_req in recv_reqs:
                 self._materialize_cuda_vmm_inputs(recv_req)
