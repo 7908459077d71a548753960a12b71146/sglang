@@ -24,7 +24,7 @@ export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 
 MODEL_PATH=${MODEL_PATH:-/home/weights/GLM-5.2-W8A8C8-mxfp8}
 DRAM_POOL_GB=${DRAM_POOL_GB:-64}          # Decode DRAM 接收池大小 (GB)
-MEM_FRACTION=${MEM_FRACTION:-0.91}       # 压小可提前触发 KV 落 DRAM
+MEM_FRACTION=${MEM_FRACTION:-0.922}       # 压小可提前触发 KV 落 DRAM
 
 unset https_proxy
 unset http_proxy
