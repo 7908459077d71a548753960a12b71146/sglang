@@ -27,7 +27,7 @@ DRAM_POOL_GB=${DRAM_POOL_GB:-64}          # Decode DRAM 接收池大小 (GB)
 # P/D 解耦: P(prefill) 8192-token 大 batch 需要大量激活内存, fraction 过高会在
 # MoE dispatch(AIV kernel) 内存耗尽 -> 507035 向量核异常; D(decode) batch 小,
 # 可用高 fraction 换更大 HBM KV 池
-P_MEM_FRACTION=${P_MEM_FRACTION:-0.85}
+P_MEM_FRACTION=${P_MEM_FRACTION:-0.91}
 D_MEM_FRACTION=${D_MEM_FRACTION:-0.91}
 
 unset https_proxy
