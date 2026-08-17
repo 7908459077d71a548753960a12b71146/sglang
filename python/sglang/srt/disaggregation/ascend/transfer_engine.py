@@ -133,7 +133,12 @@ class AscendTransferEngine(MooncakeTransferEngine):
         if ret_value != 0:
             logger.error(
                 f"[DRAM] Ascend memory registration for {len(ptrs)} buffers failed "
-                f"(ret={ret_value}), first_ptr=0x{ptrs[0]:x}"
+                f"(ret={ret_value}), first_ptr=0x{ptrs[0]:x}. NOTE: the failing "
+                f"slice reported by the memfabric logs may be an internal "
+                f"memfabric/smem_trans buffer interleaved into the same batch "
+                f"(its va/size will not appear in the sglang register "
+                f"manifest) - cross-check before attributing it to a KV/aux/"
+                f"DRAM pool buffer."
             )
 
     @staticmethod
