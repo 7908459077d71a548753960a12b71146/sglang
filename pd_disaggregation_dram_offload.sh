@@ -27,8 +27,12 @@ DRAM_POOL_GB=${DRAM_POOL_GB:-64}          # Decode DRAM 接收池大小 (GB)
 # P/D 解耦: P(prefill) 8192-token 大 batch 需要大量激活内存, fraction 过高会在
 # MoE dispatch(AIV kernel) 内存耗尽 -> 507035 向量核异常; D(decode) batch 小,
 # 可用高 fraction 换更大 HBM KV 池
-P_MEM_FRACTION=${P_MEM_FRACTION:-0.91}
-D_MEM_FRACTION=${D_MEM_FRACTION:-0.91}
+P_MEM_FRACTION=${P_MEM_FRACTION:-0.85}
+# 调试用: 压缩 D 的 HBM KV 池到 ~128 token(1页), 令所有请求落 DRAM 以观察
+# 写池+提升流程。换算(128GB 卡, 实测 0.105MB/token): 斜率≈124.8万 token/1.0,
+# 零KV基线 f0≈0.7799, 目标128tok -> f≈0.7800; 每 ±0.0005 ≈ ±620 tok,
+# 以启动日志 "#tokens:" 为准微调(为0则+0.0005)。恢复正常运行改回 0.91。
+D_MEM_FRACTION=${D_MEM_FRACTION:-0.7800}
 
 unset https_proxy
 unset http_proxy

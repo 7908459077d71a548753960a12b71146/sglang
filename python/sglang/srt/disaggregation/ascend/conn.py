@@ -201,6 +201,22 @@ class AscendKVManager(MooncakeKVManager):
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
         )
+        if dram_dst_ptrs is not None and n_hbm is not None:
+            # One summary line per request for DRAM-pool writes (the per-block
+            # details below are demoted to debug to keep this observable).
+            try:
+                total_dst = sum(len(bl) for bl in dst_kv_blocks)
+                dram_dst = sum(
+                    int((np.asarray(bl) >= n_hbm).sum()) for bl in dst_kv_blocks
+                )
+                if dram_dst > 0:
+                    logger.info(
+                        f"[DRAM] send_kvcache: writing {dram_dst}/{total_dst} dst "
+                        f"tokens to DRAM pool (n_hbm={n_hbm}), "
+                        f"session={mooncake_session_id}"
+                    )
+            except Exception:
+                pass
 
         if self.pp_size > 1:
             if self.is_mla_backend:
@@ -285,7 +301,7 @@ class AscendKVManager(MooncakeKVManager):
                 if dram_ptr is None or same_pool:
                     base, off = (dst_ptr, 0) if first < n_hbm else (dram_ptr, n_hbm)
                     if first >= n_hbm:
-                        logger.info(
+                        logger.debug(
                             f"[DRAM] xfer block: DRAM dst=0x{base + (first - off) * item_len:x} "
                             f"len={item_len * len(prefill_index)} idx=[{first}..{last}]"
                         )
@@ -298,7 +314,7 @@ class AscendKVManager(MooncakeKVManager):
                     )
                     continue
                 mid = int(np.searchsorted(decode_index, n_hbm))
-                logger.info(
+                logger.debug(
                     f"[DRAM] xfer block split at n_hbm={n_hbm}: "
                     f"hbm_part={mid} dram_part={len(prefill_index) - mid} idx=[{first}..{last}]"
                 )
@@ -435,9 +451,10 @@ class AscendKVManager(MooncakeKVManager):
         torch.npu.synchronize()
         row[dram_mask] = hbm_loc.to(row.device)
         self.dram_pool.free_tokens(dram_tokens)
+        total_bytes = sum(e[2] for e in entries)
         logger.info(
             f"[DRAM] promote done: rid={req.rid} tokens={num} entries={len(entries)} "
-            f"elapsed={(_time.time() - t0) * 1e3:.1f}ms"
+            f"bytes={total_bytes / 1e6:.1f}MB elapsed={(_time.time() - t0) * 1e3:.1f}ms"
         )
         return True
 
