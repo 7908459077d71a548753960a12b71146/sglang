@@ -48,12 +48,17 @@ export ASCEND_LAUNCH_BLOCKING=1
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
-export HCCL_BUFFSIZE=2000
+# deepep/HCCL 关键环境（对齐已验证可跑通的 base.sh）
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=35
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=64
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
-
 export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_CONNECT_TIMEOUT=300
+export HCCL_EXEC_TIMEOUT=68
+export ACL_DEVICE_SYNC_TIMEOUT=60
+export HCCL_HOST_SOCKET_PORT_RANGE=auto
+export ASCEND_USE_FIA=1
+export SGLANG_NPU_USE_MLAPO=1
 
 export PYTHONPATH=`pwd`/python:$PYTHONPATH
 
@@ -83,6 +88,8 @@ do
     then
         echo "Prefill -> ${P_IP[$i]}"
 
+        export DEEPEP_HCCL_BUFFSIZE=2048
+
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
             --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
@@ -102,6 +109,7 @@ do
             --port 31000 \
             --moe-a2a-backend deepep \
             --deepep-mode normal \
+            --watchdog-timeout 9000 \
             --disable-cuda-graph
 
         exit 1
@@ -114,8 +122,7 @@ do
     then
         echo "Decode -> ${D_IP[$i]}"
 
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
-        export HCCL_BUFFSIZE=2000
+        export DEEPEP_HCCL_BUFFSIZE=400
 
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
@@ -130,12 +137,13 @@ do
             --tp-size 8 \
             --mem-fraction-static $D_MEM_FRACTION \
             --chunked-prefill-size 8192 \
-            --disable-cuda-graph \
+            --cuda-graph-bs 16 \
             --max-running-requests 64 \
             --host 0.0.0.0 \
             --port 31000 \
             --moe-a2a-backend deepep \
             --deepep-mode low_latency \
+            --watchdog-timeout 9000 \
             --disaggregation-decode-dram-pool-size $DRAM_POOL_GB \
             --num-reserved-decode-tokens 2048 \
             --disaggregation-decode-polling-interval 2
@@ -143,8 +151,6 @@ do
         exit 1
     fi
 done
-
-            #--cuda-graph-bs 16 \
 
 # --------------- router + 压测（本机非 P/D 节点时才会走到这里）----------------
 # python -m sglang_router.launch_router \
