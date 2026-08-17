@@ -48,7 +48,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export MF_HYBM_USE_VMM_SEGMENT=1
 export STREAMS_PER_DEVICE=32
-export ASCEND_LAUNCH_BLOCKING=1
+export ASCEND_LAUNCH_BLOCKING=0
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
