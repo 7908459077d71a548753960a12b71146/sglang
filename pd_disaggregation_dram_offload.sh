@@ -35,7 +35,9 @@ unset ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+# 注意: URMA(DEVICE_URMA) 注册路径下禁止 expandable_segments —— VMM 显存无法被
+# RtIpcSetMemoryName IPC 命名(507899), batch_register 会失败; e2e(trans_offload)验证过常规堆 OK
+# export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
