@@ -119,6 +119,23 @@ class AscendKVManager(MooncakeKVManager):
                 f"[DRAM] register: appended {len(dram_ptrs)} dram layers, "
                 f"first=0x{dram_ptrs[0]:x} len={dram_lens[0]}"
             )
+        # Per-component registration manifest: maps a failing slice index in
+        # the memfabric logs (sliceIdx N of batch_register) back to its origin.
+        n_dram = len(dram_ptrs) if self.dram_pool is not None else 0
+        logger.info(
+            f"[DRAM] register manifest: kv={len(self.kv_args.kv_data_ptrs)} "
+            f"aux={len(self.kv_args.aux_data_ptrs)} "
+            f"state={[len(p) for p in (self.kv_args.state_data_ptrs or [])]} "
+            f"dram={n_dram} "
+            f"total={len(ptrs)}"
+        )
+        for name, plist, llist in (
+            ("kv", self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens),
+            ("aux", self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens),
+        ):
+            for i, (p, l) in enumerate(zip(plist, llist)):
+                if 0 < l < 64 * 1024 * 1024 or l > 1024 * 1024 * 1024:
+                    logger.debug(f"[DRAM] register manifest: {name}[{i}] 0x{p:x} len={l}")
         if ptrs:
             self.engine.batch_register(ptrs, lens)
 
@@ -457,7 +474,10 @@ class AscendKVManager(MooncakeKVManager):
         # The AIV copy must land before the DRAM pages are recycled, otherwise
         # a newly-allocated transfer could race with the in-flight copy.
         torch.npu.synchronize()
-        row[dram_mask] = hbm_loc.to(row.device)
+        # req_to_token is int32 while allocator indices are int64; aclnn's
+        # index_put requires both sides to match or it fails with 161002
+        # (AclNN_Parameter_Error dtype mismatch).
+        row[dram_mask] = hbm_loc.to(row.device).to(torch.int32)
         self.dram_pool.free_tokens(dram_tokens)
         total_bytes = sum(e[2] for e in entries)
         logger.info(
