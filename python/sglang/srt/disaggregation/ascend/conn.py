@@ -471,18 +471,73 @@ class AscendKVManager(MooncakeKVManager):
             f"hbm_idx=[{int(hbm_np[0])}..{int(hbm_np[-1])}]"
         )
         entries = []
+        bad_entries = []
+        # Per-layer HBM capacity (tokens) from the registered buffer geometry;
+        # with heterogeneous per-layer item_lens (GLM-5.2), layer-0-derived
+        # n_hbm may not match every layer's capacity.
+        hbm_caps = [
+            l // il if il else 0
+            for l, il in zip(self.kv_args.kv_data_lens, self.kv_args.kv_item_lens)
+        ]
         for start, cnt in self._co_segments(dram_np, hbm_np):
             for layer_id, item_len in enumerate(item_lens):
-                src = self.dram_pool.layer_src_dva(layer_id, int(dram_np[start]) - n_hbm)
+                tok = int(dram_np[start]) - n_hbm
+                src = self.dram_pool.layer_src_dva(layer_id, tok)
                 dst = hbm_ptrs[layer_id] + int(hbm_np[start]) * item_len
                 entries.append((src, dst, cnt * item_len))
+                # Range validation: DRAM side within pool tokens, HBM side
+                # within this layer's buffer. The plog fault "MTE DDR address
+                # out of range" (errcode 95) points at an out-of-bounds entry.
+                if tok < 0 or tok + cnt > self.dram_pool.size:
+                    bad_entries.append(("dram", layer_id, tok, cnt))
+                if layer_id < len(hbm_caps) and (
+                    int(hbm_np[start]) + cnt > hbm_caps[layer_id]
+                ):
+                    bad_entries.append(("hbm", layer_id, int(hbm_np[start]), cnt))
+        if bad_entries:
+            logger.error(
+                f"[DRAM] promote RANGE VIOLATION: n_hbm={n_hbm} "
+                f"dram_size={self.dram_pool.size} hbm_caps min/max="
+                f"{min(hbm_caps)}/{max(hbm_caps)} layer0_cap={hbm_caps[0] if hbm_caps else -1} "
+                f"hbm_idx=[{int(hbm_np.min())}..{int(hbm_np.max())}] "
+                f"bad(first 5)={bad_entries[:5]}"
+            )
+        # Encoding-boundary sanity: n_hbm is derived from LAYER 0's geometry;
+        # with heterogeneous per-layer item_lens (MLA/DSA packing) it must
+        # still equal the allocator's real token capacity, and every layer's
+        # registered length must equal tokens*item_len with the SAME ordering
+        # as hbm_ptrs — a ptr/item_len mispairing produces out-of-range dst.
+        real_pool = getattr(getattr(allocator, "inner", allocator), "size", None)
+        if real_pool is not None and int(real_pool) != n_hbm:
+            logger.error(
+                f"[DRAM] ENCODING MISMATCH: n_hbm(layer0-derived)={n_hbm} but "
+                f"allocator pool size={real_pool} — global page encoding is "
+                f"wrong (watermark, P-side DRAM addressing, promote split)"
+            )
+        mism = [
+            (l, int(pl), int(kl))
+            for l, (pl, kl) in enumerate(
+                zip(
+                    hbm_kv_pool.get_contiguous_buf_infos()[1],
+                    self.kv_args.kv_data_lens,
+                )
+            )
+            if pl != kl
+        ][:5]
+        if mism:
+            logger.error(
+                f"[DRAM] LAYER PAIRING MISMATCH (pool_len != kv_data_len), "
+                f"first 5 (layer, pool_len, kv_len)={mism} — ptrs/item_lens "
+                f"ordering inconsistent, dst addressing overflows layers"
+            )
         # Isolation probe: sync BEFORE the AIV copy so a device fault here
         # exonerates sparse_copy (the fault would come from concurrently
         # running forward kernels, e.g. deepep/attention).
         torch.npu.synchronize()
         logger.info(
             f"[DRAM] promote pre-sync ok: rid={req.rid} committed={length} "
-            f"dram={num} alloc_span={int(row.shape[0])}"
+            f"dram={num} hbm_idx=[{int(hbm_np.min())}..{int(hbm_np.max())}] "
+            f"hbm_caps={min(hbm_caps)}..{max(hbm_caps)} n_hbm={n_hbm}"
         )
         ret = self.dram_pool.promote(entries, self.kv_args.gpu_id)
         if ret != 0:
