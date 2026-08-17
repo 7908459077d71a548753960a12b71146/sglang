@@ -37,7 +37,8 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 # 注意: URMA(DEVICE_URMA) 注册路径下禁止 expandable_segments —— VMM 显存无法被
 # RtIpcSetMemoryName IPC 命名(507899), batch_register 会失败; e2e(trans_offload)验证过常规堆 OK
-# export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export MF_HYBM_USE_VMM_SEGMENT=1
 export STREAMS_PER_DEVICE=32
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
@@ -93,7 +94,7 @@ do
             --chunked-prefill-size 8192 \
             --max-running-requests 64 \
             --host 0.0.0.0 \
-            --port 30000 \
+            --port 31000 \
             --moe-a2a-backend deepep \
             --deepep-mode normal \
             --disable-cuda-graph
@@ -127,7 +128,7 @@ do
             --cuda-graph-bs 16 \
             --max-running-requests 64 \
             --host 0.0.0.0 \
-            --port 30000 \
+            --port 31000 \
             --moe-a2a-backend deepep \
             --deepep-mode low_latency \
             --disaggregation-decode-dram-pool-size $DRAM_POOL_GB \
@@ -139,35 +140,35 @@ do
 done
 
 # --------------- router + 压测（本机非 P/D 节点时才会走到这里）----------------
-python -m sglang_router.launch_router \
-    --pd-disaggregation --policy cache_aware \
-    --prefill http://141.61.50.31:30000 8998 \
-    --decode http://141.61.49.195:30000 \
-    --host 0.0.0.0 --port 6688
+# python -m sglang_router.launch_router \
+#     --pd-disaggregation --policy cache_aware \
+#     --prefill http://141.61.50.31:31000 8998 \
+#     --decode http://141.61.49.195:31000 \
+#     --host 0.0.0.0 --port 6688
 
-curl --location 'http://141.61.50.31:30000/flush_cache' --header 'Content-Type: application/json'
-python -m sglang.bench_serving \
-    --dataset-path /home/zkk/datasets/ShareGPT_V3_unfiltered_cleaned_split.json \
-    --dataset-name random \
-    --backend sglang \
-    --host 141.61.49.195 \
-    --port 6688 \
-    --max-concurrency 1 \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --num-prompts 1 \
-    --disable-ignore-eos \
-    --random-range-ratio 1 \
-    --warmup-request 0
+curl --location 'http://141.61.50.31:31000/flush_cache' --header 'Content-Type: application/json'
+# python -m sglang.bench_serving \
+#     --dataset-path /home/zkk/datasets/ShareGPT_V3_unfiltered_cleaned_split.json \
+#     --dataset-name random \
+#     --backend sglang \
+#     --host 141.61.49.195 \
+#     --port 6688 \
+#     --max-concurrency 1 \
+#     --random-input-len 8000 \
+#     --random-output-len 1000 \
+#     --num-prompts 1 \
+#     --disable-ignore-eos \
+#     --random-range-ratio 1 \
+#     --warmup-request 0
 
-python3 -m sglang.bench_serving \
-    --dataset-name generated-shared-prefix \
-    --backend sglang --host 141.61.49.195 \
-    --port 6688 \
-    --max-concurrency 1 \
-    --gsp-num-groups 1 \
-    --gsp-prompts-per-group 1 \
-    --gsp-system-prompt-len 127620 \
-    --gsp-question-len 1280 \
-    --gsp-output-len 1000 \
-    --warmup-requests 4
+# python3 -m sglang.bench_serving \
+#     --dataset-name generated-shared-prefix \
+#     --backend sglang --host 141.61.49.195 \
+#     --port 6688 \
+#     --max-concurrency 1 \
+#     --gsp-num-groups 1 \
+#     --gsp-prompts-per-group 1 \
+#     --gsp-system-prompt-len 127620 \
+#     --gsp-question-len 1280 \
+#     --gsp-output-len 1000 \
+#     --warmup-requests 4
