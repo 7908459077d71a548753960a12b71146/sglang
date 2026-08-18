@@ -126,8 +126,11 @@ class AscendKVManager(MooncakeKVManager):
                 f"[DRAM] register: appended {len(dram_ptrs)} dram layers, "
                 f"first=0x{dram_ptrs[0]:x} len={dram_lens[0]}"
             )
-        # Per-component registration manifest: maps a failing slice index in
-        # the memfabric logs (sliceIdx N of batch_register) back to its origin.
+        # Per-component registration manifest (summary only): component
+        # counts map a failing slice index in the memfabric logs back to its
+        # origin component. Per-buffer details are demoted to debug; the
+        # batch is 2MiB-aligned and merged inside memfabric, so a 1:1
+        # sliceIdx->buffer mapping is approximate anyway.
         n_dram = len(dram_ptrs) if self.dram_pool is not None else 0
         logger.info(
             f"[DRAM] register manifest: kv={len(self.kv_args.kv_data_ptrs)} "
@@ -142,14 +145,14 @@ class AscendKVManager(MooncakeKVManager):
         ):
             for i, (p, l) in enumerate(zip(plist, llist)):
                 if l < 256 * 1024 * 1024:
-                    logger.info(
+                    logger.debug(
                         f"[DRAM] register manifest: {name}[{i}] 0x{int(p):x} len={l}"
                     )
         for j, (component_ptrs, component_lens) in enumerate(
             zip(self.kv_args.state_data_ptrs or [], self.kv_args.state_data_lens or [])
         ):
             for i, (p, l) in enumerate(zip(component_ptrs, component_lens)):
-                logger.info(
+                logger.debug(
                     f"[DRAM] register manifest: state[{j}][{i}] 0x{int(p):x} len={l}"
                 )
         if ptrs:
