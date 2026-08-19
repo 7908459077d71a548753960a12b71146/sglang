@@ -95,9 +95,11 @@ do
     then
         echo "Prefill -> ${P_IP[$i]}"
 
-        LOAD_ARGS=""
+        # dummy 与 --model-loader-extra-config 互斥(loader.py DummyModelLoader
+        # 显式拒绝 extra config), dummy 模式下两者都不传
+        LOADER_ARGS="--model-loader-extra-config {\"enable_multithread_load\": true}"
         if [[ -n "$LOAD_FORMAT" ]]; then
-            LOAD_ARGS="--load-format $LOAD_FORMAT"
+            LOADER_ARGS="--load-format $LOAD_FORMAT"
             echo "load-format=$LOAD_FORMAT (debug, skip real weights)"
         fi
 
@@ -105,8 +107,7 @@ do
         # deep_ep NPU 构建上会挂死/向量核异常(507035), 已用单机非 PD 部署复现;
         # 单机无需 a2a, MoE 走标准 TP 路径(base.sh 16 rank 走 internode 故未踩中)
         sglang serve \
-            --model-loader-extra-config '{"enable_multithread_load": true}' \
-            $LOAD_ARGS \
+            $LOADER_ARGS \
             --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
             --disaggregation-bootstrap-port $((8998+$i)) \
             --model-path $MODEL_PATH \
@@ -137,15 +138,16 @@ do
 
         export DEEPEP_HCCL_BUFFSIZE=400
 
-        LOAD_ARGS=""
+        # dummy 与 --model-loader-extra-config 互斥(loader.py DummyModelLoader
+        # 显式拒绝 extra config), dummy 模式下两者都不传
+        LOADER_ARGS="--model-loader-extra-config {\"enable_multithread_load\": true}"
         if [[ -n "$LOAD_FORMAT" ]]; then
-            LOAD_ARGS="--load-format $LOAD_FORMAT"
+            LOADER_ARGS="--load-format $LOAD_FORMAT"
             echo "load-format=$LOAD_FORMAT (debug, skip real weights)"
         fi
 
         sglang serve \
-            --model-loader-extra-config '{"enable_multithread_load": true}' \
-            $LOAD_ARGS \
+            $LOADER_ARGS \
             --disaggregation-mode decode --disaggregation-transfer-backend ascend \
             --model-path $MODEL_PATH \
             --tokenizer-path $MODEL_PATH \
