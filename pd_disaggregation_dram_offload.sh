@@ -24,6 +24,9 @@ export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 
 MODEL_PATH=${MODEL_PATH:-/home/weights/GLM-5.2-W8A8C8-mxfp8}
 DRAM_POOL_GB=${DRAM_POOL_GB:-8}           # Decode DRAM 接收池大小 (GB)
+# 调试快速拉起: LOAD_FORMAT=dummy 跳过真实权重加载(随机初始化, 不读磁盘权重文件),
+# 仅用于传输/调度链路验证, 推理输出无意义; 默认空=正常加载
+LOAD_FORMAT=${LOAD_FORMAT:-}
 # P/D 解耦: P(prefill) 8192-token 大 batch 需要大量激活内存, fraction 过高会在
 # MoE dispatch(AIV kernel) 内存耗尽 -> 507035 向量核异常; D(decode) batch 小,
 # 可用高 fraction 换更大 HBM KV 池
@@ -92,11 +95,18 @@ do
     then
         echo "Prefill -> ${P_IP[$i]}"
 
+        LOAD_ARGS=""
+        if [[ -n "$LOAD_FORMAT" ]]; then
+            LOAD_ARGS="--load-format $LOAD_FORMAT"
+            echo "load-format=$LOAD_FORMAT (debug, skip real weights)"
+        fi
+
         # P 为单机 8 卡: deep_ep normal 的 pure intranode dispatch 路径在当前
         # deep_ep NPU 构建上会挂死/向量核异常(507035), 已用单机非 PD 部署复现;
         # 单机无需 a2a, MoE 走标准 TP 路径(base.sh 16 rank 走 internode 故未踩中)
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
+            $LOAD_ARGS \
             --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
             --disaggregation-bootstrap-port $((8998+$i)) \
             --model-path $MODEL_PATH \
@@ -127,8 +137,15 @@ do
 
         export DEEPEP_HCCL_BUFFSIZE=400
 
+        LOAD_ARGS=""
+        if [[ -n "$LOAD_FORMAT" ]]; then
+            LOAD_ARGS="--load-format $LOAD_FORMAT"
+            echo "load-format=$LOAD_FORMAT (debug, skip real weights)"
+        fi
+
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
+            $LOAD_ARGS \
             --disaggregation-mode decode --disaggregation-transfer-backend ascend \
             --model-path $MODEL_PATH \
             --tokenizer-path $MODEL_PATH \
