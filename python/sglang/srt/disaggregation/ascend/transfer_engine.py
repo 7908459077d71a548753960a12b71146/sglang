@@ -146,7 +146,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
         # device_urma: cross-node transfer over UBC (EID addressing), required
         # for the decode DRAM offload path.
-        allowed_protocols = {"device_rdma", "sdma", "device_urma"}
+        allowed_protocols = {"device_rdma", "sdma", "device_urma", "device_uboe"}
         if protocol and protocol.lower() in allowed_protocols:
             return protocol.lower()
         else:
