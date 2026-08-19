@@ -2,10 +2,10 @@
 # ============================================================================
 # PD 分离 + Decode KV cache DRAM offload 启动脚本（A5 / ASCEND_950，memfabric URMA）
 #
-# 拓扑: Prefill 单机 8 卡 (141.61.50.198) + Decode 单机 8 卡 (141.61.49.195)
+# 拓扑: Prefill 单机 8 卡 (141.61.49.198) + Decode 单机 8 卡 (141.61.49.195)
 #
 # 用法（无需参数, 按 hostname -I 自动识别本机角色）:
-#   Prefill 节点 (141.61.50.198): bash pd_disaggregation_dram_offload.sh
+#   Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 #   Decode  节点 (141.61.49.195): bash pd_disaggregation_dram_offload.sh
 #
 # 新特性 (commit d83bba4): --disaggregation-decode-dram-pool-size <GB>
@@ -67,13 +67,13 @@ export SGLANG_NPU_USE_MLAPO=1
 export PYTHONPATH=`pwd`/python:$PYTHONPATH
 
 # --------------------- PD 拓扑: P 单机 8 卡 + D 单机 8 卡 ---------------------
-P_IP=('141.61.50.198')
+P_IP=('141.61.49.198')
 D_IP=('141.61.49.195')
 
 # 跨机 URMA 传输 + DRAM 池远端直写（P/D 两侧均需, 仅 A5 支持）
 export ASCEND_MF_TRANSFER_PROTOCOL=device_urma
 # session store, P/D 两侧均可达（挂在 Prefill 节点）
-export MF_CONFIG_STORE_URL="tcp://141.61.50.198:24669"
+export MF_CONFIG_STORE_URL="tcp://141.61.49.198:24669"
 # offload 组件依赖库（如已装到默认路径可不设）
 # export MEMFABRIC_HYBRID_EXTEND_LIB_PATH=/path/to/libmf_hybm_accoffload.so
 
@@ -158,11 +158,11 @@ done
 # --------------- router + 压测（本机非 P/D 节点时才会走到这里）----------------
 # python -m sglang_router.launch_router \
 #     --pd-disaggregation --policy cache_aware \
-#     --prefill http://141.61.50.198:31000 8998 \
+#     --prefill http://141.61.49.198:31000 8998 \
 #     --decode http://141.61.49.195:31000 \
 #     --host 0.0.0.0 --port 6688
 
-curl --location 'http://141.61.50.198:31000/flush_cache' --header 'Content-Type: application/json'
+curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type: application/json'
 # python -m sglang.bench_serving \
 #     --dataset-path /home/zkk/datasets/ShareGPT_V3_unfiltered_cleaned_split.json \
 #     --dataset-name random \
