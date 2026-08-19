@@ -84,7 +84,7 @@ echo "${LOCAL_HOST2}"
 
 # HCCL/Gloo 网口: 手动填入本机承载 P/D 通信的网卡名（ifconfig / ip addr 查看）
 export HCCL_SOCKET_IFNAME=enp35s0f2
-export GLOO_SOCKET_IFNAME=data0.3001
+export GLOO_SOCKET_IFNAME=flannel.1
 
 for i in "${!P_IP[@]}";
 do
