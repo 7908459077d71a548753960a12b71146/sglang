@@ -66,6 +66,12 @@ export SGLANG_NPU_USE_MLAPO=1
 
 export PYTHONPATH=`pwd`/python:$PYTHONPATH
 
+# 日志重定向: sglang serve 的 stdout/stderr 全量落文件, 控制台不再打屏
+# (memfabric C 层日志走 stderr 一并重定向; 文件名带角色/时间戳便于区分)
+LOG_DIR=${LOG_DIR:-/home/sglang/logs}
+mkdir -p "$LOG_DIR"
+LOG_TS=$(date +%Y%m%d_%H%M%S)
+
 # --------------------- PD 拓扑: P 单机 8 卡 + D 单机 8 卡 ---------------------
 P_IP=('141.61.49.198')
 D_IP=('141.61.49.195')
@@ -90,7 +96,8 @@ for i in "${!P_IP[@]}";
 do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
-        echo "Prefill -> ${P_IP[$i]}"
+        P_LOG="$LOG_DIR/prefill_${LOG_TS}.log"
+        echo "Prefill -> ${P_IP[$i]}  (log: $P_LOG)"
 
         # P 为单机 8 卡: deep_ep normal 的 pure intranode dispatch 路径在当前
         # deep_ep NPU 构建上会挂死/向量核异常(507035), 已用单机非 PD 部署复现;
@@ -113,7 +120,8 @@ do
             --host 0.0.0.0 \
             --port 31000 \
             --watchdog-timeout 9000 \
-            --disable-cuda-graph
+            --disable-cuda-graph \
+            >"$P_LOG" 2>&1
 
         exit 1
     fi
@@ -123,7 +131,8 @@ for i in "${!D_IP[@]}";
 do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
-        echo "Decode -> ${D_IP[$i]}"
+        D_LOG="$LOG_DIR/decode_${LOG_TS}.log"
+        echo "Decode -> ${D_IP[$i]}  (log: $D_LOG)"
 
         export DEEPEP_HCCL_BUFFSIZE=400
 
@@ -149,7 +158,8 @@ do
             --watchdog-timeout 9000 \
             --disaggregation-decode-dram-pool-size $DRAM_POOL_GB \
             --num-reserved-decode-tokens 2048 \
-            --disaggregation-decode-polling-interval 2
+            --disaggregation-decode-polling-interval 2 \
+            >"$D_LOG" 2>&1
 
         exit 1
     fi
