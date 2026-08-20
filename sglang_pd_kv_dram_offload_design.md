@@ -102,6 +102,12 @@ send_kvcache:                                    pop_preallocated:
 D9 公共文件零 DRAM 专属逻辑（低侵入原则）；D10 支持投机推理（draft 层随主池 DRAM 化，
 解除与 speculative 的互斥）。
 
+**补充确认（2026-08-20）**：sparse_copy 为 AIV 算子（OpCommand::RunOpApiV2 标准下发、
+参数全设备张量），**技术上具备入图条件**；但 AIV 算子与计算流（AICore）异步并行时会**抢核**
+导致整体性能下降，故 **promote 维持 graph 外同步执行，异步流/入图方案暂不采用**。
+retract 备份恢复（CPU tensor H2D）带 npu.synchronize，同样位于 graph 外调度窗口，
+与 `--cuda-graph-bs` decode 兼容。
+
 ---
 
 ## 3. 分模块修改方案

@@ -204,12 +204,8 @@ class AscendKVManager(MooncakeKVManager):
         info = self.decode_kv_args_table.get(mooncake_session_id)
         ext = getattr(info, "pd_extension", None) if info is not None else None
         if not ext:
-            logger.info(f"[DRAM] send_kvcache: no pd_extension for session {mooncake_session_id}")
+            logger.debug(f"[DRAM] send_kvcache: no pd_extension for session {mooncake_session_id}")
             return None, None
-        logger.info(
-            f"[DRAM] send_kvcache: ext found, dram_layers={len(ext['dram_kv_ptrs'])} "
-            f"n_hbm_tokens={ext['n_hbm_tokens']} session={mooncake_session_id}"
-        )
         return ext["dram_kv_ptrs"], ext["n_hbm_tokens"]
 
     def send_kvcache(
@@ -533,24 +529,10 @@ class AscendKVManager(MooncakeKVManager):
                 f"hbm_page=[{int(hbm_pages.min())}..{int(hbm_pages.max())}] "
                 f"bad(first 5)={bad_entries[:5]}"
             )
-        # Encoding-boundary sanity in matched units: the allocator's TOKEN
-        # space must fit inside the registered HBM page buffers
-        # (n_hbm pages, one of which is the pool's spare page).
-        real_pool = getattr(getattr(allocator, "inner", allocator), "size", None)
-        if real_pool is not None and int(real_pool) > n_hbm * page_size:
-            logger.error(
-                f"[DRAM] ENCODING MISMATCH: allocator tokens={real_pool} exceed "
-                f"HBM page space={n_hbm * page_size} (n_hbm_pages={n_hbm}, "
-                f"page_size={page_size}) — global page encoding is wrong"
-            )
         # Isolation probe: sync BEFORE the AIV copy so a device fault here
         # exonerates sparse_copy (the fault would come from concurrently
         # running forward kernels, e.g. deepep/attention).
         torch.npu.synchronize()
-        logger.info(
-            f"[DRAM] promote pre-sync ok: rid={req.rid} committed={length} "
-            f"dram={num} pages={num_pages} n_hbm_pages={n_hbm}"
-        )
         ret = self.dram_pool.promote(entries, self.kv_args.gpu_id)
         if ret != 0:
             allocator.free(hbm_loc)

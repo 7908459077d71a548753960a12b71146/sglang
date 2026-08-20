@@ -155,12 +155,12 @@ class AscendDramPool:
         # token // page_size the global page the sender addresses.
         out = (pages[:, None] + self.n_hbm_tokens) * self.page_size + in_page
         out = out.reshape(-1)[:need_size]
+        # Allocation log: the single source of truth for "who took what".
         logger.info(
-            f"[DRAM] pool alloc: need={need_size} pages={num_pages} "
-            f"global_page_range=[{int(pages[0]) + self.n_hbm_tokens}.."
+            f"[DRAM] alloc: tokens={need_size} pages={num_pages} "
+            f"global_pages=[{int(pages[0]) + self.n_hbm_tokens}.."
             f"{int(pages[-1]) + self.n_hbm_tokens}] "
-            f"token_range=[{int(out[0])}..{int(out[-1])}] "
-            f"free_pages {len(self.free_pages) + num_pages}->{len(self.free_pages)}"
+            f"free_pages->{len(self.free_pages)}"
         )
         return out.to(self.device)
 
@@ -174,9 +174,10 @@ class AscendDramPool:
             return 0
         pages = torch.unique((dram.cpu() // self.page_size) - self.n_hbm_tokens)
         self.free_pages = torch.cat([pages.to(torch.int64), self.free_pages])
+        # Release log: the single source of truth for "who returned what".
         logger.info(
-            f"[DRAM] pool free: tokens={dram.numel()} pages={len(pages)} "
-            f"free_pages->{len(self.free_pages)} allocated_tokens={self.allocated_tokens()}"
+            f"[DRAM] free: tokens={dram.numel()} pages={len(pages)} "
+            f"free_pages->{len(self.free_pages)}"
         )
         return dram.numel()
 
@@ -208,10 +209,6 @@ class AscendDramPool:
         if not entries:
             return 0
         total_bytes = sum(e[2] for e in entries)
-        logger.info(
-            f"[DRAM] sparse_copy: entries={len(entries)} total_bytes={total_bytes} "
-            f"dev={device_id}"
-        )
         dev = torch.device("npu", device_id)
         src_ptrs = torch.tensor([e[0] for e in entries], dtype=torch.int64).to(dev)
         dst_ptrs = torch.tensor([e[1] for e in entries], dtype=torch.int64).to(dev)

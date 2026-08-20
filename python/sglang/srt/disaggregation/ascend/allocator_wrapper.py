@@ -53,26 +53,22 @@ class AscendDramFallbackAllocator:
             - self.reserved_tokens
         )
         if budget >= need_size:
-            logger.info(
-                f"[DRAM] wrapper alloc->HBM: need={need_size} budget={budget} "
-                f"hbm_free={self.inner.available_size()} "
-                f"dram_debt={self.dram_pool.allocated_tokens()}"
-            )
             return self.inner.alloc(need_size)
-        logger.info(
-            f"[DRAM] wrapper alloc watermark tripped: need={need_size} budget={budget} "
-            f"hbm_free={self.inner.available_size()} "
-            f"dram_free={self.dram_pool.available_size()} "
-            f"dram_debt={self.dram_pool.allocated_tokens()}"
-        )
         # Watermark tripped: land the whole request in DRAM so the remaining
         # HBM pages are fully reserved for running decode growth and promotes.
+        # The pool's [DRAM] alloc/free logs are the single source of truth;
+        # the watermark arithmetic is debug-only.
+        logger.debug(
+            f"[DRAM] watermark tripped (alloc): need={need_size} budget={budget} "
+            f"hbm_free={self.inner.available_size()} "
+            f"dram_debt={self.dram_pool.allocated_tokens()}"
+        )
         loc = self.dram_pool.alloc(need_size)
         if loc is not None:
             return loc
         # DRAM pool is full too: keep the original single-pool behavior
         # (caller queues the request / fails prealloc as before).
-        logger.info("[DRAM] wrapper alloc: DRAM full too, fallback to HBM alloc")
+        logger.info("[DRAM] alloc: DRAM full too, fallback to HBM alloc")
         return self.inner.alloc(need_size)
 
     def alloc_extend(
@@ -96,8 +92,8 @@ class AscendDramFallbackAllocator:
                 - self.reserved_tokens
             )
             if budget < extend_num_tokens:
-                logger.info(
-                    f"[DRAM] wrapper alloc_extend watermark: need={extend_num_tokens} "
+                logger.debug(
+                    f"[DRAM] watermark tripped (alloc_extend): need={extend_num_tokens} "
                     f"budget={budget} hbm_free={self.inner.available_size()}"
                 )
                 loc = self.dram_pool.alloc(extend_num_tokens)
@@ -121,14 +117,15 @@ class AscendDramFallbackAllocator:
         # DRAM synthetic tokens start at n_hbm_tokens * page_size (the HBM
         # allocator's real token space ends below that), so the split
         # threshold must be page-scaled — n_hbm_tokens alone is a PAGE count.
+        # Pool-level detail (pages, free-list) is logged by [DRAM] free;
+        # the split arithmetic here is debug-only.
         dram_n = self.dram_pool.free_tokens(free_index)
         if dram_n == free_index.numel():
-            logger.info(f"[DRAM] wrapper free: all-DRAM tokens={dram_n}")
             return
         hbm = free_index[
             free_index < self.dram_pool.n_hbm_tokens * self.dram_pool.page_size
         ]
-        logger.info(
+        logger.debug(
             f"[DRAM] wrapper free split: total={free_index.numel()} dram={dram_n} hbm={hbm.numel()}"
         )
         if hbm.numel() > 0:

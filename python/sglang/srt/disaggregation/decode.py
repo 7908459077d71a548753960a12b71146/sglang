@@ -2158,10 +2158,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 mgr = getattr(prealloc_queue, "kv_manager", None)
                 if hasattr(mgr, "promote_dram_pages"):
-                    logger.info(
-                        f"[DRAM] promote hook fired: rid={decode_req.req.rid} "
-                        f"poll=Success"
-                    )
                     # Ascend DRAM pool: lift DRAM-resident KV to HBM before the
                     # request becomes schedulable (NPU attention reads HBM
                     # only). On transient HBM shortage keep it queued until
