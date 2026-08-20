@@ -67,13 +67,13 @@ export SGLANG_NPU_USE_MLAPO=1
 export PYTHONPATH=`pwd`/python:$PYTHONPATH
 
 # --------------------- PD 拓扑: P 单机 8 卡 + D 单机 8 卡 ---------------------
-P_IP=('141.61.50.31')
+P_IP=('141.61.49.198')
 D_IP=('141.61.49.195')
 
 # 跨机 URMA 传输 + DRAM 池远端直写（P/D 两侧均需, 仅 A5 支持）
 export ASCEND_MF_TRANSFER_PROTOCOL=device_urma
 # session store, P/D 两侧均可达（挂在 Prefill 节点）
-export MF_CONFIG_STORE_URL="tcp://141.61.50.31:24669"
+export MF_CONFIG_STORE_URL="tcp://141.61.49.198:24669"
 # offload 组件依赖库（如已装到默认路径可不设）
 # export MEMFABRIC_HYBRID_EXTEND_LIB_PATH=/path/to/libmf_hybm_accoffload.so
 
@@ -84,7 +84,7 @@ echo "${LOCAL_HOST2}"
 
 # HCCL/Gloo 网口: 手动填入本机承载 P/D 通信的网卡名（ifconfig / ip addr 查看）
 export HCCL_SOCKET_IFNAME=enp35s0f2
-export GLOO_SOCKET_IFNAME=data0.3001 # flannel.1
+export GLOO_SOCKET_IFNAME=flannel.1
 
 for i in "${!P_IP[@]}";
 do
