@@ -32,7 +32,7 @@ P_MEM_FRACTION=${P_MEM_FRACTION:-0.85}
 # 写池+提升流程。换算(128GB 卡, 实测 0.105MB/token): 斜率≈124.8万 token/1.0,
 # 零KV基线 f0≈0.7799, 目标128tok -> f≈0.7800; 每 ±0.0005 ≈ ±620 tok,
 # 以启动日志 "#tokens:" 为准微调(为0则+0.0005)。恢复正常运行改回 0.91。
-D_MEM_FRACTION=${D_MEM_FRACTION:-0.7798}
+D_MEM_FRACTION=${D_MEM_FRACTION:-0.7748}
 
 unset https_proxy
 unset http_proxy
