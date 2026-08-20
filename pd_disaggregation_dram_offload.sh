@@ -66,8 +66,8 @@ export SGLANG_NPU_USE_MLAPO=1
 
 export PYTHONPATH=`pwd`/python:$PYTHONPATH
 
-# 日志重定向: sglang serve 的 stdout/stderr 全量落文件, 控制台不再打屏
-# (memfabric C 层日志走 stderr 一并重定向; 文件名带角色/时间戳便于区分)
+# 日志双路输出: sglang serve 的 stdout/stderr 同时打屏 + 落文件 (tee)
+# (memfabric C 层日志走 stderr 一并捕获; 文件名带角色/时间戳便于区分)
 LOG_DIR=${LOG_DIR:-/home/sglang/logs}
 mkdir -p "$LOG_DIR"
 LOG_TS=$(date +%Y%m%d_%H%M%S)
@@ -121,7 +121,7 @@ do
             --port 31000 \
             --watchdog-timeout 9000 \
             --disable-cuda-graph \
-            >"$P_LOG" 2>&1
+            2>&1 | tee "$P_LOG"
 
         exit 1
     fi
@@ -159,7 +159,7 @@ do
             --disaggregation-decode-dram-pool-size $DRAM_POOL_GB \
             --num-reserved-decode-tokens 2048 \
             --disaggregation-decode-polling-interval 2 \
-            >"$D_LOG" 2>&1
+            2>&1 | tee "$D_LOG"
 
         exit 1
     fi
