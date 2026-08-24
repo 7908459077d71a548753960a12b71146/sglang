@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional, Union
@@ -260,6 +261,36 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             )
         else:
             output = self.backend.replay(graph_key, forward_batch)
+
+        # DEBUG (graph-mode precision, NPU override): NOTE this method fully
+        # overrides DecodeCudaGraphRunner.execute — probes there never run.
+        # SGLANG_SELECTIVE_DEBUG_SYNC=1  -> device sync after replay.
+        # SGLANG_SELECTIVE_DEBUG_SLEEP_MS=<n> -> wall-clock delay (covers
+        #   host-report-driven fire-and-forget DMA that sync cannot see).
+        # SGLANG_SELECTIVE_DUMP_STAGING=1 -> staging checksum after replay.
+        _dbg = os.getenv("SGLANG_SELECTIVE_DEBUG_SYNC", "0") == "1"
+        _sleep_ms = os.getenv("SGLANG_SELECTIVE_DEBUG_SLEEP_MS", "0")
+        _dump = os.getenv("SGLANG_SELECTIVE_DUMP_STAGING", "0") == "1"
+        if _dbg or _sleep_ms != "0" or _dump:
+            torch.npu.synchronize() if _dbg else None
+            if _sleep_ms != "0":
+                time.sleep(int(_sleep_ms) / 1000.0)
+            if _dump and not forward_batch.forward_mode.is_idle():
+                _sel_coord = getattr(
+                    self.model_runner, "npu_selective_hisparse_coordinator", None
+                )
+                if _sel_coord is not None:
+                    _n = int(_sel_coord.h2d_cnt.item())
+                    _flat = _sel_coord.packed_staging.view(-1)[
+                        : _n * _sel_coord.record_bytes
+                    ]
+                    logger.info(
+                        "[STAGING-DUMP graph] key=%s N=%d sum=%d nonzero=%d",
+                        graph_key.size,
+                        _n,
+                        _flat.sum(dtype=torch.int64).item(),
+                        int((_flat != 0).sum().item()),
+                    )
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
