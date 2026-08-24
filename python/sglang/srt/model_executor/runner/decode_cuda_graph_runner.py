@@ -29,6 +29,7 @@ import contextlib
 import inspect
 import logging
 import os
+import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -1400,6 +1401,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Enable with SGLANG_SELECTIVE_DEBUG_SYNC=1.
             if os.getenv("SGLANG_SELECTIVE_DEBUG_SYNC", "0") == "1":
                 torch.npu.synchronize()
+            # DEBUG: wall-clock delay after replay. npu.synchronize() only
+            # waits for device-side work; if the AIV-issued async DMA
+            # completion is processed by the host ACL report thread
+            # (fire-and-forget), sync does NOT cover it — sleep does. If
+            # precision recovers with sleep but not with sync, the DMA
+            # landing is host-report-driven and needs a real completion
+            # dependency. Enable with SGLANG_SELECTIVE_DEBUG_SLEEP_MS=<n>.
+            _sleep_ms = os.getenv("SGLANG_SELECTIVE_DEBUG_SLEEP_MS", "0")
+            if _sleep_ms != "0":
+                time.sleep(int(_sleep_ms) / 1000.0)
             if war_record is SharedReadBoundary.POST_REPLAY:
                 self._publish_war_read_done(in_graph=False)
             elif war_record is SharedReadBoundary.IN_REPLAY:

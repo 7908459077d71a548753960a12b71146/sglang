@@ -1149,6 +1149,13 @@ class NPUSelectiveHiSparseCoordinator:
             self._selective_real_tokens.fill_(real_tokens)
             self.h2d_cnt.fill_(real_tokens * self.topk)
             self.d2h_cnt.fill_(real_tokens)
+        # DEBUG (graph-mode precision): zero the in-graph D2H backup count so
+        # the captured backup sparse_copy submits nothing at replay. If
+        # precision recovers, the backup path is corrupting the Host pool
+        # (wrong dst pointers / stale logical locs at replay) rather than the
+        # H2D prefetch being late. Enable with SGLANG_SELECTIVE_DISABLE_D2H=1.
+        if os.getenv("SGLANG_SELECTIVE_DISABLE_D2H", "0") == "1":
+            self.d2h_cnt.fill_(0)
 
     def finish_graph_capture(self):
         """Restore eager coordinator semantics after one graph is captured.
