@@ -7,34 +7,33 @@
 #   D: 141.61.94.111, 141.61.94.139
 #
 # 并行策略 (对照 run_8node_pd.sh):
-#   P: TP16, DP16 → attn_tp=1, EP16   (与生产单组完全一致)
-#   D: TP16, DP16 → attn_tp=1, EP16   (生产 DP32/EP32, 此处缩减一半)
-#
-# 用法（无需参数, 按 hostname -I 自动识别本机角色）:
-#   P 节点: bash pd_selective_hisparse_4node.sh
-#   D 节点: bash pd_selective_hisparse_4node.sh
+#   P: TP8, PP2, CP8 → attn_tp=1, EP8   (与 8node 单组完全一致)
+#   D: TP16, DP16 → attn_tp=1, EP16     (8node 的一半: TP32/DP32/EP32)
 # ============================================================================
 
 # cpu
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
+sysctl -w vm.swappiness=10
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
+export SGLANG_SET_CPU_AFFINITY=1
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
 
 # ===== Cleanup =====
 unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING
 
-pkill -9 python 2>/dev/null || true
+pkill -9 python  2>/dev/null || true
 pkill -9 sglang 2>/dev/null || true
-
-source /usr/local/memfabric_hybrid/set_env.sh
+pkill -9 VLLM   2>/dev/null || true
 
 # ===== Environment =====
-export SGLANG_SET_CPU_AFFINITY=1
-export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
-export SGLANG_LOG_LEVEL=debug
-CODE_PATH=${CODE_PATH:-/home/t00882532/Code/hisparse}
-export PYTHONPATH=${CODE_PATH}/python:$PYTHONPATH
+source /mnt/share/chenxu/SFA/vendors/custom_transformer/bin/set_env.bash
+source /usr/local/memfabric_hybrid/set_env.sh
+export PYTHONPATH=/home/t00882532/Code/hisparse0824/python:$PYTHONPATH
 
 export HCCL_CONNECT_TIMEOUT=300
 export HCCL_EXEC_TIMEOUT=68
@@ -50,9 +49,14 @@ export ASCEND_USE_FIA=1
 
 # [MLAPO]
 export SGLANG_NPU_USE_MLAPO=1
+# export SGLANG_NPU_GLM_NEXTN_BF16_KV_CACHE=1
 
-# [DEEPEP]
+# [DEEPEP]  (EP16: 每 rank token 翻倍 36→72)
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
+
+# [Prefill Delay]
+#export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+#export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 
 # [MTP]
 export SGLANG_ENABLE_SPEC_V2=1
@@ -68,12 +72,16 @@ export GLOO_SOCKET_IFNAME=data0.173
 export MF_HYBM_USE_VMM_SEGMENT=1
 export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
 
+export ASCEND_MF_STORE_URL="tcp://141.61.94.103:31001"
+#export ASCEND_MF_LOG_LEVEL=1
+
 unset HCCL_IF_IP 2>/dev/null || true
 unset HCCL_SOCKET_FAMILY 2>/dev/null || true
 unset RANK_TABLE_FILE 2>/dev/null || true
 
 # ===== Model Config =====
-MODEL_PATH=${MODEL_PATH:-/mnt/share/w00936111/GLM-5.2-W8A8C8-mxfp8}
+#MODEL_PATH_P=/home/cx/glm5_2_weight
+MODEL_PATH=/mnt/share/w00936111/GLM-5.2-W8A8C8-mxfp8
 SERVED_MODEL_NAME=glm52
 
 # Selective HiSparse: 选中的卸载层 ID
@@ -82,16 +90,24 @@ SERVED_MODEL_NAME=glm52
 #   单层:  SELECTIVE_LAYER_IDS="5"
 #   4 层:  SELECTIVE_LAYER_IDS="5 21 49 77"
 #   全部:  SELECTIVE_LAYER_IDS="5 9 13 17 21 25 29 33 37 41 45 49 53 57 61 65 69 73 77"
-#SELECTIVE_LAYER_IDS=${SELECTIVE_LAYER_IDS:-"5"}
-SELECTIVE_LAYER_IDS=${SELECTIVE_LAYER_IDS:-"5 9 13 17 21 25 29 33 37 41 45 49 53 57 61 65 69 73 77"}
+SELECTIVE_LAYER_IDS=${SELECTIVE_LAYER_IDS:-"5"}
+#SELECTIVE_LAYER_IDS=${SELECTIVE_LAYER_IDS:-"5 41 65 77"}
+#SELECTIVE_LAYER_IDS=${SELECTIVE_LAYER_IDS:-"5 9 13 17 21 25 29 33 37 41 45 49 53 57 61 65 69 73 77"}
+
+# ===== Graph Debug =====
+# 当前配置: 单层(layer 5) + 单batch(cuda-graph-bs 1) 用于定位 graph 问题
+# Debug 环境变量 (在 Decode 节点设置):
+#   export SGLANG_SELECTIVE_SKIP_H2D=1  → graph 模式跳过 H2D DMA
+#   export SGLANG_SELECTIVE_SKIP_D2H=1  → graph 模式跳过 D2H DMA
+# 二分法: 先试 SKIP_H2D, 再试 SKIP_D2H, 看哪个能消除 507011
 # ===== Cluster Config ===========================================
 # 4 机: P 2 节点 × 8 卡 + D 2 节点 × 8 卡
-#   P: TP16, DP16 → attn_tp = 16/16 = 1, EP16
-#   D: TP16, DP16 → attn_tp = 16/16 = 1, EP16
+#   P: TP8, PP2, CP8 → attn_tp = 1, EP8   (与 8node 生产单组一致)
+#   D: TP16, DP16 → attn_tp = 1, EP16
 # ================================================================
 NUM_NPUS_PER_NODE=8
 
-# Prefill 节点 (2 nodes)
+# Prefill 节点 (2 nodes, 1 group)
 P_IPS=(
   "141.61.94.103"
   "141.61.94.107"
@@ -114,18 +130,17 @@ D_IFS=(
 P_NNODES=${#P_IPS[@]}
 D_NNODES=${#D_IPS[@]}
 
-P_TP_SIZE=$(( P_NNODES * NUM_NPUS_PER_NODE ))   # 16
+# 并行度:
+#   P: TP = 8 (per PP stage), PP = 2
+#   D: TP = D_NNODES * 8 = 16, DP16
 D_TP_SIZE=$(( D_NNODES * NUM_NPUS_PER_NODE ))   # 16
-P_DP_SIZE=16
 D_DP_SIZE=16
+# ================================================================
 
 P_MASTER="${P_IPS[0]}"
 D_MASTER="${D_IPS[0]}"
 P_DIST_INIT="${P_MASTER}:5567"
 D_DIST_INIT="${D_MASTER}:5568"
-
-# session store, 挂在 Prefill 首节点
-export ASCEND_MF_STORE_URL="tcp://${P_MASTER}:31001"
 
 # ===== Auto-detect node by matching local IPs ==================
 LOCAL_HOST1=$(hostname -I | awk '{print $1}')
@@ -142,25 +157,29 @@ for i in "${!P_IPS[@]}"; do
     echo "local IPs       : ${LOCAL_HOST1} ${LOCAL_HOST2}"
     echo "dist-init-addr  : ${P_DIST_INIT}"
     echo "nnodes          : ${P_NNODES}"
-    echo "tp-size         : ${P_TP_SIZE}"
-    echo "dp-size         : ${P_DP_SIZE}"
+    echo "tp-size         : 8"
+    echo "pp-size         : 2"
+    echo "attn-cp-size    : 8"
     echo "HCCL interface  : ${HCCL_SOCKET_IFNAME}"
     echo "GLOO interface  : ${GLOO_SOCKET_IFNAME}"
     echo "========================================"
-    export DEEPEP_HCCL_BUFFSIZE=2048
-
+#    export DEEPEP_HCCL_BUFFSIZE=2048
+    export DEEP_USE_MODE="allgather"
+    export SGLANG_PP_LAYER_PARTITION="38,40"
     python3 -m sglang.launch_server \
       --model-path ${MODEL_PATH} \
       --served-model-name "${SERVED_MODEL_NAME}" \
       --host 0.0.0.0 \
-      --port 30000 \
+      --port 30123 \
       --nnodes ${P_NNODES} \
       --node-rank ${i} \
       --dist-init-addr ${P_DIST_INIT} \
-      --tp-size ${P_TP_SIZE} \
-      --dp ${P_DP_SIZE} \
-      --enable-dp-attention \
-      --enable-dp-lm-head \
+      --tp-size 8 \
+      --pp-size 2 \
+      --enable-nsa-prefill-context-parallel \
+      --dsa-prefill-cp-mode in-seq-split \
+      --attn-cp-size 8 \
+      --moe-dense-tp-size 1 \
       --load-balance-method round_robin \
       --disaggregation-mode prefill \
       --disaggregation-transfer-backend ascend \
@@ -178,21 +197,22 @@ for i in "${!P_IPS[@]}"; do
       --chunked-prefill-size 16384 \
       --kv-cache-dtype "fp8_e4m3" \
       --moe-a2a-backend deepep \
-      --deepep-mode auto \
+      --deepep-mode normal \
       --disable-cuda-graph \
+      --disable-radix-cache \
       --enable-metrics
 
     exit 1
   fi
 done
 
-# ===== Launch Decode nodes (Selective HiSparse) ================
+# ===== Launch Decode nodes =====================================
 for i in "${!D_IPS[@]}"; do
   if [[ "$LOCAL_HOST1" == "${D_IPS[$i]}" || "$LOCAL_HOST2" == "${D_IPS[$i]}" ]]; then
     export HCCL_SOCKET_IFNAME="${D_IFS[$i]}"
 
     echo "========================================"
-    echo "Launching GLM5.2 Decode node ${i} (Selective HiSparse)"
+    echo "Launching GLM5.2 Decode node ${i}"
     echo "node-rank       : ${i}"
     echo "local IPs       : ${LOCAL_HOST1} ${LOCAL_HOST2}"
     echo "dist-init-addr  : ${D_DIST_INIT}"
@@ -203,11 +223,13 @@ for i in "${!D_IPS[@]}"; do
     echo "HCCL interface  : ${HCCL_SOCKET_IFNAME}"
     echo "GLOO interface  : ${GLOO_SOCKET_IFNAME}"
     echo "========================================"
-    export DEEPEP_HCCL_BUFFSIZE=1024
-    export HCCL_BUFFSIZE=70
-    export SGLANG_LM_HEAD_TP=4
-    export SGLANG_ATTN_O_TP_SIZE=4
-    export SGLANG_NPU_PROFILING=1
+    export DEEPEP_HCCL_BUFFSIZE=512
+    export HCCL_BUFFSIZE=140
+    # LM-head TP
+    export SGLANG_LM_HEAD_TP=8
+#    export SGLANG_ATTN_O_TP_SIZE=4
+    export SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM=1
+#    export SGLANG_NPU_PROFILING=1
 
     python3 -m sglang.launch_server \
       --model-path ${MODEL_PATH} \
@@ -228,22 +250,22 @@ for i in "${!D_IPS[@]}"; do
       --attention-backend ascend \
       --device npu \
       --disable-radix-cache \
-      --disable-chunked-prefix-cache \
       --watchdog-timeout 9000 \
-      --max-running-requests 64 \
-      --mem-fraction-static 0.92 \
+      --max-running-requests 192 \
+      --mem-fraction-static 0.945 \
       --quantization modelslim \
       --kv-cache-dtype "fp8_e4m3" \
       --moe-a2a-backend deepep \
       --deepep-mode auto \
+      --cuda-graph-bs 1 2 3 4 5 6 \
       --context-len 133120 \
-      --tokenizer-worker-num 8 \
+      --tokenizer-worker-num 4 \
+      --enable-dynamic-batch-tokenizer \
       --speculative-algorithm NEXTN \
       --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
       --speculative-draft-kv-cache-dtype bf16 \
-      --enable-metrics \
       --npu-selective-hisparse-layer-ids ${SELECTIVE_LAYER_IDS} \
-      --cuda-graph-bs 1 4 6
+      --enable-metrics
 
     exit 1
   fi
@@ -251,8 +273,6 @@ done
 
 echo "ERROR: local IPs [${LOCAL_HOST1} ${LOCAL_HOST2}] not found in P_IPS=[${P_IPS[*]}] or D_IPS=[${D_IPS[*]}]"
 exit 1
-
-#       --disable-cuda-graph \
 
 # ===== Router (在独立节点或任一 P/D 节点上手动执行) ============
 # python -m sglang_router.launch_router \
