@@ -503,12 +503,13 @@ class NPUSelectiveHiSparseCoordinator:
         # matches one expect increment, a stale (earlier-round) count can
         # never satisfy a later expect. Idle replays (cnt=0) still bump:
         # the copy kernel notifies unconditionally, so the pairing stays
-        # 1:1. Layout per flag (int32[4]): [done_count, magic, pub_magic,
-        # rsv] — magic path unused (kept 0).
-        self.h2d_flag = torch.zeros(4, dtype=torch.int32, device=self.device)
-        self.h2d_expect = torch.zeros(2, dtype=torch.int32, device=self.device)
-        self.d2h_flag = torch.zeros(4, dtype=torch.int32, device=self.device)
-        self.d2h_expect = torch.zeros(2, dtype=torch.int32, device=self.device)
+        # 1:1. Flag buffers are int32[16]: the kernel's atomic add is a
+        # 32B-aligned DataCopy over 8 lanes (lane0=+1, rest 0) and a full
+        # 64B cacheline keeps dcci spin-reads isolated from neighbors.
+        self.h2d_flag = torch.zeros(16, dtype=torch.int32, device=self.device)
+        self.h2d_expect = torch.zeros(16, dtype=torch.int32, device=self.device)
+        self.d2h_flag = torch.zeros(16, dtype=torch.int32, device=self.device)
+        self.d2h_expect = torch.zeros(16, dtype=torch.int32, device=self.device)
         # AIV block count used by the copy kernel (sparse_copy launches 64).
         self._dma_flag_block_num = 64
 
