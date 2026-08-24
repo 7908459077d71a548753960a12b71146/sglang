@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Sequence
@@ -1109,6 +1110,15 @@ class NPUSelectiveHiSparseCoordinator:
     ):
         """Called before graph replay to update real token count."""
         self._bridge_eager_to_graph()
+        # DEBUG (graph-mode precision): subscribe the replay-issuing stream to
+        # the ACL callback thread. The original subscription covers only the
+        # capture stream, but graph replay executes on the issuing (main)
+        # stream — in-graph sparse_copy async DMA completion reports fired
+        # there are never processed by acl.rt.process_report, so H2D data may
+        # not land before the in-graph SFA read. Idempotent (subscribe() skips
+        # known streams). Enable with SGLANG_SELECTIVE_SUBSCRIBE_REPLAY_STREAM=1.
+        if os.getenv("SGLANG_SELECTIVE_SUBSCRIBE_REPLAY_STREAM", "0") == "1":
+            self.register_callback_stream(torch.npu.current_stream(self.device))
         real_tokens = 0 if is_idle else real_batch * self.verify_width
         graph_tokens = graph_batch * self.verify_width
         if real_tokens > graph_tokens:

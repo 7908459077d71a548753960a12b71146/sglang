@@ -1393,6 +1393,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if war_record is SharedReadBoundary.PRE_REPLAY:
                 self._publish_war_read_done(in_graph=False)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            # DEBUG (graph-mode precision): give in-flight in-graph DMA
+            # (sparse_copy D2H backup) time to land before the next replay's
+            # H2D prefetch reads those Host pool entries. Discriminates the
+            # cross-iteration D2H->H2D landing race from in-graph staleness.
+            # Enable with SGLANG_SELECTIVE_DEBUG_SYNC=1.
+            if os.getenv("SGLANG_SELECTIVE_DEBUG_SYNC", "0") == "1":
+                torch.npu.synchronize()
             if war_record is SharedReadBoundary.POST_REPLAY:
                 self._publish_war_read_done(in_graph=False)
             elif war_record is SharedReadBoundary.IN_REPLAY:
