@@ -948,6 +948,19 @@ class NPUSelectiveHiSparseCoordinator:
         # 1. Wait for H2D
         if st.h2d_done is not None:
             torch.npu.current_stream().wait_event(st.h2d_done)
+            # DEBUG (exp F): eager-side staging checksum right after the H2D
+            # wait and before the current-patch overwrite — this is the pure
+            # H2D-landed content. Compare against the graph-side dump from
+            # decode_cuda_graph_runner.execute(). Enable with
+            # SGLANG_SELECTIVE_DUMP_STAGING=1.
+            if os.getenv("SGLANG_SELECTIVE_DUMP_STAGING", "0") == "1":
+                _n = st.real_tokens * K
+                _flat = self.packed_staging.view(-1)[: _n * self.record_bytes]
+                logger.info(
+                    f"[STAGING-DUMP eager] layer={layer_id} "
+                    f"N={_n} sum={_flat.sum(dtype=torch.int64).item()} "
+                    f"nonzero={int((_flat != 0).sum().item())}"
+                )
 
         # 2. Current KV patch (graph-safe: no boolean indexing / nonzero)
         # W3: read from the fixed-address scratch written by
