@@ -31,7 +31,7 @@ pkill -9 sglang 2>/dev/null || true
 pkill -9 VLLM   2>/dev/null || true
 
 # ===== Environment =====
-source /mnt/share/t00882532/SFA/vendors/custom_transformer/bin/set_env.bash
+source /mnt/share/t00882532/vendors/custom_transformer/bin/set_env.bash
 source /usr/local/memfabric_hybrid/set_env.sh
 export PYTHONPATH=`pwd`/python:$PYTHONPATH
 
