@@ -491,14 +491,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         max_running = kvc.server_args.max_running_requests or 256
         attn_dp = get_attention_dp_size()
         bcap = (max_running + attn_dp - 1) // attn_dp
-        decode_graph_config = getattr(
-            getattr(kvc.server_args, "cuda_graph_config", None),
-            "decode",
-            None,
-        )
-        cuda_graph_bs = getattr(decode_graph_config, "bs", None)
-        if cuda_graph_bs:
-            bcap = max(bcap, max(cuda_graph_bs))
+        # Only let graph batch sizes raise the staging capacity when graphs
+        # are actually enabled. With --disable-cuda-graph the default bs list
+        # (max 512) would otherwise inflate the fixed bias by ~14GB.
+        if not getattr(kvc.server_args, "disable_cuda_graph", False):
+            decode_graph_config = getattr(
+                getattr(kvc.server_args, "cuda_graph_config", None),
+                "decode",
+                None,
+            )
+            cuda_graph_bs = getattr(decode_graph_config, "bs", None)
+            if cuda_graph_bs:
+                bcap = max(bcap, max(cuda_graph_bs))
         if kvc.spec_algorithm.is_speculative():
             from sglang.srt.speculative.spec_utils import (
                 resolve_num_tokens_per_req,
