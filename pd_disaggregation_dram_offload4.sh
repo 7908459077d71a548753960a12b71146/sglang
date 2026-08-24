@@ -3,8 +3,8 @@
 # PD 分离 + Selective HiSparse 启动脚本（A5 / ASCEND_950，memfabric URMA）
 #
 # 拓扑: Prefill 2 机 16 卡 + Decode 2 机 16 卡
-#   P: 141.61.94.103, 141.61.94.107
-#   D: 141.61.94.111, 141.61.94.139
+#   P: 141.61.133.101, 141.61.133.103
+#   D: 141.61.133.102, 141.61.133.105
 #
 # 并行策略 (对照 run_8node_pd.sh):
 #   P: TP8, PP2, CP8 → attn_tp=1, EP8   (与 8node 单组完全一致)
@@ -66,13 +66,13 @@ export TRANSFORMERS_VERBOSITY=error
 
 # [多机]
 export HCCL_HOST_SOCKET_PORT_RANGE=auto
-export GLOO_SOCKET_IFNAME=data0.173
+export GLOO_SOCKET_IFNAME=data0.3001
 
 # A5 PD分离
 export MF_HYBM_USE_VMM_SEGMENT=1
 export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
 
-export ASCEND_MF_STORE_URL="tcp://141.61.94.103:31001"
+export ASCEND_MF_STORE_URL="tcp://141.61.133.101:31001"
 #export ASCEND_MF_LOG_LEVEL=1
 
 unset HCCL_IF_IP 2>/dev/null || true
@@ -109,22 +109,22 @@ NUM_NPUS_PER_NODE=8
 
 # Prefill 节点 (2 nodes, 1 group)
 P_IPS=(
-  "141.61.94.103"
-  "141.61.94.107"
+  "141.61.133.101"
+  "141.61.133.103"
 )
 P_IFS=(
-  "enp35s0f2"
-  "enp35s0f2"
+  "enp34s0f1"
+  "enp34s0f1"
 )
 
 # Decode 节点 (2 nodes)
 D_IPS=(
-  "141.61.94.111"
-  "141.61.94.139"
+  "141.61.133.102"
+  "141.61.133.105"
 )
 D_IFS=(
-  "enp35s0f2"
-  "enp35s0f2"
+  "eth2"
+  "eth2"
 )
 
 P_NNODES=${#P_IPS[@]}
@@ -277,6 +277,6 @@ exit 1
 # ===== Router (在独立节点或任一 P/D 节点上手动执行) ============
 # python -m sglang_router.launch_router \
 #     --pd-disaggregation --policy cache_aware \
-#     --prefill http://141.61.94.103:30000 \
-#     --decode http://141.61.94.111:30000 \
+#     --prefill http://141.61.133.101:30123 \
+#     --decode http://141.61.133.102:30000 \
 #     --host 0.0.0.0 --port 6677
