@@ -367,8 +367,11 @@ class NPUSelectiveHiSparseCoordinator:
         # Active prefetch state
         self.active_prefetch: Optional[SelectedPrefetchState] = None
 
-        # Published new packed KV per layer (for current patch)
-        self._published_packed: dict[int, torch.Tensor] = {}
+        # Latest D2H event across ALL selected layers (eager mode only):
+        # new_packed_scratch is shared, so overwriting it must wait for the
+        # latest in-flight D2H read. backup_stream is single-stream
+        # serialized, so the latest event subsumes all earlier ones.
+        self._last_backup_event: Optional[torch.npu.Event] = None
 
         # Graph mode state
         self._graph_mode = False
@@ -411,6 +414,15 @@ class NPUSelectiveHiSparseCoordinator:
         )
         self.unpack_k_rope_bf16 = torch.zeros(
             T, K, self.qk_rope_head_dim, dtype=torch.bfloat16, device=self.device
+        )
+        # Fixed-address scratch holding the current forward's newly packed
+        # KV: publish_new_packed_kv copies into it and the selected layer's
+        # current-patch reads from it. Replaces the Python-held
+        # ``_published_packed`` reference to a graph-pool tensor with a
+        # stable pre-allocated buffer (already counted in the pool
+        # configurator's selective fixed bias).
+        self.new_packed_scratch = torch.zeros(
+            T, R, dtype=torch.uint8, device=self.device
         )
         # Contiguous component buffers for safe Cast (avoid non-contiguous FP8→BF16)
         TK = T * K
@@ -570,7 +582,7 @@ class NPUSelectiveHiSparseCoordinator:
             topk >= req_first_pos_exp.unsqueeze(1)
         )  # [T, K]
 
-        # For current-batch entries, compute row in _published_packed:
+        # For current-batch entries, compute row in new_packed_scratch:
         # row = request_index * V + offset_within_batch
         offset_within_batch = topk - req_first_pos_exp.unsqueeze(1)  # [T, K]
         current_row_idx = (
@@ -634,6 +646,14 @@ class NPUSelectiveHiSparseCoordinator:
                 f"Selective HiSparse: real tokens {T} > capacity {self.tcap}. "
                 f"Increase --max-running_requests or decrease verify width."
             )
+
+        # Eager mode keeps the device-side real-token count in sync (harmless
+        # bookkeeping; the eager DMA path submits all N entries with the
+        # valid mask and does not consume this scalar). Graph mode never
+        # writes it here — replay reads the value filled by
+        # prepare_graph_replay (capture sees 0 → DMA no-op).
+        if not self._graph_mode:
+            self._selective_real_tokens.fill_(T)
 
         # Wait for previous staging/scratch/backup to complete.
         # During graph capture, skip cross-iteration event waits — the graph
@@ -702,6 +722,10 @@ class NPUSelectiveHiSparseCoordinator:
                     + locs.reshape(-1).to(torch.int64) * self.record_bytes
                 )
                 self.h2d_dst_ptrs[:N] = self._h2d_dst_ptrs_preset[:N]
+                # Padded rows never reach here with valid entries: graph
+                # mode gates causal_ok upstream (build_loc_plan) and the
+                # replay-updated h2d_cnt limits submitted entries to the
+                # real rows; eager mode submits all N with the valid mask.
                 self.h2d_lens[:N] = torch.where(
                     valid_flat, self.record_bytes, 0
                 ).to(torch.int32)
@@ -761,17 +785,33 @@ class NPUSelectiveHiSparseCoordinator:
         Called on the main stream after packing.  The D2H copy runs on the
         backup stream.
         """
-        # Wait for previous D2H of this layer to complete before overwriting
-        # _published_packed and reusing d2h pointer buffers.
+        # Wait for previous D2H of this layer to complete before reusing the
+        # d2h pointer buffers. Additionally, new_packed_scratch is shared
+        # across all selected layers, so overwriting it must wait for the
+        # latest in-flight D2H read of ANY layer (the latest backup event
+        # subsumes earlier ones because backup_stream is serialized).
         # During graph capture, skip cross-iteration event waits.
         if not self._graph_mode:
             prev_ev = self.backup_done_event.get(layer_id)
             if prev_ev is not None:
                 torch.npu.current_stream().wait_event(prev_ev)
+            if self._last_backup_event is not None:
+                torch.npu.current_stream().wait_event(self._last_backup_event)
 
         T = packed_kv.shape[0]
-        # Store for current-patch step
-        self._published_packed[layer_id] = packed_kv
+
+        # W3: land the new packed KV in the fixed-address scratch so the
+        # current-patch consumer (and the D2H DMA below) read a stable
+        # pre-allocated buffer instead of a Python-held graph-pool tensor.
+        # Same-stream ordering guarantees the copy lands before both
+        # consumers.
+        self.new_packed_scratch[:T].copy_(packed_kv.view(torch.uint8))
+
+        # Eager mode syncs the device-side real-token count (harmless
+        # bookkeeping, see maybe_start_prefetch). Graph mode reads the
+        # replay-filled value (capture sees 0 → DMA no-op).
+        if not self._graph_mode:
+            self._selective_real_tokens.fill_(T)
 
         if not self._graph_mode and logger.isEnabledFor(logging.INFO):
             locs_cpu = logical_locs[:T].cpu()
@@ -782,6 +822,10 @@ class NPUSelectiveHiSparseCoordinator:
                 f"packed_dtype={packed_kv.dtype}"
             )
 
+        # Record AFTER the W3 scratch copy so the eager D2H stream waits for
+        # it; graph capture keeps everything on the capture stream (stream
+        # order supplies the dependency) and must not record graph-owned
+        # events.
         pack_ready = (
             None
             if self._graph_mode
@@ -804,7 +848,8 @@ class NPUSelectiveHiSparseCoordinator:
             try:
                 from memfabric_hybrid import offload as mf_offload
 
-                base_hbm = packed_kv.data_ptr()
+                # W3: DMA reads from the fixed-address scratch.
+                base_hbm = self.new_packed_scratch.data_ptr()
                 base_dva = self.pool.layer_dva(layer_id)
 
                 self.d2h_src_ptrs[:N] = (
@@ -856,9 +901,10 @@ class NPUSelectiveHiSparseCoordinator:
             if not self._graph_mode:
                 self.backup_done_event[layer_id] = d2h_stream.record_event()
                 self._eager_async_pending = True
-
-    def get_published_new_packed_kv(self, layer_id: int) -> torch.Tensor:
-        return self._published_packed[layer_id]
+                # W3: track the latest D2H for the shared-scratch
+                # (new_packed_scratch) overwrite guard in the next publish
+                # of ANY layer.
+                self._last_backup_event = self.backup_done_event[layer_id]
 
     # === selected-layer attention ===
 
@@ -903,14 +949,17 @@ class NPUSelectiveHiSparseCoordinator:
             torch.npu.current_stream().wait_event(st.h2d_done)
 
         # 2. Current KV patch (graph-safe: no boolean indexing / nonzero)
-        packed = self.get_published_new_packed_kv(layer_id)  # [T, 656]
+        # W3: read from the fixed-address scratch written by
+        # publish_new_packed_kv (same-stream ordering on both the eager
+        # main stream and the graph capture stream).
+        packed = self.new_packed_scratch[:T]  # [T, 656] uint8
         current_rows = st.current_source_row[:T]  # [T, K]
         mask = (current_rows >= 0).reshape(-1)  # [T*K]
         safe_src = current_rows.reshape(-1).clamp(min=0)  # [T*K]
 
         staging_flat = self.packed_staging.view(-1, self.record_bytes)
         N = T * K
-        src_data = packed.view(torch.uint8)[safe_src]  # [T*K, 656]
+        src_data = packed[safe_src]  # [T*K, 656]
         staging_flat[:N] = torch.where(
             mask.unsqueeze(1),
             src_data,
