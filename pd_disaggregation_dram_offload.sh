@@ -68,7 +68,7 @@ export PYTHONPATH=`pwd`/python:$PYTHONPATH
 
 # 日志双路输出: sglang serve 的 stdout/stderr 同时打屏 + 落文件 (tee)
 # (memfabric C 层日志走 stderr 一并捕获; 文件名带角色/时间戳便于区分)
-LOG_DIR=${LOG_DIR:-`pwd`}
+LOG_DIR=${LOG_DIR:-`pwd`/logs/}
 mkdir -p "$LOG_DIR"
 LOG_TS=$(date +%Y%m%d_%H%M%S)
 
