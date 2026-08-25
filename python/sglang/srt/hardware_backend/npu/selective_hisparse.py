@@ -432,14 +432,20 @@ class NPUSelectiveHiSparseCoordinator:
             dtype=torch.uint8,
             device=self.device,
         )
-        # R9 (debug): per-layer unpack/workspace family. These were the LAST
-        # shared buffers on the compute path — layer L's SFA (compute queue)
-        # reads unpack_k_* while layer L+4's unpack chain (torch ops) already
-        # overwrites them, one window per adjacent layer pair per replay
-        # (~linear dose-response). One set per layer; ~510MB per layer at
-        # Tcap=144 — NOT counted by the pool configurator, lower
-        # D_MEM_FRACTION accordingly.
-        n_ws = len(self.selected_layer_ids_sorted)
+        # R9-final (ping-pong): the unpack/workspace family was the last
+        # cross-layer shared resource on the compute path — layer L's SFA
+        # (compute queue) read unpack_k_* while layer L+4's unpack chain
+        # (torch ops) already overwrote them, one window per adjacent layer
+        # pair per replay (linear dose-response, confirmed by the 4-layer
+        # A/B: shared 0.88 vs per-layer 0.92).
+        # Production shape: TWO sets alternating by selected-layer parity
+        # (buffer = ws[_si % 2]) instead of one per layer. Safety: adjacent
+        # selected layers are 4 apart (5, 9, 13, ...), so when layer L's SFA
+        # still reads set p, the earliest writer is layer L+4 which uses set
+        # p^1 — read and write never share a set. Memory: +510MB total,
+        # independent of layer count (vs 510MB/layer for the debug R9).
+        self._n_ws = 2
+        n_ws = self._n_ws
         self.unpack_k_nope_bf16_all = torch.zeros(
             n_ws, T, K, self.kv_lora_rank, dtype=torch.bfloat16, device=self.device
         )
@@ -1188,8 +1194,11 @@ class NPUSelectiveHiSparseCoordinator:
                 f"staging_nonzero={staging_nonzero}/{N}"
             )
 
-        # R9: this layer's OWN workspace slices (see _alloc_staging_buffers).
-        _ws = self._layer_scratch_index[layer_id]
+        # R9-final: ping-pong workspace set — parity of the layer's position
+        # in the selected list (see _alloc_staging_buffers). Adjacent
+        # selected layers are 4 apart, so a set is reused only 4 layers
+        # later, after its reader's SFA has long retired.
+        _ws = self._layer_scratch_index[layer_id] % self._n_ws
         out = selective_sparse_attention(
             q_nope=q_nope[:T],
             q_rope=q_rope[:T],
