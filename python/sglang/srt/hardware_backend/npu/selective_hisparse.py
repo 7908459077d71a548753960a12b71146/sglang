@@ -941,25 +941,16 @@ class NPUSelectiveHiSparseCoordinator:
                 torch.npu.current_stream().wait_event(prev_ev)
             if self._last_backup_event is not None:
                 torch.npu.current_stream().wait_event(self._last_backup_event)
-        else:
-            # Graph mode: new_packed_scratch is shared across layers, and
-            # the previous in-graph D2H backup (AIV) may still be reading
-            # it when this op overwrites — the stream does not order that
-            # AIV completion before this AICore copy. Gate on the D2H
-            # completion flag instead (monotonic count; first round has
-            # count == expect == 0 and passes immediately, correctly).
-            try:
-                from memfabric_hybrid import offload as mf_offload
-
-                ret = mf_offload.wait_flag(
-                    self.d2h_flag,
-                    self.d2h_expect,
-                    self.device,
-                )
-                if ret != 0:
-                    raise RuntimeError(f"wait_flag D2H failed: ret={ret}")
-            except ImportError:
-                pass
+        # R11 (graph mode: NO D2H wait). The old wait_flag here paired each
+        # wait with the copy that came AFTER it (waits precede their copies
+        # on the D2H path), so wait_k could only pass after copy_k's
+        # predecessor finished — off by one. Under multi-layer captures this
+        # stalled each layer's publish for a full D2H completion (the
+        # seconds-long stalls at 19 layers) and, combined with capture
+        # warmup, let stale passes corrupt ordering (0.70). It is also
+        # unnecessary now: R5 gives every layer its own new_packed_scratch
+        # slice, so no cross-layer scratch overwrite exists to gate, and the
+        # MIX copy shares the compute queue with the scratch writes (FIFO).
 
         T = packed_kv.shape[0]
 
