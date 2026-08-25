@@ -20,6 +20,10 @@ sysctl -w kernel.sched_migration_cost_ns=50000
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 export SELECTIVE_LAYER_IDS=${SELECTIVE_LAYER_IDS-"5 9 13 17 21 25 29 33 37 41 45 49 53 57 61 65 69 73 77"}
+# [精度调试] cuda-graph-bs 可用环境变量覆盖, 免改脚本:
+#   CUDA_GRAPH_BS="1"                (对照旧 bs1 实验)
+#   CUDA_GRAPH_BS="8 16"             (默认, 对照 0.76)
+CUDA_GRAPH_BS=${CUDA_GRAPH_BS-"8 16"}
 
 MODEL_PATH=${MODEL_PATH:-/home/weights/GLM-5.2-W8A8C8-mxfp8}
 # P/D 解耦: P(prefill) 8192-token 大 batch 需要大量激活内存, fraction 过高会在
@@ -179,7 +183,7 @@ do
             --moe-dense-tp-size 1 \
             --mem-fraction-static $D_MEM_FRACTION \
             --chunked-prefill-size 8192 \
-            --cuda-graph-bs 8 16 \
+            --cuda-graph-bs ${CUDA_GRAPH_BS} \
             --speculative-algorithm NEXTN \
             --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
             --max-running-requests 192 \
