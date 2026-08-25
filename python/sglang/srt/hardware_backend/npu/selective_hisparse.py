@@ -1145,18 +1145,27 @@ class NPUSelectiveHiSparseCoordinator:
             # (device-side, single AIV core) until the copy kernel's 64
             # cores all finished THIS round's magic. This op is captured
             # into the graph between the DMA and the patch/SFA reads.
-            try:
-                from memfabric_hybrid import offload as mf_offload
+            # R13 (A/B): skip the in-graph H2D wait entirely. In the
+            # all-MIX world the compute-queue FIFO already orders the copy
+            # kernel before patch/SFA; the wait is documented redundant
+            # insurance — but its device-side spin stalls the compute
+            # queue, and the stall window grows with layer count (11-19
+            # layers lost ~1pt/layer). If skipping restores precision, the
+            # spin itself was the enabler. Env-gated single-variable probe:
+            # SGLANG_SELECTIVE_SKIP_H2D_WAIT=1
+            if os.getenv("SGLANG_SELECTIVE_SKIP_H2D_WAIT", "0") != "1":
+                try:
+                    from memfabric_hybrid import offload as mf_offload
 
-                ret = mf_offload.wait_flag(
-                    self.h2d_flag,
-                    self.h2d_expect,
-                    self.device,
-                )
-                if ret != 0:
-                    raise RuntimeError(f"wait_flag H2D failed: ret={ret}")
-            except ImportError:
-                pass  # fallback: staging copy path, no flag protocol
+                    ret = mf_offload.wait_flag(
+                        self.h2d_flag,
+                        self.h2d_expect,
+                        self.device,
+                    )
+                    if ret != 0:
+                        raise RuntimeError(f"wait_flag H2D failed: ret={ret}")
+                except ImportError:
+                    pass  # fallback: staging copy path, no flag protocol
 
         # 2. Current KV patch (graph-safe: no boolean indexing / nonzero)
         # W3: read from the fixed-address scratch written by
