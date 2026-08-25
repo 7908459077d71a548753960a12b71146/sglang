@@ -415,8 +415,17 @@ class NPUSelectiveHiSparseCoordinator:
         # NOTE: ~T*K*R bytes per layer (193MB at Tcap=144); the pool
         # configurator's fixed bias does NOT account for the extra copies —
         # compensate D_MEM_FRACTION manually for debug runs.
+        # A/B switch for the R8 paired experiment: SGLANG_SELECTIVE_SHARED_STAGING=1
+        # allocates ONE slice (equivalent to the old shared buffer, memory-cheap)
+        # and makes every layer index modulo 1 — an exact replay of the pre-R8
+        # aliasing without reverting any other R5-R7 changes.
+        if os.getenv("SGLANG_SELECTIVE_SHARED_STAGING", "0") == "1":
+            _staging_slices = 1
+        else:
+            _staging_slices = len(self.selected_layer_ids_sorted)
+        self._staging_slices = _staging_slices
         self.packed_staging_all = torch.zeros(
-            len(self.selected_layer_ids_sorted),
+            _staging_slices,
             T,
             K,
             R,
@@ -524,11 +533,15 @@ class NPUSelectiveHiSparseCoordinator:
         )
         # Pre-compute sequential HBM offsets for H2D dst_ptrs (constant).
         # R8: per-layer — each layer's H2D lands in its OWN staging slice.
+        # (A/B mode: all rows point at slice 0 — exact shared-buffer aliasing.)
         Rmax = T * K
         _ar = torch.arange(Rmax, device=self.device, dtype=torch.int64) * R
         self._h2d_dst_ptrs_preset_all = torch.stack(
             [
-                self.packed_staging_all[i].view(-1).data_ptr() + _ar
+                self.packed_staging_all[i % _staging_slices]
+                .view(-1)
+                .data_ptr()
+                + _ar
                 for i in range(len(self.selected_layer_ids_sorted))
             ]
         )
@@ -1135,7 +1148,9 @@ class NPUSelectiveHiSparseCoordinator:
 
         # R8: this layer's OWN staging slice — patch and SFA both touch it;
         # no other layer's H2D ever writes it.
-        staging = self.packed_staging_all[self._layer_scratch_index[layer_id]]
+        staging = self.packed_staging_all[
+            self._layer_scratch_index[layer_id] % self._staging_slices
+        ]
         staging_flat = staging.view(-1, self.record_bytes)
         N = T * K
         src_data = packed[safe_src]  # [T*K, 656]
