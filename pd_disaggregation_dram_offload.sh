@@ -143,6 +143,12 @@ do
         # 128 容量时需 825MB (报错日志含 NEEDED_HCCL_BUFFSIZE 算式), 留余量取 850
         export DEEPEP_HCCL_BUFFSIZE=850
 
+        # [精度调试 R1] 图模式 staging dump（配合本轮: 单请求 + cuda-graph-bs 8 16）:
+        #  (a) h2d_cnt 截断验证: 单请求应打 N=12288 (1 req * 6 draft * 2048 topk);
+        #      若出现 N=98304 (=8*6*2048) 或 196608 → padding 行未截断, 直接锁定 pad bug
+        #  (b) 统计 graph replay 次数, 与 Decode batch 日志的 cuda graph 字段交叉验证
+        export SGLANG_SELECTIVE_DUMP_STAGING=1
+
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
             --disaggregation-mode decode --disaggregation-transfer-backend ascend \
