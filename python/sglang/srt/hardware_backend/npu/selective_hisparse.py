@@ -432,11 +432,19 @@ class NPUSelectiveHiSparseCoordinator:
             dtype=torch.uint8,
             device=self.device,
         )
-        self.unpack_k_nope_bf16 = torch.zeros(
-            T, K, self.kv_lora_rank, dtype=torch.bfloat16, device=self.device
+        # R9 (debug): per-layer unpack/workspace family. These were the LAST
+        # shared buffers on the compute path — layer L's SFA (compute queue)
+        # reads unpack_k_* while layer L+4's unpack chain (torch ops) already
+        # overwrites them, one window per adjacent layer pair per replay
+        # (~linear dose-response). One set per layer; ~510MB per layer at
+        # Tcap=144 — NOT counted by the pool configurator, lower
+        # D_MEM_FRACTION accordingly.
+        n_ws = len(self.selected_layer_ids_sorted)
+        self.unpack_k_nope_bf16_all = torch.zeros(
+            n_ws, T, K, self.kv_lora_rank, dtype=torch.bfloat16, device=self.device
         )
-        self.unpack_k_rope_bf16 = torch.zeros(
-            T, K, self.qk_rope_head_dim, dtype=torch.bfloat16, device=self.device
+        self.unpack_k_rope_bf16_all = torch.zeros(
+            n_ws, T, K, self.qk_rope_head_dim, dtype=torch.bfloat16, device=self.device
         )
         # Fixed-address scratch holding the current forward's newly packed
         # KV: publish_new_packed_kv copies into it and the selected layer's
@@ -463,12 +471,13 @@ class NPUSelectiveHiSparseCoordinator:
             lid: i for i, lid in enumerate(self.selected_layer_ids_sorted)
         }
         # Contiguous component buffers for safe Cast (avoid non-contiguous FP8→BF16)
+        # R9: per-layer slices of the same family.
         TK = T * K
-        self.fp8_nope_buf = torch.zeros(
-            TK, self.kv_lora_rank, dtype=torch.float8_e4m3fn, device=self.device
+        self.fp8_nope_buf_all = torch.zeros(
+            n_ws, TK, self.kv_lora_rank, dtype=torch.float8_e4m3fn, device=self.device
         )
-        self.scales_buf = torch.zeros(
-            TK, self.kv_lora_rank // 128, dtype=torch.float32, device=self.device
+        self.scales_buf_all = torch.zeros(
+            n_ws, TK, self.kv_lora_rank // 128, dtype=torch.float32, device=self.device
         )
         self.host_locs_buf = torch.zeros(
             T, K, dtype=torch.int64, device=self.device
@@ -476,14 +485,14 @@ class NPUSelectiveHiSparseCoordinator:
         self.current_source_row_buf = torch.full(
             (T, K), -1, dtype=torch.int64, device=self.device
         )
-        self.sparse_indices_buf = torch.zeros(
-            T, 1, 1, K, dtype=torch.int32, device=self.device
+        self.sparse_indices_buf_all = torch.zeros(
+            n_ws, T, 1, 1, K, dtype=torch.int32, device=self.device
         )
-        self.actual_seq_lens_kv_buf = torch.ones(
-            T, dtype=torch.int32, device=self.device
+        self.actual_seq_lens_kv_buf_all = torch.ones(
+            n_ws, T, dtype=torch.int32, device=self.device
         )
-        self.actual_seq_lens_q_buf = torch.ones(
-            T, dtype=torch.int32, device=self.device
+        self.actual_seq_lens_q_buf_all = torch.ones(
+            n_ws, T, dtype=torch.int32, device=self.device
         )
         self.arange_k_buf = torch.arange(
             K, dtype=torch.int32, device=self.device
@@ -570,16 +579,16 @@ class NPUSelectiveHiSparseCoordinator:
         persistent_buffers = (
             self.packed_staging_all,
             self._h2d_dst_ptrs_preset_all,
-            self.unpack_k_nope_bf16,
-            self.unpack_k_rope_bf16,
+            self.unpack_k_nope_bf16_all,
+            self.unpack_k_rope_bf16_all,
             self.new_packed_scratch_all,
-            self.fp8_nope_buf,
-            self.scales_buf,
+            self.fp8_nope_buf_all,
+            self.scales_buf_all,
             self.host_locs_buf,
             self.current_source_row_buf,
-            self.sparse_indices_buf,
-            self.actual_seq_lens_kv_buf,
-            self.actual_seq_lens_q_buf,
+            self.sparse_indices_buf_all,
+            self.actual_seq_lens_kv_buf_all,
+            self.actual_seq_lens_q_buf_all,
             self.arange_k_buf,
             self.arange_token_buf,
             self.h2d_src_ptrs_all,
@@ -1179,22 +1188,24 @@ class NPUSelectiveHiSparseCoordinator:
                 f"staging_nonzero={staging_nonzero}/{N}"
             )
 
+        # R9: this layer's OWN workspace slices (see _alloc_staging_buffers).
+        _ws = self._layer_scratch_index[layer_id]
         out = selective_sparse_attention(
             q_nope=q_nope[:T],
             q_rope=q_rope[:T],
             packed_staging=staging[:T],
             valid_mask=all_valid_mask,
             scale=layer.scaling,
-            unpack_k_nope_bf16=self.unpack_k_nope_bf16,
-            unpack_k_rope_bf16=self.unpack_k_rope_bf16,
-            sparse_indices_buf=self.sparse_indices_buf,
-            actual_seq_lens_kv_buf=self.actual_seq_lens_kv_buf,
+            unpack_k_nope_bf16=self.unpack_k_nope_bf16_all[_ws],
+            unpack_k_rope_bf16=self.unpack_k_rope_bf16_all[_ws],
+            sparse_indices_buf=self.sparse_indices_buf_all[_ws],
+            actual_seq_lens_kv_buf=self.actual_seq_lens_kv_buf_all[_ws],
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            actual_seq_lens_q_buf=self.actual_seq_lens_q_buf,
+            actual_seq_lens_q_buf=self.actual_seq_lens_q_buf_all[_ws],
             arange_k_buf=self.arange_k_buf,
-            fp8_nope_buf=self.fp8_nope_buf,
-            scales_buf=self.scales_buf,
+            fp8_nope_buf=self.fp8_nope_buf_all[_ws],
+            scales_buf=self.scales_buf_all[_ws],
             graph_mode=self._graph_mode,
         )
 
