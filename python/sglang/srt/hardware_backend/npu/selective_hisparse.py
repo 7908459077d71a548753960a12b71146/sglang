@@ -485,11 +485,19 @@ class NPUSelectiveHiSparseCoordinator:
         self.scales_buf_all = torch.zeros(
             n_ws, TK, self.kv_lora_rank // 128, dtype=torch.float32, device=self.device
         )
-        self.host_locs_buf = torch.zeros(
-            T, K, dtype=torch.int64, device=self.device
+        # R10: per-layer loc-plan buffers. build_loc_plan rewrites these two
+        # for EVERY selected layer while the PREVIOUS layer's H2D copy /
+        # current-patch / SFA still consume its plan (gather_locs feed the
+        # DMA descriptors, current_source_row feeds the patch). This was the
+        # remaining cross-layer window after R9: 7-layer per-layer-workspace
+        # still scored 0.86 (expected ~0.90 if R9 were the only cause).
+        # int64 [T, K] x2 per layer is ~4.8MB/layer — cheap, full per-layer.
+        _n_lp = len(self.selected_layer_ids_sorted)
+        self.host_locs_buf_all = torch.zeros(
+            _n_lp, T, K, dtype=torch.int64, device=self.device
         )
-        self.current_source_row_buf = torch.full(
-            (T, K), -1, dtype=torch.int64, device=self.device
+        self.current_source_row_buf_all = torch.full(
+            (_n_lp, T, K), -1, dtype=torch.int64, device=self.device
         )
         self.sparse_indices_buf_all = torch.zeros(
             n_ws, T, 1, 1, K, dtype=torch.int32, device=self.device
@@ -590,8 +598,8 @@ class NPUSelectiveHiSparseCoordinator:
             self.new_packed_scratch_all,
             self.fp8_nope_buf_all,
             self.scales_buf_all,
-            self.host_locs_buf,
-            self.current_source_row_buf,
+            self.host_locs_buf_all,
+            self.current_source_row_buf_all,
             self.sparse_indices_buf_all,
             self.actual_seq_lens_kv_buf_all,
             self.actual_seq_lens_q_buf_all,
@@ -631,6 +639,7 @@ class NPUSelectiveHiSparseCoordinator:
         self,
         topk_indices: torch.Tensor,
         forward_batch: "ForwardBatch",
+        selected_layer_id: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convert Top-K position indices to Host gather locations.
 
@@ -639,10 +648,21 @@ class NPUSelectiveHiSparseCoordinator:
             valid_mask: [T, K] bool — True for valid historical entries
             current_source_row: [T, K] int64 — row index into new_packed for
                 current-position hits, or -1 for historical entries
+
+        R10: with selected_layer_id the two persistent scratch buffers are
+        this layer's OWN slices (cross-layer plan overwrite eliminated).
+        Without it (legacy callers) the shared slice 0 is used.
         """
         B = forward_batch.batch_size
         T = B * self.verify_width
         K = self.topk
+        if selected_layer_id is not None:
+            _lp = self._layer_scratch_index[selected_layer_id]
+            host_locs_buf = self.host_locs_buf_all[_lp, :T]
+            current_source_row_buf = self.current_source_row_buf_all[_lp, :T]
+        else:
+            host_locs_buf = self.host_locs_buf_all[0, :T]
+            current_source_row_buf = self.current_source_row_buf_all[0, :T]
 
         topk = topk_indices[:T].reshape(T, K).to(torch.int64)
 
@@ -687,10 +707,9 @@ class NPUSelectiveHiSparseCoordinator:
 
         # current_source_row: for current-batch hits, row index into
         # new_packed; for historical/invalid → -1
-        current_rows_buf = self.current_source_row_buf[:T]  # [T, K]
-        current_rows_buf.fill_(-1)
+        current_source_row_buf.fill_(-1)
         current_rows = torch.where(
-            is_current, current_row_idx, current_rows_buf
+            is_current, current_row_idx, current_source_row_buf
         )  # [T, K]
 
         # Host locs for historical entries
@@ -702,12 +721,11 @@ class NPUSelectiveHiSparseCoordinator:
 
         # gather_locs: historical → hist_locs, current/invalid → sentinel
         sentinel = self.pool.host_sentinel_loc
-        sentinel_buf = self.host_locs_buf[:T]
-        sentinel_buf.fill_(sentinel)
+        host_locs_buf.fill_(sentinel)
         gather_locs = torch.where(
             causal_ok & ~is_current,
             hist_locs,
-            sentinel_buf,
+            host_locs_buf,
         )
 
         # valid_mask: True for valid historical entries (not current, not invalid)
@@ -760,9 +778,9 @@ class NPUSelectiveHiSparseCoordinator:
             prev_backup = self.backup_done_event.get(selected, self._initial_event)
             self.prefetch_stream.wait_event(prev_backup)
 
-        # Build loc plan
+        # Build loc plan (R10: this layer's own scratch slices)
         locs, valid, current_rows = self.build_loc_plan(
-            topk_indices, forward_batch
+            topk_indices, forward_batch, selected_layer_id=selected
         )
 
         # Eager H2D uses a side stream and needs an explicit hand-off.  Graph
