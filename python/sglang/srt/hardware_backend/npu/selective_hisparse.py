@@ -422,9 +422,24 @@ class NPUSelectiveHiSparseCoordinator:
         # ``_published_packed`` reference to a graph-pool tensor with a
         # stable pre-allocated buffer (already counted in the pool
         # configurator's selective fixed bias).
-        self.new_packed_scratch = torch.zeros(
-            T, R, dtype=torch.uint8, device=self.device
+        # PER-LAYER (debug R5): a single shared scratch forces layer L+4's
+        # overwrite to race layer L's in-flight D2H read inside one graph
+        # replay — the wait_flag gate blocks the compute queue only and can
+        # be bypassed by a vector-queue overwrite op. One [T, R] slice per
+        # selected layer removes the cross-layer window entirely; the extra
+        # memory is num_selected * T * R bytes (trivial vs packed_staging).
+        # Layer index resolved in Python at capture time (bakes a fixed view
+        # into the graph).
+        self.new_packed_scratch_all = torch.zeros(
+            len(self.selected_layer_ids_sorted),
+            T,
+            R,
+            dtype=torch.uint8,
+            device=self.device,
         )
+        self._layer_scratch_index: dict[int, int] = {
+            lid: i for i, lid in enumerate(self.selected_layer_ids_sorted)
+        }
         # Contiguous component buffers for safe Cast (avoid non-contiguous FP8→BF16)
         TK = T * K
         self.fp8_nope_buf = torch.zeros(
@@ -517,6 +532,7 @@ class NPUSelectiveHiSparseCoordinator:
             self.packed_staging,
             self.unpack_k_nope_bf16,
             self.unpack_k_rope_bf16,
+            self.new_packed_scratch_all,
             self.fp8_nope_buf,
             self.scales_buf,
             self.host_locs_buf,
@@ -869,8 +885,13 @@ class NPUSelectiveHiSparseCoordinator:
         # current-patch consumer (and the D2H DMA below) read a stable
         # pre-allocated buffer instead of a Python-held graph-pool tensor.
         # Same-stream ordering guarantees the copy lands before both
-        # consumers.
-        self.new_packed_scratch[:T].copy_(packed_kv.view(torch.uint8))
+        # consumers. R5: per-layer slice (layer_id resolved at capture time);
+        # no other layer ever writes this buffer, so the D2H read below and
+        # this write cannot race a different layer's overwrite.
+        scratch = self.new_packed_scratch_all[
+            self._layer_scratch_index[layer_id]
+        ]
+        scratch[:T].copy_(packed_kv.view(torch.uint8))
 
         # Eager mode syncs the device-side real-token count (harmless
         # bookkeeping, see maybe_start_prefetch). Graph mode reads the
@@ -913,8 +934,11 @@ class NPUSelectiveHiSparseCoordinator:
             try:
                 from memfabric_hybrid import offload as mf_offload
 
-                # W3: DMA reads from the fixed-address scratch.
-                base_hbm = self.new_packed_scratch.data_ptr()
+                # W3: DMA reads from the fixed-address scratch (R5: this
+                # layer's own slice — see publish comment above).
+                base_hbm = self.new_packed_scratch_all[
+                    self._layer_scratch_index[layer_id]
+                ].data_ptr()
                 base_dva = self.pool.layer_dva(layer_id)
 
                 self.d2h_src_ptrs[:N] = (
@@ -1059,8 +1083,11 @@ class NPUSelectiveHiSparseCoordinator:
         # 2. Current KV patch (graph-safe: no boolean indexing / nonzero)
         # W3: read from the fixed-address scratch written by
         # publish_new_packed_kv (same-stream ordering on both the eager
-        # main stream and the graph capture stream).
-        packed = self.new_packed_scratch[:T]  # [T, 656] uint8
+        # main stream and the graph capture stream). R5: this layer's own
+        # slice — captured view, stable across replays.
+        packed = self.new_packed_scratch_all[
+            self._layer_scratch_index[layer_id]
+        ][:T]  # [T, 656] uint8
         current_rows = st.current_source_row[:T]  # [T, K]
         mask = (current_rows >= 0).reshape(-1)  # [T*K]
         safe_src = current_rows.reshape(-1).clamp(min=0)  # [T*K]
