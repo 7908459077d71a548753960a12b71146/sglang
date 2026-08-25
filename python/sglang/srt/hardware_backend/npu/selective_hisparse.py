@@ -1327,6 +1327,32 @@ class NPUSelectiveHiSparseCoordinator:
         if os.getenv("SGLANG_SELECTIVE_DISABLE_D2H", "0") == "1":
             self.d2h_cnt.fill_(0)
 
+        # R7 (flag health probe): read the monotonic counters BEFORE this
+        # replay. Invariant: h2d_flag[0] == h2d_expect[0] (every captured
+        # notify is paired with one captured expect add_) — checked after a
+        # device sync so the read reflects all PREVIOUS replays' kernels.
+        # A mismatch (flag < expect: a wait passed early / notify lost;
+        # flag > expect: stray notify) means the flag protocol itself is
+        # broken at this layer count, which would invalidate every wait
+        # downstream and produce exactly the dose-response precision loss.
+        # Read-only probe: the sync makes each replay slightly slower but
+        # changes no semantics. Enable with SGLANG_SELECTIVE_CHECK_FLAGS=1.
+        if os.getenv("SGLANG_SELECTIVE_CHECK_FLAGS", "0") == "1":
+            self._dbg_replay_round = getattr(self, "_dbg_replay_round", 0) + 1
+            if self._dbg_replay_round % 100 == 1:  # sample to bound overhead
+                torch.npu.synchronize()
+                h2d_f = int(self.h2d_flag[0].item())
+                h2d_e = int(self.h2d_expect[0].item())
+                d2h_f = int(self.d2h_flag[0].item())
+                d2h_e = int(self.d2h_expect[0].item())
+                ok = (h2d_f == h2d_e) and (d2h_f == d2h_e)
+                logger.info(
+                    f"[FLAG-CHECK] round={self._dbg_replay_round} "
+                    f"h2d flag/expect={h2d_f}/{h2d_e} "
+                    f"d2h flag/expect={d2h_f}/{d2h_e} "
+                    f"{'OK' if ok else '*** MISMATCH ***'}"
+                )
+
     def finish_graph_capture(self):
         """Restore eager coordinator semantics after one graph is captured.
 
