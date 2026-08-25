@@ -474,29 +474,37 @@ class NPUSelectiveHiSparseCoordinator:
         # H2D and D2H run on separate streams (prefetch_stream / backup_stream)
         # and MUST have independent pointer buffers to avoid races when both
         # are in flight simultaneously.
+        # PER-LAYER (debug R6): every selected layer used to write the SAME
+        # descriptor buffers (h2d_src_ptrs[:N] = ... torch ops) while the
+        # previous layer's captured sparse_copy kernel may still be reading
+        # them in-flight — a per-layer cross-layer window that scales with
+        # layer count (matches the dose-response: 1-2 layers clean, 10
+        # layers 0.80, 19 layers 0.72). One descriptor set per layer removes
+        # the window; layer index resolved in Python at capture time.
+        n_sel = len(self.selected_layer_ids_sorted)
         Rmax = T * K
         # H2D buffers (max entries = Tcap * K)
-        self.h2d_src_ptrs = torch.zeros(
-            Rmax, dtype=torch.int64, device=self.device
+        self.h2d_src_ptrs_all = torch.zeros(
+            n_sel, Rmax, dtype=torch.int64, device=self.device
         )
-        self.h2d_dst_ptrs = torch.zeros(
-            Rmax, dtype=torch.int64, device=self.device
+        self.h2d_dst_ptrs_all = torch.zeros(
+            n_sel, Rmax, dtype=torch.int64, device=self.device
         )
-        self.h2d_lens = torch.zeros(
-            Rmax, dtype=torch.int32, device=self.device
+        self.h2d_lens_all = torch.zeros(
+            n_sel, Rmax, dtype=torch.int32, device=self.device
         )
         self.h2d_cnt = torch.zeros(
             (), dtype=torch.int32, device=self.device
         )
         # D2H buffers (max entries = Tcap)
-        self.d2h_src_ptrs = torch.zeros(
-            T, dtype=torch.int64, device=self.device
+        self.d2h_src_ptrs_all = torch.zeros(
+            n_sel, T, dtype=torch.int64, device=self.device
         )
-        self.d2h_dst_ptrs = torch.zeros(
-            T, dtype=torch.int64, device=self.device
+        self.d2h_dst_ptrs_all = torch.zeros(
+            n_sel, T, dtype=torch.int64, device=self.device
         )
-        self.d2h_lens = torch.zeros(
-            T, dtype=torch.int32, device=self.device
+        self.d2h_lens_all = torch.zeros(
+            n_sel, T, dtype=torch.int32, device=self.device
         )
         self.d2h_cnt = torch.zeros(
             (), dtype=torch.int32, device=self.device
@@ -542,13 +550,13 @@ class NPUSelectiveHiSparseCoordinator:
             self.actual_seq_lens_q_buf,
             self.arange_k_buf,
             self.arange_token_buf,
-            self.h2d_src_ptrs,
-            self.h2d_dst_ptrs,
-            self.h2d_lens,
+            self.h2d_src_ptrs_all,
+            self.h2d_dst_ptrs_all,
+            self.h2d_lens_all,
             self.h2d_cnt,
-            self.d2h_src_ptrs,
-            self.d2h_dst_ptrs,
-            self.d2h_lens,
+            self.d2h_src_ptrs_all,
+            self.d2h_dst_ptrs_all,
+            self.d2h_lens_all,
             self.d2h_cnt,
             self._h2d_dst_ptrs_preset,
             self.h2d_flag,
@@ -759,16 +767,23 @@ class NPUSelectiveHiSparseCoordinator:
 
                 base_dva = self.pool.layer_dva(selected)
 
-                self.h2d_src_ptrs[:N] = (
+                # R6: this layer's own descriptor slice — no other layer
+                # writes it, so the previous layer's in-flight copy cannot
+                # read descriptors being overwritten.
+                _si = self._layer_scratch_index[selected]
+                h2d_src = self.h2d_src_ptrs_all[_si]
+                h2d_dst = self.h2d_dst_ptrs_all[_si]
+                h2d_lens = self.h2d_lens_all[_si]
+                h2d_src[:N] = (
                     base_dva
                     + locs.reshape(-1).to(torch.int64) * self.record_bytes
                 )
-                self.h2d_dst_ptrs[:N] = self._h2d_dst_ptrs_preset[:N]
+                h2d_dst[:N] = self._h2d_dst_ptrs_preset[:N]
                 # Padded rows never reach here with valid entries: graph
                 # mode gates causal_ok upstream (build_loc_plan) and the
                 # replay-updated h2d_cnt limits submitted entries to the
                 # real rows; eager mode submits all N with the valid mask.
-                self.h2d_lens[:N] = torch.where(
+                h2d_lens[:N] = torch.where(
                     valid_flat, self.record_bytes, 0
                 ).to(torch.int32)
                 if not self._graph_mode:
@@ -785,9 +800,9 @@ class NPUSelectiveHiSparseCoordinator:
                 # the h2d_done event instead).
                 if self._graph_mode:
                     ret = mf_offload.sparse_copy_notify(
-                        self.h2d_src_ptrs[:N],
-                        self.h2d_dst_ptrs[:N],
-                        self.h2d_lens[:N],
+                        h2d_src[:N],
+                        h2d_dst[:N],
+                        h2d_lens[:N],
                         self.h2d_cnt,
                         self.h2d_flag,
                         self.device,
@@ -795,9 +810,9 @@ class NPUSelectiveHiSparseCoordinator:
                     self.h2d_expect[0].add_(self._dma_flag_block_num)
                 else:
                     ret = mf_offload.sparse_copy(
-                        self.h2d_src_ptrs[:N],
-                        self.h2d_dst_ptrs[:N],
-                        self.h2d_lens[:N],
+                        h2d_src[:N],
+                        h2d_dst[:N],
+                        h2d_lens[:N],
                         self.h2d_cnt,
                         self.device,
                     )
@@ -936,12 +951,15 @@ class NPUSelectiveHiSparseCoordinator:
 
                 # W3: DMA reads from the fixed-address scratch (R5: this
                 # layer's own slice — see publish comment above).
-                base_hbm = self.new_packed_scratch_all[
-                    self._layer_scratch_index[layer_id]
-                ].data_ptr()
+                _si = self._layer_scratch_index[layer_id]
+                base_hbm = self.new_packed_scratch_all[_si].data_ptr()
                 base_dva = self.pool.layer_dva(layer_id)
+                # R6: this layer's own descriptor slice (see H2D comment).
+                d2h_src = self.d2h_src_ptrs_all[_si]
+                d2h_dst = self.d2h_dst_ptrs_all[_si]
+                d2h_lens = self.d2h_lens_all[_si]
 
-                self.d2h_src_ptrs[:N] = (
+                d2h_src[:N] = (
                     base_hbm
                     + torch.arange(
                         N, device=self.device, dtype=torch.int64
@@ -958,25 +976,25 @@ class NPUSelectiveHiSparseCoordinator:
                     real_token_mask = None
                     safe_logical_locs = logical_locs[:N].to(torch.int64)
 
-                self.d2h_dst_ptrs[:N] = (
+                d2h_dst[:N] = (
                     base_dva
                     + safe_logical_locs * self.record_bytes
                 )
                 if real_token_mask is not None:
-                    self.d2h_lens[:N] = torch.where(
+                    d2h_lens[:N] = torch.where(
                         real_token_mask,
                         self.record_bytes,
                         0,
                     ).to(torch.int32)
                 else:
-                    self.d2h_lens[:N] = self.record_bytes
+                    d2h_lens[:N] = self.record_bytes
                     self.d2h_cnt.fill_(N)
 
                 if self._graph_mode:
                     ret = mf_offload.sparse_copy_notify(
-                        self.d2h_src_ptrs[:N],
-                        self.d2h_dst_ptrs[:N],
-                        self.d2h_lens[:N],
+                        d2h_src[:N],
+                        d2h_dst[:N],
+                        d2h_lens[:N],
                         self.d2h_cnt,
                         self.d2h_flag,
                         self.device,
@@ -984,9 +1002,9 @@ class NPUSelectiveHiSparseCoordinator:
                     self.d2h_expect[0].add_(self._dma_flag_block_num)
                 else:
                     ret = mf_offload.sparse_copy(
-                        self.d2h_src_ptrs[:N],
-                        self.d2h_dst_ptrs[:N],
-                        self.d2h_lens[:N],
+                        d2h_src[:N],
+                        d2h_dst[:N],
+                        d2h_lens[:N],
                         self.d2h_cnt,
                         self.device,
                     )
