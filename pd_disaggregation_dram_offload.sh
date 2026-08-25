@@ -19,7 +19,7 @@ sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
-export SELECTIVE_LAYER_IDS=${SELECTIVE_LAYER_IDS:-"5 9 13 17 21 25 29 33 37 41 45 49 53 57 61 65 69 73 77"}
+export SELECTIVE_LAYER_IDS=${SELECTIVE_LAYER_IDS-"5 9 13 17 21 25 29 33 37 41 45 49 53 57 61 65 69 73 77"}
 
 MODEL_PATH=${MODEL_PATH:-/home/weights/GLM-5.2-W8A8C8-mxfp8}
 # P/D 解耦: P(prefill) 8192-token 大 batch 需要大量激活内存, fraction 过高会在
@@ -68,7 +68,7 @@ export PYTHONPATH=`pwd`/python:$PYTHONPATH
 
 # 日志双路输出: sglang serve 的 stdout/stderr 同时打屏 + 落文件 (tee)
 # (memfabric C 层日志走 stderr 一并捕获; 文件名带角色/时间戳便于区分)
-LOG_DIR=${LOG_DIR:-/home/sglang/logs}
+LOG_DIR=${LOG_DIR:-`pwd`}
 mkdir -p "$LOG_DIR"
 LOG_TS=$(date +%Y%m%d_%H%M%S)
 
@@ -147,7 +147,16 @@ do
         #  (a) h2d_cnt 截断验证: 单请求应打 N=12288 (1 req * 6 draft * 2048 topk);
         #      若出现 N=98304 (=8*6*2048) 或 196608 → padding 行未截断, 直接锁定 pad bug
         #  (b) 统计 graph replay 次数, 与 Decode batch 日志的 cuda graph 字段交叉验证
-        export SGLANG_SELECTIVE_DUMP_STAGING=1
+        # [精度调试 E3] 无 hisparse 对照: SELECTIVE_LAYER_IDS="" 启动可完全关闭
+        # selective hisparse (不传该参数, KV 全 resident HBM), 用于判别
+        # graph bs8 精度问题是否 hisparse 特有。判读:
+        #   0.94 → hisparse pad 路径实锤; 仍 0.7x → 分支基础图设施问题
+        if [[ -n "$SELECTIVE_LAYER_IDS" ]]; then
+            HISPARSE_ARGS="--npu-selective-hisparse-layer-ids ${SELECTIVE_LAYER_IDS}"
+        else
+            HISPARSE_ARGS=""
+            echo "[E3] SELECTIVE_LAYER_IDS empty -> selective hisparse DISABLED"
+        fi
 
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
@@ -176,7 +185,7 @@ do
             --deepep-mode low_latency \
             --watchdog-timeout 9000 \
             --num-reserved-decode-tokens 2048 \
-            --npu-selective-hisparse-layer-ids ${SELECTIVE_LAYER_IDS} \
+            ${HISPARSE_ARGS} \
             --disaggregation-decode-polling-interval 2 \
             2>&1 | tee "$D_LOG"
 
