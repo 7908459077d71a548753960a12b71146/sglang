@@ -281,7 +281,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 )
                 if _sel_coord is not None:
                     _n = int(_sel_coord.h2d_cnt.item())
-                    _flat = _sel_coord.packed_staging.view(-1)[
+                    _flat = _sel_coord.packed_staging_all.view(-1)[
                         : _n * _sel_coord.record_bytes
                     ]
                     logger.info(

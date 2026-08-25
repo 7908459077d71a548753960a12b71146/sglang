@@ -407,8 +407,21 @@ class NPUSelectiveHiSparseCoordinator:
         K = self.topk
         R = self.record_bytes
 
-        self.packed_staging = torch.zeros(
-            T, K, R, dtype=torch.uint8, device=self.device
+        # R8 (debug): per-layer staging. The shared staging buffer was the
+        # last cross-layer shared resource on the DMA path — layer L+4's H2D
+        # sparse_copy (MIX, compute queue) overwrites the same rows layer L's
+        # unpack chain (torch ops) may still be reading. One [T, K, R] slice
+        # per selected layer removes the L-1 overwrite windows per replay.
+        # NOTE: ~T*K*R bytes per layer (193MB at Tcap=144); the pool
+        # configurator's fixed bias does NOT account for the extra copies —
+        # compensate D_MEM_FRACTION manually for debug runs.
+        self.packed_staging_all = torch.zeros(
+            len(self.selected_layer_ids_sorted),
+            T,
+            K,
+            R,
+            dtype=torch.uint8,
+            device=self.device,
         )
         self.unpack_k_nope_bf16 = torch.zeros(
             T, K, self.kv_lora_rank, dtype=torch.bfloat16, device=self.device
@@ -509,11 +522,16 @@ class NPUSelectiveHiSparseCoordinator:
         self.d2h_cnt = torch.zeros(
             (), dtype=torch.int32, device=self.device
         )
-        # Pre-compute sequential HBM offsets for H2D dst_ptrs (constant)
-        staging_base = self.packed_staging.data_ptr()
-        self._h2d_dst_ptrs_preset = staging_base + torch.arange(
-            Rmax, device=self.device, dtype=torch.int64
-        ) * R
+        # Pre-compute sequential HBM offsets for H2D dst_ptrs (constant).
+        # R8: per-layer — each layer's H2D lands in its OWN staging slice.
+        Rmax = T * K
+        _ar = torch.arange(Rmax, device=self.device, dtype=torch.int64) * R
+        self._h2d_dst_ptrs_preset_all = torch.stack(
+            [
+                self.packed_staging_all[i].view(-1).data_ptr() + _ar
+                for i in range(len(self.selected_layer_ids_sorted))
+            ]
+        )
 
         # Completion-flag protocol for graph-mode DMA ordering (see
         # mf_offload.sparse_copy_notify / wait_flag). Monotonic-count
@@ -537,7 +555,8 @@ class NPUSelectiveHiSparseCoordinator:
         self._dma_flag_block_num = 64
 
         persistent_buffers = (
-            self.packed_staging,
+            self.packed_staging_all,
+            self._h2d_dst_ptrs_preset_all,
             self.unpack_k_nope_bf16,
             self.unpack_k_rope_bf16,
             self.new_packed_scratch_all,
@@ -558,7 +577,6 @@ class NPUSelectiveHiSparseCoordinator:
             self.d2h_dst_ptrs_all,
             self.d2h_lens_all,
             self.d2h_cnt,
-            self._h2d_dst_ptrs_preset,
             self.h2d_flag,
             self.h2d_expect,
             self.d2h_flag,
@@ -757,7 +775,9 @@ class NPUSelectiveHiSparseCoordinator:
             if loc_plan_ready is not None:
                 h2d_stream.wait_event(loc_plan_ready)
 
-            staging_flat = self.packed_staging.view(-1, self.record_bytes)
+            staging_flat = self.packed_staging_all[
+                self._layer_scratch_index[selected]
+            ].view(-1, self.record_bytes)
 
             valid_flat = valid.reshape(-1)
             N = T * self.topk
@@ -778,7 +798,8 @@ class NPUSelectiveHiSparseCoordinator:
                     base_dva
                     + locs.reshape(-1).to(torch.int64) * self.record_bytes
                 )
-                h2d_dst[:N] = self._h2d_dst_ptrs_preset[:N]
+                # R8: dst into THIS layer's staging slice.
+                h2d_dst[:N] = self._h2d_dst_ptrs_preset_all[_si, :N]
                 # Padded rows never reach here with valid entries: graph
                 # mode gates causal_ok upstream (build_loc_plan) and the
                 # replay-updated h2d_cnt limits submitted entries to the
@@ -1072,7 +1093,9 @@ class NPUSelectiveHiSparseCoordinator:
             # SGLANG_SELECTIVE_DUMP_STAGING=1.
             if os.getenv("SGLANG_SELECTIVE_DUMP_STAGING", "0") == "1":
                 _n = st.real_tokens * K
-                _flat = self.packed_staging.view(-1)[: _n * self.record_bytes]
+                _flat = self.packed_staging_all[
+                    self._layer_scratch_index[layer_id]
+                ].view(-1)[: _n * self.record_bytes]
                 logger.info(
                     f"[STAGING-DUMP eager] layer={layer_id} "
                     f"N={_n} sum={_flat.sum(dtype=torch.int64).item()} "
@@ -1110,7 +1133,10 @@ class NPUSelectiveHiSparseCoordinator:
         mask = (current_rows >= 0).reshape(-1)  # [T*K]
         safe_src = current_rows.reshape(-1).clamp(min=0)  # [T*K]
 
-        staging_flat = self.packed_staging.view(-1, self.record_bytes)
+        # R8: this layer's OWN staging slice — patch and SFA both touch it;
+        # no other layer's H2D ever writes it.
+        staging = self.packed_staging_all[self._layer_scratch_index[layer_id]]
+        staging_flat = staging.view(-1, self.record_bytes)
         N = T * K
         src_data = packed[safe_src]  # [T*K, 656]
         staging_flat[:N] = torch.where(
@@ -1141,7 +1167,7 @@ class NPUSelectiveHiSparseCoordinator:
         out = selective_sparse_attention(
             q_nope=q_nope[:T],
             q_rope=q_rope[:T],
-            packed_staging=self.packed_staging[:T],
+            packed_staging=staging[:T],
             valid_mask=all_valid_mask,
             scale=layer.scaling,
             unpack_k_nope_bf16=self.unpack_k_nope_bf16,
