@@ -789,7 +789,7 @@ class NPUSelectiveHiSparseCoordinator:
                 h2d_stream.wait_event(loc_plan_ready)
 
             staging_flat = self.packed_staging_all[
-                self._layer_scratch_index[selected]
+                self._layer_scratch_index[selected] % self._staging_slices
             ].view(-1, self.record_bytes)
 
             valid_flat = valid.reshape(-1)
@@ -1107,7 +1107,7 @@ class NPUSelectiveHiSparseCoordinator:
             if os.getenv("SGLANG_SELECTIVE_DUMP_STAGING", "0") == "1":
                 _n = st.real_tokens * K
                 _flat = self.packed_staging_all[
-                    self._layer_scratch_index[layer_id]
+                    self._layer_scratch_index[layer_id] % self._staging_slices
                 ].view(-1)[: _n * self.record_bytes]
                 logger.info(
                     f"[STAGING-DUMP eager] layer={layer_id} "
