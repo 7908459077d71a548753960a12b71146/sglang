@@ -143,11 +143,14 @@ do
         # 128 容量时需 825MB (报错日志含 NEEDED_HCCL_BUFFSIZE 算式), 留余量取 850
         export DEEPEP_HCCL_BUFFSIZE=850
 
-        # [精度调试 R2] hisparse ON + 单请求 + cuda-graph-bs 8 16 + 每次 replay 后
-        # device sync: 判别竞态发生在跨 replay 还是图内/pad 逻辑。
-        #   恢复 0.94 → 跨 replay 竞态(桥接/eager-graph 边界);
-        #   仍 0.76  → 图内时序竞态 或 pad 行逻辑(确定性错误), 转架构修复
-        export SGLANG_SELECTIVE_DEBUG_SYNC=1
+        # [精度调试 R3] 单层(layer 5) + 单请求 + cuda-graph-bs 8 16:
+        # 相比 0.76 基线(19层)仅减少 selected 层数 → 每步 DMA/向量算子数降 19 倍,
+        # pad 行数不变(7 行)。判读:
+        #   大幅恢复(≥0.9) → 图内时序竞态(竞争量驱动) → 转 memfabric 架构修复
+        #   仍 ~0.76       → pad 行确定性毒化 → 查 pad 路径(SFA zeroing/empty_rows)
+        # [已定案] R1: 单请求 bs8=0.76(多请求无关, N 截断正常)
+        #         E3: 无 hisparse bs8=0.94(graph 基础设施干净)
+        #         R2: replay 后 sync 无效(跨 replay 竞态排除)
         # [精度调试 E3] 无 hisparse 对照: SELECTIVE_LAYER_IDS="" 启动可完全关闭
         # selective hisparse (不传该参数, KV 全 resident HBM), 用于判别
         # graph bs8 精度问题是否 hisparse 特有。判读:
