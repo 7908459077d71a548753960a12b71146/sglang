@@ -185,7 +185,7 @@ do
             --chunked-prefill-size 8192 \
             --cuda-graph-bs ${CUDA_GRAPH_BS} \
             --speculative-algorithm NEXTN \
-            --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
+            --speculative-num-steps ${SPEC_NUM_STEPS-5} --speculative-eagle-topk 1 --speculative-num-draft-tokens ${SPEC_DRAFT_TOKENS-6} \
             --max-running-requests 192 \
             --host 0.0.0.0 \
             --port 31000 \
