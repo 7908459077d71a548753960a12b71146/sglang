@@ -44,6 +44,8 @@ FIELD_TOL = {  # relative tolerance; int fields compared exactly
     "crow": None,   # exact — current_source_row >= 0 count (patch plan)
     "allv": None,   # exact — all_valid_mask count (SFA valid count)
     "pub": None,    # exact — publish-time packed_kv rowsum (quant output)
+    "kin": 1e-4,    # pre-quant cache_k rowsum (f32; deterministic kernel
+    "kinv": 1e-4,   #  + same shapes => identical inputs give identical sums)
 }
 FIELDS = list(FIELD_TOL.keys())
 
@@ -242,6 +244,35 @@ def main():
             if not any_hit:
                 print(f"pair {pi}: pub == pkg on both runs for all layers "
                       f"(no staleness, same quant output)")
+        # kin-vs-pub decision line for the first pair, first layers
+        if pairs and "kin" in pairs[0][0] and "kin" in pairs[0][1]:
+            e, g = pairs[0]
+            t = min(e["T"], g["T"])
+            kin_bad = sum(
+                int((rel_diff(e["kin"][li, :t], g["kin"][li, :t])
+                     > FIELD_TOL["kin"]).sum())
+                for li in range(n_layers)
+            )
+            kinv_bad = sum(
+                int((rel_diff(e["kinv"][li, :t], g["kinv"][li, :t])
+                     > FIELD_TOL["kinv"]).sum())
+                for li in range(n_layers)
+            )
+            pub_bad = sum(
+                int((e["pub"][li, :t] != g["pub"][li, :t]).sum())
+                for li in range(n_layers)
+            )
+            print(f"\n[VERDICT] pair 0: kin bad={kin_bad}, kinv bad="
+                  f"{kinv_bad}, pub bad={pub_bad} (tokens over all layers)")
+            if pub_bad and not kin_bad and not kinv_bad:
+                print("  => inputs identical, quant output differs: "
+                      "divergence INSIDE npu_dynamic_quant "
+                      "(captured-replay semantics) — PRIME SUSPECT")
+            elif kin_bad or kinv_bad:
+                print("  => pre-quant inputs differ: divergence is "
+                      "UPSTREAM of the quant (KV projection numerics)")
+            elif not pub_bad:
+                print("  => quant inputs and outputs both match")
 
     print("\n=== first divergence ===")
     if first_div is None:
@@ -281,8 +312,16 @@ chain interpretation (first divergent field at the first divergent layer):
              stale — attention over wrong row set
   stg_pre  -> H2D DMA delivered different bytes with identical plan
              -> DMA data path bug (the smoking gun)
-  pub      -> fp8 pack output differs between runs at the source
-             (see also the pub-vs-pkg section for stale-read detection)
+  pub      -> fp8 pack output differs between runs at the source.
+             CROSS-CHECK with kin at the same layer:
+               kin match + pub diff -> divergence INSIDE the fp8 quant op
+                                      (npu_dynamic_quant captured-replay
+                                      semantics) — prime suspect
+               kin diff             -> upstream KV projection differs
+               kin absent           -> old snapshot; re-dump to decide
+  kin/kinv -> pre-quant pack input (cache_k/cache_v) differs: the
+             divergence predates the quant — upstream projection or
+             mode-dependent matmul numerics
   stg_post -> patch wrote different content: if pkg matches, the
              where()/staging write itself; if pkg differs, upstream of it
   out      -> inputs identical but SFA computed differently

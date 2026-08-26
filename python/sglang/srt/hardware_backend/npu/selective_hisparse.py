@@ -644,6 +644,17 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_pub_all = torch.zeros(
                 _n_dbg, T, dtype=torch.int64, device=self.device
             )
+            # kin/kinv — PRE-quant pack inputs (cache_k / cache_v rowsums)
+            # captured at set_kv_buffer time. Decision table with pub:
+            #   kin matches + pub differs -> divergence INSIDE the fp8
+            #                                quant op (captured-replay bug)
+            #   kin differs               -> upstream KV projection differs
+            self._dbg_kin_all = torch.zeros(
+                _n_dbg, T, dtype=torch.float32, device=self.device
+            )
+            self._dbg_kinv_all = torch.zeros(
+                _n_dbg, T, dtype=torch.float32, device=self.device
+            )
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg}"
@@ -1278,6 +1289,29 @@ class NPUSelectiveHiSparseCoordinator:
         if ret != 0:
             raise RuntimeError(f"sparse_copy D2H (deferred) failed: ret={ret}")
 
+    def debug_capture_kin(
+        self, layer_id: int, cache_k: torch.Tensor, cache_v: torch.Tensor
+    ):
+        """D1 stage-2: freeze the PRE-quant pack inputs at set_kv_buffer
+        time (k_nope / k_rope rowsums). Called by the KV pool before
+        _pack_dsa_fp8_kv_cache; in graph mode this op is captured, so it
+        freezes the per-replay actual projection output.
+        """
+        if not self._dbg_dump:
+            return
+        _si = self._layer_scratch_index[layer_id]
+        t = min(cache_k.shape[0], self.tcap)
+        self._dbg_kin_all[_si, :t].copy_(
+            cache_k[:t].reshape(t, -1).sum(
+                dim=-1, dtype=torch.float32
+            )
+        )
+        self._dbg_kinv_all[_si, :t].copy_(
+            cache_v[:t].reshape(t, -1).sum(
+                dim=-1, dtype=torch.float32
+            )
+        )
+
     def dump_diff_snapshot(self, step: int, t_real: int):
         """D1: save the per-layer debug capture buffers to disk.
 
@@ -1307,6 +1341,8 @@ class NPUSelectiveHiSparseCoordinator:
             "crow": self._dbg_crow_all[:, :n].cpu(),
             "allv": self._dbg_allv_all[:, :n].cpu(),
             "pub": self._dbg_pub_all[:, :n].cpu(),
+            "kin": self._dbg_kin_all[:, :n].cpu(),
+            "kinv": self._dbg_kinv_all[:, :n].cpu(),
         }
         path = os.path.join(
             self._dbg_dir, f"{mode}_dev{dev}_step{step:04d}.pt"

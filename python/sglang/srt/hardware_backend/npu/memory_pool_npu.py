@@ -1070,6 +1070,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
+            if self.selective_coordinator is not None:
+                # D1 stage-2: pre-quant input capture (kin/kinv)
+                self.selective_coordinator.debug_capture_kin(
+                    layer_id, cache_k, cache_v
+                )
             packed = self._pack_dsa_fp8_kv_cache(
                 cache_k, cache_v, loc.numel()
             )
