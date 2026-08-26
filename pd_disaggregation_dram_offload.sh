@@ -166,6 +166,15 @@ do
             echo "[E3] SELECTIVE_LAYER_IDS empty -> selective hisparse DISABLED"
         fi
 
+        # [D1 diff-dump] eager 对照开关: D_EAGER=1 加 --disable-cuda-graph(保留显式
+        # --cuda-graph-bs 供 bias 计算)。eager 19层需配 MAX_RUNNING_REQ=24 压缩
+        # bcap/tcap 以过内存关。
+        if [[ "${D_EAGER-"0"}" == "1" ]]; then
+            GRAPH_ARGS="--disable-cuda-graph --cuda-graph-bs ${CUDA_GRAPH_BS}"
+        else
+            GRAPH_ARGS="--cuda-graph-bs ${CUDA_GRAPH_BS}"
+        fi
+
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
             --disaggregation-mode decode --disaggregation-transfer-backend ascend \
@@ -183,10 +192,10 @@ do
             --moe-dense-tp-size 1 \
             --mem-fraction-static $D_MEM_FRACTION \
             --chunked-prefill-size 8192 \
-            --cuda-graph-bs ${CUDA_GRAPH_BS} \
+            ${GRAPH_ARGS} \
             --speculative-algorithm NEXTN \
             --speculative-num-steps ${SPEC_NUM_STEPS-5} --speculative-eagle-topk 1 --speculative-num-draft-tokens ${SPEC_DRAFT_TOKENS-6} \
-            --max-running-requests 192 \
+            --max-running-requests ${MAX_RUNNING_REQ-192} \
             --host 0.0.0.0 \
             --port 31000 \
             --moe-a2a-backend deepep \

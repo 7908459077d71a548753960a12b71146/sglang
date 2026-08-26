@@ -292,6 +292,26 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                         int((_flat != 0).sum().item()),
                     )
 
+        # D1 content-diff dump: after each non-idle replay, snapshot the
+        # per-layer debug capture buffers (their captured copies executed
+        # inside this replay; .cpu() in dump_diff_snapshot syncs the
+        # stream, freezing the values this replay actually produced).
+        if (
+            os.getenv("SGLANG_SELECTIVE_DIFF_DUMP", "0") == "1"
+            and not forward_batch.forward_mode.is_idle()
+        ):
+            _sel_coord = getattr(
+                self.model_runner, "npu_selective_hisparse_coordinator", None
+            )
+            if _sel_coord is not None and getattr(
+                _sel_coord, "_dbg_dump", False
+            ):
+                _sel_coord._dbg_replay_step += 1
+                if _sel_coord._dbg_replay_step <= _sel_coord._dbg_max_steps:
+                    _sel_coord.dump_diff_snapshot(
+                        _sel_coord._dbg_replay_step, self.raw_num_token
+                    )
+
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None

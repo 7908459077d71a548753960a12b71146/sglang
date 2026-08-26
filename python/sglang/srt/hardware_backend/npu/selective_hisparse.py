@@ -578,6 +578,51 @@ class NPUSelectiveHiSparseCoordinator:
             ]
         )
 
+        # D1 (content-diff dump): persistent per-layer debug capture
+        # buffers. In graph mode the copies below are CAPTURED ops — they
+        # execute at their stream position on every replay, freezing what
+        # each layer actually SAW (not the post-replay healed content).
+        # The SFA output rowsum is the key trap: if SFA consumed a stale
+        # staging row, out is wrong forever even though staging "heals".
+        # ~48MB total (locs dominates). Stage 1 localizes (step, layer,
+        # token); stage 2 can zoom per-layer to K-level detail.
+        if os.getenv("SGLANG_SELECTIVE_DIFF_DUMP", "0") == "1":
+            _n_dbg = len(self.selected_layer_ids_sorted)
+            self._dbg_dump = True
+            self._dbg_dir = os.getenv(
+                "SGLANG_SELECTIVE_DUMP_DIR", "/root/hisparse_dump"
+            )
+            os.makedirs(self._dbg_dir, exist_ok=True)
+            self._dbg_max_steps = int(
+                os.getenv("SGLANG_SELECTIVE_DUMP_MAX_STEPS", "20")
+            )
+            self._dbg_step = 0
+            self._dbg_replay_step = 0
+            self._dbg_locs_all = torch.zeros(
+                _n_dbg, T, K, dtype=torch.int64, device=self.device
+            )
+            self._dbg_valid_all = torch.zeros(
+                _n_dbg, T, dtype=torch.int64, device=self.device
+            )
+            self._dbg_stg_pre_all = torch.zeros(
+                _n_dbg, T, dtype=torch.int64, device=self.device
+            )
+            self._dbg_stg_post_all = torch.zeros(
+                _n_dbg, T, dtype=torch.int64, device=self.device
+            )
+            self._dbg_q_all = torch.zeros(
+                _n_dbg, T, dtype=torch.float32, device=self.device
+            )
+            self._dbg_out_all = torch.zeros(
+                _n_dbg, T, dtype=torch.float32, device=self.device
+            )
+            logger.info(
+                f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
+                f"max_steps={self._dbg_max_steps} layers={_n_dbg}"
+            )
+        else:
+            self._dbg_dump = False
+
         # Completion-flag protocol for graph-mode DMA ordering (see
         # mf_offload.sparse_copy_notify / wait_flag). Monotonic-count
         # variant (no host participation per replay — magic bumps would be
@@ -1196,6 +1241,37 @@ class NPUSelectiveHiSparseCoordinator:
         if ret != 0:
             raise RuntimeError(f"sparse_copy D2H (deferred) failed: ret={ret}")
 
+    def dump_diff_snapshot(self, step: int, t_real: int):
+        """D1: save the per-layer debug capture buffers to disk.
+
+        Called by eager mode after the last selected layer of a forward,
+        and by NPUGraphRunner.execute after each replay (the captured
+        copies have then executed; .cpu() syncs the stream so the values
+        are the ones this replay actually produced).
+        """
+        if not self._dbg_dump:
+            return
+        n = min(max(int(t_real), 1), self.tcap)
+        mode = "graph" if self._graph_mode else "eager"
+        dev = torch.npu.current_device()
+        snap = {
+            "step": step,
+            "mode": mode,
+            "dev": int(dev),
+            "T": n,
+            "layers": list(self.selected_layer_ids_sorted),
+            "locs": self._dbg_locs_all[:, :n].cpu(),
+            "valid": self._dbg_valid_all[:, :n].cpu(),
+            "stg_pre": self._dbg_stg_pre_all[:, :n].cpu(),
+            "stg_post": self._dbg_stg_post_all[:, :n].cpu(),
+            "q": self._dbg_q_all[:, :n].cpu(),
+            "out": self._dbg_out_all[:, :n].cpu(),
+        }
+        path = os.path.join(
+            self._dbg_dir, f"{mode}_dev{dev}_step{step:04d}.pt"
+        )
+        torch.save(snap, path)
+
     def run_selected_attention(
         self,
         layer_id: int,
@@ -1284,6 +1360,25 @@ class NPUSelectiveHiSparseCoordinator:
         # publish_new_packed_kv (same-stream ordering on both the eager
         # main stream and the graph capture stream). R5: this layer's own
         # slice — captured view, stable across replays.
+        # D1 diff-dump pre-patch captures (graph: captured ops, freeze
+        # per-replay values; eager: direct copies). Placed BEFORE the
+        # patch write so stg_pre is the pure H2D-landed content.
+        if self._dbg_dump:
+            _si_dbg = self._layer_scratch_index[layer_id]
+            if _si_dbg == 0:
+                self._dbg_step += 1
+            self._dbg_stg_pre_all[_si_dbg, :T].copy_(
+                staging_flat[:N].view(T, -1).sum(
+                    dim=-1, dtype=torch.int64
+                )
+            )
+            self._dbg_locs_all[_si_dbg, :T].copy_(st.gather_locs[:T])
+            self._dbg_valid_all[_si_dbg, :T].copy_(
+                st.valid_mask[:T].sum(dim=-1, dtype=torch.int64)
+            )
+            self._dbg_q_all[_si_dbg, :T].copy_(
+                q_nope[:T].sum(dim=-1, dtype=torch.float32)
+            )
         packed = self.new_packed_scratch_all[
             self._layer_scratch_index[layer_id]
         ][:T]  # [T, 656] uint8
@@ -1352,6 +1447,27 @@ class NPUSelectiveHiSparseCoordinator:
         if not self._graph_mode:
             self.staging_free_event = torch.npu.current_stream().record_event()
         self.active_prefetch = None
+
+        # D1 diff-dump post captures: stg_post = the exact SFA input
+        # (after patch); out rowsum = what SFA ACTUALLY computed — the
+        # smoking gun for consumed-too-early (out stays wrong even when
+        # staging heals post-replay). Eager: dump file after the LAST
+        # selected layer of this forward.
+        if self._dbg_dump:
+            self._dbg_stg_post_all[_si_dbg, :T].copy_(
+                staging_flat[:N].view(T, -1).sum(
+                    dim=-1, dtype=torch.int64
+                )
+            )
+            self._dbg_out_all[_si_dbg, :T].copy_(
+                out[:T].sum(dim=-1, dtype=torch.float32)
+            )
+            if (
+                _si_dbg == len(self.selected_layer_ids_sorted) - 1
+                and not self._graph_mode
+                and self._dbg_step <= self._dbg_max_steps
+            ):
+                self.dump_diff_snapshot(self._dbg_step, T)
 
         # 6. Pad back to full DP shape (no-op during graph capture/replay)
         num_total = q_nope.shape[0]
