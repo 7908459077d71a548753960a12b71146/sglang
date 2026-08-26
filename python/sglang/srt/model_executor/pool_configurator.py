@@ -539,10 +539,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tcap = bcap * verify_width
         rcap = tcap * topk
 
-        # packed_staging: [Tcap, K, 656] uint8 — TWO slices (staging
+        # packed_staging: [Tcap, K, 656] uint8 — N slices (staging
         # ping-pong, parity-indexed by selected layer; matches
-        # _alloc_staging_buffers in selective_hisparse.py)
-        staging = rcap * record_bytes * 2
+        # _alloc_staging_buffers in selective_hisparse.py, same env)
+        import os as _os
+        _n_staging_slices = int(
+            _os.getenv("SGLANG_SELECTIVE_STAGING_SLICES", "2")
+        )
+        staging = rcap * record_bytes * _n_staging_slices
         # unpack_k_nope_bf16: [Tcap, K, 512] BF16
         unpack_nope = rcap * kv_lora_rank * 2
         # unpack_k_rope_bf16: [Tcap, K, 64] BF16

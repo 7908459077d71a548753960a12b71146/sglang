@@ -412,16 +412,19 @@ class NPUSelectiveHiSparseCoordinator:
         K = self.topk
         R = self.record_bytes
 
-        # Staging ping-pong: TWO [T, K, R] slices alternating by the layer's
-        # position in the selected list (~2×193MB at Tcap=144, fixed, layer
-        # count independent) — same shape as the R9 workspace ping-pong
-        # below. Safety: adjacent selected layers are 4 apart (5, 9, 13, ...)
-        # and use opposite sets; a set is re-written only 8 model layers
-        # later, after its reader's patch+SFA has long retired. Strictly
-        # safer than one shared slice (next writer only 4 layers away);
-        # R8 A/B showed both are precision-equivalent, ping-pong is the
-        # conservative choice.
-        _staging_slices = 2
+        # Staging ping-pong: slices alternating by the layer's position in
+        # the selected list (~193MB each at Tcap=144, fixed, layer count
+        # independent) — same shape as the R9 workspace ping-pong below.
+        # Safety: adjacent selected layers are 4 apart (5, 9, 13, ...) and
+        # use adjacent sets; a set is re-written only 4*n_slices model
+        # layers later. E10 (C-set probe): 19L dose curve is linear
+        # (~1.25pt/layer) with all python timing levers dead — remaining
+        # suspect is a per-layer resource; this raises isolation from 2
+        # (rewrite distance 8 layers, open window at 19L queue depth) to
+        # env-configurable. pool_configurator reads the same env for bias.
+        _staging_slices = int(
+            os.getenv("SGLANG_SELECTIVE_STAGING_SLICES", "2")
+        )
         self._staging_slices = _staging_slices
         self.packed_staging_all = torch.zeros(
             _staging_slices,
