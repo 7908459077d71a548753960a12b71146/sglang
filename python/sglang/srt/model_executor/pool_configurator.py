@@ -500,7 +500,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # Without this, eager 19L under-estimates the bias, the pool eats
         # the difference, and alloc_memory_pool OOMs at startup.
         _explicit_bs = (
-            getattr(kvc.server_args, "cuda_graph_bs", None) or None
+            getattr(kvc.server_args, "cuda_graph_bs_decode", None) or None
         )
         if not getattr(kvc.server_args, "disable_cuda_graph", False):
             decode_graph_config = getattr(
