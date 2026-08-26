@@ -40,11 +40,15 @@ FIELD_TOL = {  # relative tolerance; int fields compared exactly
     "valid": None,  # exact
     "stg_pre": None,   # exact
     "stg_post": None,  # exact
+    "pkg": None,    # exact — publish-landed scratch rowsum (pack path)
+    "crow": None,   # exact — current_source_row >= 0 count (patch plan)
+    "allv": None,   # exact — all_valid_mask count (SFA valid count)
+    "pub": None,    # exact — publish-time packed_kv rowsum (quant output)
 }
 FIELDS = list(FIELD_TOL.keys())
 
 
-def load_dir(d):
+def load_dir(d, dev=None):
     files = glob.glob(os.path.join(d, "*.pt"))
     by_dev = {}
     for f in files:
@@ -56,8 +60,16 @@ def load_dir(d):
         )
     if not by_dev:
         raise SystemExit(f"no snapshots found under {d}")
-    # pick the device with the most files (the active DP rank)
-    dev, lst = max(by_dev.items(), key=lambda kv: len(kv[1]))
+    if dev is None:
+        # pick the device with the most files (the active DP rank)
+        dev, lst = max(by_dev.items(), key=lambda kv: len(kv[1]))
+    else:
+        if dev not in by_dev:
+            raise SystemExit(
+                f"dev {dev} not present under {d} "
+                f"(found: {sorted(by_dev)})"
+            )
+        lst = by_dev[dev]
     lst.sort()
     snaps = [torch.load(f, map_location="cpu", weights_only=False)
              for _, f in lst]
@@ -83,15 +95,29 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--eager-dir", required=True)
     ap.add_argument("--graph-dir", required=True)
+    ap.add_argument("--dev", type=int, default=None,
+                    help="compare this DP rank's device on both sides "
+                    "(same rank => same requests => alignable beyond "
+                    "warmup); default: auto-pick common dev")
     args = ap.parse_args()
 
-    edev, esnaps = load_dir(args.eager_dir)
-    gdev, gsnaps = load_dir(args.graph_dir)
+    if args.dev is None:
+        # Auto: enumerate devs of both dirs, prefer a COMMON dev (same DP
+        # rank processes the same request stream in both runs — required
+        # for step alignment beyond the warmup batch).
+        def devs_of(d):
+            return {int(m.group(1)) for f in glob.glob(os.path.join(d, "*.pt"))
+                    if (m := re.match(r".*_dev(\d+)_step\d+\.pt",
+                                      os.path.basename(f)))}
+        common = devs_of(args.eager_dir) & devs_of(args.graph_dir)
+        if not common:
+            raise SystemExit("no common device between the two dirs")
+        args.dev = min(common)  # deterministic
+
+    edev, esnaps = load_dir(args.eager_dir, dev=args.dev)
+    gdev, gsnaps = load_dir(args.graph_dir, dev=args.dev)
     print(f"eager: dev{edev}, {len(esnaps)} steps | "
           f"graph: dev{gdev}, {len(gsnaps)} steps")
-    if edev != gdev:
-        print(f"WARNING: active devices differ ({edev} vs {gdev}); "
-              f"requests may not correspond — results unreliable.")
 
     layers = esnaps[0]["layers"]
     n_layers = len(layers)
@@ -133,6 +159,8 @@ def main():
                "bad": []}
         for li in range(n_layers):
             for field in FIELDS:
+                if field not in e or field not in g:
+                    continue  # older snapshots without the field
                 ea = e[field][li, :t]
                 ga = g[field][li, :t]
                 bad = first_bad_idx(ea, ga, FIELD_TOL[field])
@@ -157,6 +185,64 @@ def main():
             print(f"pair {row['pair']:3d} (e{row['eager_step']:03d}/"
                   f"g{row['graph_step']:03d}): {desc}")
 
+    # ---- patch effect: within-run stg_post vs stg_pre ----
+    # Distinguishes "graph patch never fired (stg_post==stg_pre in graph)"
+    # from "patch fired but wrote different src bytes".
+    print("\n=== patch effect (within-run stg_post vs stg_pre) ===")
+    for pi, (e, g) in enumerate(pairs[:3]):
+        t = min(e["T"], g["T"])
+        for li in range(n_layers):
+            e_pre, e_post = e["stg_pre"][li, :t], e["stg_post"][li, :t]
+            g_pre, g_post = g["stg_pre"][li, :t], g["stg_post"][li, :t]
+            e_act = int((e_post != e_pre).sum())
+            g_act = int((g_post != g_pre).sum())
+            g_noop = bool((g_post == g_pre).all())
+            if e_act != g_act or g_noop:
+                flag = "  <-- GRAPH PATCH NO-OP" if g_noop else ""
+                print(f"pair {pi} L{layers[li]:3d}: eager patched {e_act}/{t}, "
+                      f"graph patched {g_act}/{t}{flag}")
+        # per-token table for the FIRST selected layer of this pair
+        li = 0
+        print(f"pair {pi} L{layers[li]} per-token (first 6 tokens):")
+        for tok in range(min(6, t)):
+            print(f"  tok {tok}: eager pre={e['stg_pre'][li, tok].item():>22d} "
+                  f"post={e['stg_post'][li, tok].item():>22d} | "
+                  f"graph pre={g['stg_pre'][li, tok].item():>22d} "
+                  f"post={g['stg_post'][li, tok].item():>22d}")
+
+    # ---- publish vs patch-view: within-run pub vs pkg (stale detection) ----
+    # pub = what the quant produced at publish time; pkg = what the patch
+    # saw in the scratch. Within-run mismatch = STALE scratch read.
+    # Cross-run pub mismatch = quant itself produced different bytes.
+    print("\n=== publish vs patch-view (pub vs pkg) ===")
+    have_pub = all("pub" in s and "pkg" in s
+                   for s in esnaps + gsnaps)
+    if not have_pub:
+        print("(old snapshots lack pub/pkg — re-dump with the new "
+              "instrumentation to enable this check)")
+    else:
+        for pi, (e, g) in enumerate(pairs[:3]):
+            t = min(e["T"], g["T"])
+            any_hit = False
+            for li in range(n_layers):
+                e_stale = int((e["pub"][li, :t] != e["pkg"][li, :t]).sum())
+                g_stale = int((g["pub"][li, :t] != g["pkg"][li, :t]).sum())
+                x_pub = int((e["pub"][li, :t] != g["pub"][li, :t]).sum())
+                if e_stale or g_stale or x_pub:
+                    any_hit = True
+                    verdict = []
+                    if g_stale and not e_stale:
+                        verdict.append("GRAPH STALE SCRATCH READ")
+                    if x_pub:
+                        verdict.append("QUANT OUTPUT DIFFERS (cross-run)")
+                    print(f"pair {pi} L{layers[li]:3d}: stale eager="
+                          f"{e_stale}/{t} graph={g_stale}/{t}, "
+                          f"cross-run pub diff={x_pub}/{t}"
+                          f"  <-- {'; '.join(verdict)}")
+            if not any_hit:
+                print(f"pair {pi}: pub == pkg on both runs for all layers "
+                      f"(no staleness, same quant output)")
+
     print("\n=== first divergence ===")
     if first_div is None:
         print("NONE — all aligned pairs match on every field/layer.")
@@ -174,14 +260,31 @@ def main():
     for tok in bad[:5]:
         print(f"  token {tok}: eager={ea[tok].item():.6g} "
               f"graph={ga[tok].item():.6g}")
+    # q margin at the first divergent layer: is q (tolerance-matched)
+    # actually near-identical or just under the 5% threshold? A large q
+    # margin means upstream numerics, not hisparse, explains the diff.
+    qe, qg = e["q"][li, :t], g["q"][li, :t]
+    qrel = rel_diff(qe, qg)
+    print(f"  q margin at this layer: max rel diff "
+          f"{qrel.max().item():.4g} (tolerance 5e-2)")
     print("""
 chain interpretation (first divergent field at the first divergent layer):
   q        -> divergence is UPSTREAM (model state of a previous layer,
              hisparse-independent) — look at earlier layers' 'out'
   locs     -> topk/anchor compute diverged (upstream propagation)
+  pkg      -> publish-landed scratch differs: pack path
+             (set_kv_buffer fp8 quant / scratch copy) — check q margin:
+             small q noise + pkg diff = benign eager-vs-graph numerics
+  crow     -> patch plan differs: current_source_row stale in graph
+             (loc-plan capture/replay semantics)
+  allv     -> SFA valid-count differs: valid_mask or current_source_row
+             stale — attention over wrong row set
   stg_pre  -> H2D DMA delivered different bytes with identical plan
              -> DMA data path bug (the smoking gun)
-  stg_post -> current-patch wrote different content (scratch/pack path)
+  pub      -> fp8 pack output differs between runs at the source
+             (see also the pub-vs-pkg section for stale-read detection)
+  stg_post -> patch wrote different content: if pkg matches, the
+             where()/staging write itself; if pkg differs, upstream of it
   out      -> inputs identical but SFA computed differently
              -> SFA/unpack workspace issue""")
 

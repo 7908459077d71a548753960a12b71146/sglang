@@ -616,6 +616,34 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_out_all = torch.zeros(
                 _n_dbg, T, dtype=torch.float32, device=self.device
             )
+            # Stage-2 discriminator fields (all int64, exact compare):
+            # pkg  — publish-landed scratch rowsum: isolates the
+            #        pack/publish path (set_kv_buffer → scratch copy).
+            # crow — count of current_source_row >= 0 per token: the
+            #        patch plan (which rows the patch writes).
+            # allv — all_valid_mask count per token: what SFA actually
+            #        treats as valid (drives compaction + seq lens).
+            self._dbg_pkg_all = torch.zeros(
+                _n_dbg, T, dtype=torch.int64, device=self.device
+            )
+            self._dbg_crow_all = torch.zeros(
+                _n_dbg, T, dtype=torch.int64, device=self.device
+            )
+            self._dbg_allv_all = torch.zeros(
+                _n_dbg, T, dtype=torch.int64, device=self.device
+            )
+            # pub — publish-time packed_kv rowsum, captured right after the
+            # scratch copy in publish_new_packed_kv (graph: captured op,
+            # freezes the per-replay actual quant output). pkg (scratch as
+            # seen by the patch) vs pub splits the two remaining suspects:
+            #   pub != eager's pub  -> the fp8 pack itself produced
+            #                           different bytes in graph
+            #   pub == eager's pub but pkg != pub (within graph run)
+            #                       -> the patch read a STALE scratch
+            #                           (copy_/gather cross-queue ordering)
+            self._dbg_pub_all = torch.zeros(
+                _n_dbg, T, dtype=torch.int64, device=self.device
+            )
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg}"
@@ -1033,6 +1061,15 @@ class NPUSelectiveHiSparseCoordinator:
             self._layer_scratch_index[layer_id]
         ]
         scratch[:T].copy_(packed_kv.view(torch.uint8))
+        # D1 stage-2: freeze THIS publish's packed content (graph: captured
+        # op → per-replay actual quant output). See _dbg_pub_all comment.
+        if self._dbg_dump:
+            _si_pub = self._layer_scratch_index[layer_id]
+            self._dbg_pub_all[_si_pub, :T].copy_(
+                packed_kv.view(torch.uint8)[:T].sum(
+                    dim=-1, dtype=torch.int64
+                )
+            )
 
         # E7 (C6 probe, env-gated, graph mode only): flush the PREVIOUS
         # selected layer's D2H now. Its scratch copy_ was issued one full
@@ -1266,6 +1303,10 @@ class NPUSelectiveHiSparseCoordinator:
             "stg_post": self._dbg_stg_post_all[:, :n].cpu(),
             "q": self._dbg_q_all[:, :n].cpu(),
             "out": self._dbg_out_all[:, :n].cpu(),
+            "pkg": self._dbg_pkg_all[:, :n].cpu(),
+            "crow": self._dbg_crow_all[:, :n].cpu(),
+            "allv": self._dbg_allv_all[:, :n].cpu(),
+            "pub": self._dbg_pub_all[:, :n].cpu(),
         }
         path = os.path.join(
             self._dbg_dir, f"{mode}_dev{dev}_step{step:04d}.pt"
@@ -1395,6 +1436,12 @@ class NPUSelectiveHiSparseCoordinator:
                     dim=-1, dtype=torch.float32
                 )
             )
+            self._dbg_pkg_all[_si_dbg, :T].copy_(
+                packed.sum(dim=-1, dtype=torch.int64)
+            )
+            self._dbg_crow_all[_si_dbg, :T].copy_(
+                (current_rows >= 0).sum(dim=-1, dtype=torch.int64)
+            )
         src_data = packed[safe_src]  # [T*K, 656]
         staging_flat[:N] = torch.where(
             mask.unsqueeze(1),
@@ -1407,6 +1454,10 @@ class NPUSelectiveHiSparseCoordinator:
         all_valid_mask = (
             st.valid_mask[:T] | (st.current_source_row[:T] >= 0)
         )
+        if self._dbg_dump:
+            self._dbg_allv_all[_si_dbg, :T].copy_(
+                all_valid_mask.sum(dim=-1, dtype=torch.int64)
+            )
 
         if not self._graph_mode and logger.isEnabledFor(logging.INFO):
             n_curr = mask.sum().item()
