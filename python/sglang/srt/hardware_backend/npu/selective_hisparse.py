@@ -1363,6 +1363,20 @@ class NPUSelectiveHiSparseCoordinator:
         # D1 diff-dump pre-patch captures (graph: captured ops, freeze
         # per-replay values; eager: direct copies). Placed BEFORE the
         # patch write so stg_pre is the pure H2D-landed content.
+        packed = self.new_packed_scratch_all[
+            self._layer_scratch_index[layer_id]
+        ][:T]  # [T, 656] uint8
+        current_rows = st.current_source_row[:T]  # [T, K]
+        mask = (current_rows >= 0).reshape(-1)  # [T*K]
+        safe_src = current_rows.reshape(-1).clamp(min=0)  # [T*K]
+
+        # R8: this layer's OWN staging slice — patch and SFA both touch it;
+        # no other layer's H2D ever writes it.
+        staging = self.packed_staging_all[
+            self._layer_scratch_index[layer_id] % self._staging_slices
+        ]
+        staging_flat = staging.view(-1, self.record_bytes)
+        N = T * K
         if self._dbg_dump:
             _si_dbg = self._layer_scratch_index[layer_id]
             if _si_dbg == 0:
@@ -1379,20 +1393,6 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_q_all[_si_dbg, :T].copy_(
                 q_nope[:T].sum(dim=-1, dtype=torch.float32)
             )
-        packed = self.new_packed_scratch_all[
-            self._layer_scratch_index[layer_id]
-        ][:T]  # [T, 656] uint8
-        current_rows = st.current_source_row[:T]  # [T, K]
-        mask = (current_rows >= 0).reshape(-1)  # [T*K]
-        safe_src = current_rows.reshape(-1).clamp(min=0)  # [T*K]
-
-        # R8: this layer's OWN staging slice — patch and SFA both touch it;
-        # no other layer's H2D ever writes it.
-        staging = self.packed_staging_all[
-            self._layer_scratch_index[layer_id] % self._staging_slices
-        ]
-        staging_flat = staging.view(-1, self.record_bytes)
-        N = T * K
         src_data = packed[safe_src]  # [T*K, 656]
         staging_flat[:N] = torch.where(
             mask.unsqueeze(1),
