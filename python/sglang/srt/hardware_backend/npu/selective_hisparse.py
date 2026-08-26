@@ -960,6 +960,23 @@ class NPUSelectiveHiSparseCoordinator:
         ]
         scratch[:T].copy_(packed_kv.view(torch.uint8))
 
+        # C6 probe (env-gated, graph mode only): the copy above is a
+        # VECTOR-queue torch op while the D2H sparse_copy_notify below runs
+        # on the COMPUTE queue (MIX) — same stream, but cross-queue
+        # completion is unordered, so the D2H can read a one-step-stale
+        # scratch and back up poisoned KV to the host pool. At 19 layers
+        # the vector queue is deep enough to open this window (7L closed:
+        # sleep probe harmless at 7L, -10pt at 19L). Eager mode gates this
+        # via pack_ready below; this records an event after the copy and
+        # waits it before the D2H launch so the captured graph carries a
+        # cross-queue dependency edge (record+wait both inside the capture
+        # — the legal pattern; R11's error was recording outside it).
+        _d2h_gate_ev = None
+        if self._graph_mode and os.getenv(
+            "SGLANG_SELECTIVE_GATE_D2H_EVENT", "0"
+        ) == "1":
+            _d2h_gate_ev = torch.npu.current_stream().record_event()
+
         # Eager mode syncs the device-side real-token count (harmless
         # bookkeeping, see maybe_start_prefetch). Graph mode reads the
         # replay-filled value (capture sees 0 → DMA no-op).
@@ -995,6 +1012,11 @@ class NPUSelectiveHiSparseCoordinator:
         with torch.npu.stream(d2h_stream):
             if pack_ready is not None:
                 d2h_stream.wait_event(pack_ready)
+            # C6 probe: wait the post-copy event (graph mode; d2h_stream IS
+            # the current/capture stream there) so the MIX D2H cannot pass
+            # the vector-queue copy_.
+            if _d2h_gate_ev is not None:
+                torch.npu.current_stream().wait_event(_d2h_gate_ev)
 
             N = T
 
