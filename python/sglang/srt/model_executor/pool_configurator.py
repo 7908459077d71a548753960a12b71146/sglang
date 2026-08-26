@@ -547,17 +547,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             _os.getenv("SGLANG_SELECTIVE_STAGING_SLICES", "2")
         )
         staging = rcap * record_bytes * _n_staging_slices
-        # unpack_k_nope_bf16: [Tcap, K, 512] BF16
-        unpack_nope = rcap * kv_lora_rank * 2
+        # unpack_k_nope_bf16: [Tcap, K, 512] BF16 — n_ws sets (matches
+        # _alloc_staging_buffers in selective_hisparse.py, same env)
+        _n_ws = int(_os.getenv("SGLANG_SELECTIVE_UNPACK_WS", "2"))
+        unpack_nope = rcap * kv_lora_rank * 2 * _n_ws
         # unpack_k_rope_bf16: [Tcap, K, 64] BF16
-        unpack_rope = rcap * qk_rope_head_dim * 2
+        unpack_rope = rcap * qk_rope_head_dim * 2 * _n_ws
         # publish_new_packed_kv retains one packed output per selected layer.
         packed_outputs = (
             len(self._local_selective_layer_ids()) * tcap * record_bytes
         )
         # Persistent unpack/cast workspaces omitted by the original estimate.
-        fp8_nope = rcap * kv_lora_rank
-        scales = rcap * (kv_lora_rank // 128) * 4
+        fp8_nope = rcap * kv_lora_rank * _n_ws
+        scales = rcap * (kv_lora_rank // 128) * 4 * _n_ws
         # Per-record metadata and mf_offload pointer arrays.
         record_meta = (
             tcap * topk * 8  # host_locs int64

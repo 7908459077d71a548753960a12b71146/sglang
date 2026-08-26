@@ -446,7 +446,14 @@ class NPUSelectiveHiSparseCoordinator:
         # still reads set p, the earliest writer is layer L+4 which uses set
         # p^1 — read and write never share a set. Memory: +510MB total,
         # independent of layer count (vs 510MB/layer for the debug R9).
-        self._n_ws = 2
+        # E11 (C-set probe, env-gated): same isolation question as staging
+        # (E10, innocent). 19L linear dose curve with all timing levers
+        # dead points at a per-layer resource; this raises the workspace
+        # isolation from 2 (rewrite distance 8 model layers) to
+        # env-configurable. pool_configurator reads the same env for bias.
+        self._n_ws = int(
+            os.getenv("SGLANG_SELECTIVE_UNPACK_WS", "2")
+        )
         n_ws = self._n_ws
         self.unpack_k_nope_bf16_all = torch.zeros(
             n_ws, T, K, self.kv_lora_rank, dtype=torch.bfloat16, device=self.device
