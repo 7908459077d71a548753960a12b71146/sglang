@@ -1110,6 +1110,11 @@ class NPUSelectiveHiSparseCoordinator:
                     self.d2h_cnt.fill_(N)
 
                 if self._graph_mode:
+                    # B3: env re-read here — _plain_copy from
+                    # maybe_start_prefetch is out of scope in this method.
+                    _plain_copy_d2h = (
+                        os.getenv("SGLANG_SELECTIVE_PLAIN_COPY", "0") == "1"
+                    )
                     _is_last_selected = (
                         _si == len(self.selected_layer_ids_sorted) - 1
                     )
@@ -1121,7 +1126,7 @@ class NPUSelectiveHiSparseCoordinator:
                         # probe read).
                         self._pending_d2h = (layer_id, N)
                         ret = 0
-                    elif _plain_copy:
+                    elif _plain_copy_d2h:
                         # B3: notify-free plain copy (see H2D comment).
                         ret = mf_offload.sparse_copy(
                             d2h_src[:N],
