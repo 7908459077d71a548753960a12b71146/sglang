@@ -491,18 +491,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         max_running = kvc.server_args.max_running_requests or 256
         attn_dp = get_attention_dp_size()
         bcap = (max_running + attn_dp - 1) // attn_dp
-        # Only let graph batch sizes raise the staging capacity when graphs
-        # are actually enabled. With --disable-cuda-graph the default bs list
-        # (max 512) would otherwise inflate the fixed bias by ~14GB.
+        # Graph batch sizes raise the staging capacity when graphs are
+        # enabled. Under --disable-cuda-graph the DEFAULT bs list (max 512)
+        # would inflate the bias ~14GB, but an EXPLICIT --cuda-graph-bs
+        # still reflects the real decode batch — eager decode runs the same
+        # batches as graph replay would (router-side batching is identical),
+        # so honor an explicit list and ignore only the implicit default.
+        # Without this, eager 19L under-estimates the bias, the pool eats
+        # the difference, and alloc_memory_pool OOMs at startup.
+        _explicit_bs = (
+            getattr(kvc.server_args, "cuda_graph_bs", None) or None
+        )
         if not getattr(kvc.server_args, "disable_cuda_graph", False):
             decode_graph_config = getattr(
                 getattr(kvc.server_args, "cuda_graph_config", None),
                 "decode",
                 None,
             )
-            cuda_graph_bs = getattr(decode_graph_config, "bs", None)
+            cuda_graph_bs = getattr(decode_graph_config, "decode_bs", None) or getattr(decode_graph_config, "bs", None)
             if cuda_graph_bs:
                 bcap = max(bcap, max(cuda_graph_bs))
+        elif _explicit_bs:
+            bcap = max(bcap, max(_explicit_bs))
         if kvc.spec_algorithm.is_speculative():
             from sglang.srt.speculative.spec_utils import (
                 resolve_num_tokens_per_req,
@@ -529,8 +539,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tcap = bcap * verify_width
         rcap = tcap * topk
 
-        # packed_staging: [Tcap, K, 656] uint8
-        staging = rcap * record_bytes
+        # packed_staging: [Tcap, K, 656] uint8 — TWO slices (staging
+        # ping-pong, parity-indexed by selected layer; matches
+        # _alloc_staging_buffers in selective_hisparse.py)
+        staging = rcap * record_bytes * 2
         # unpack_k_nope_bf16: [Tcap, K, 512] BF16
         unpack_nope = rcap * kv_lora_rank * 2
         # unpack_k_rope_bf16: [Tcap, K, 64] BF16
