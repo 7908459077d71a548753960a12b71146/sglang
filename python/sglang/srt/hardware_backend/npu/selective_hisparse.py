@@ -655,6 +655,13 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_kinv_all = torch.zeros(
                 _n_dbg, T, dtype=torch.float32, device=self.device
             )
+            # pos — forward_batch.positions rowsum at the selected layer.
+            # kinv (RoPE'd k) diverging 65% while kin (un-RoPE'd) is
+            # bit-exact points at positions being wrong/stale in graph
+            # replay; this field nails it directly.
+            self._dbg_pos_all = torch.zeros(
+                _n_dbg, T, dtype=torch.int64, device=self.device
+            )
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg}"
@@ -1343,6 +1350,7 @@ class NPUSelectiveHiSparseCoordinator:
             "pub": self._dbg_pub_all[:, :n].cpu(),
             "kin": self._dbg_kin_all[:, :n].cpu(),
             "kinv": self._dbg_kinv_all[:, :n].cpu(),
+            "pos": self._dbg_pos_all[:, :n].cpu(),
         }
         path = os.path.join(
             self._dbg_dir, f"{mode}_dev{dev}_step{step:04d}.pt"
@@ -1477,6 +1485,10 @@ class NPUSelectiveHiSparseCoordinator:
             )
             self._dbg_crow_all[_si_dbg, :T].copy_(
                 (current_rows >= 0).sum(dim=-1, dtype=torch.int64)
+            )
+            _pos_t = min(forward_batch.positions.shape[0], T)
+            self._dbg_pos_all[_si_dbg, :_pos_t].copy_(
+                forward_batch.positions[:_pos_t].to(torch.int64)
             )
         src_data = packed[safe_src]  # [T*K, 656]
         staging_flat[:N] = torch.where(

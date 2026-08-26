@@ -46,6 +46,7 @@ FIELD_TOL = {  # relative tolerance; int fields compared exactly
     "pub": None,    # exact — publish-time packed_kv rowsum (quant output)
     "kin": 1e-4,    # pre-quant cache_k rowsum (f32; deterministic kernel
     "kinv": 1e-4,   #  + same shapes => identical inputs give identical sums)
+    "pos": None,    # exact — forward_batch.positions at the selected layer
 }
 FIELDS = list(FIELD_TOL.keys())
 
@@ -273,6 +274,32 @@ def main():
                       "UPSTREAM of the quant (KV projection numerics)")
             elif not pub_bad:
                 print("  => quant inputs and outputs both match")
+            # magnitude table for layer 0 (and the layer where kin first
+            # matches but kinv does not, if any): absolute values decide
+            # whether these are noise-level (1e-3) or real poison.
+            print(f"\n  magnitude at L{layers[0]} (first {min(6, t)} tokens):")
+            for fld in ("pos", "kin", "kinv", "pub", "stg_post", "out"):
+                if fld not in e or fld not in g:
+                    continue
+                ev, gv = e[fld][0, :t], g[fld][0, :t]
+                if FIELD_TOL[fld] is None:
+                    badm = (ev != gv)
+                else:
+                    badm = rel_diff(ev.float(), gv.float()) > FIELD_TOL[fld]
+                nbad = int(badm.sum())
+                if nbad:
+                    rd = rel_diff(ev.float(), gv.float())
+                    print(f"    {fld:9s}: {nbad}/{t} bad, "
+                          f"max rel diff {rd.max().item():.4g}")
+                    for tok in torch.nonzero(badm).flatten()[:3].tolist():
+                        print(f"      tok {tok}: eager={ev[tok].item():.6g} "
+                              f"graph={gv[tok].item():.6g} "
+                              f"(rel {rd[tok].item():.4g})")
+                else:
+                    rd = rel_diff(ev.float(), gv.float()) \
+                        if FIELD_TOL[fld] is not None else None
+                    extra = f", max rel diff {rd.max().item():.4g}" if rd is not None else ""
+                    print(f"    {fld:9s}: 0/{t} bad{extra}")
 
     print("\n=== first divergence ===")
     if first_div is None:
