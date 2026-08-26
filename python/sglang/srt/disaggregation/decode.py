@@ -2254,7 +2254,7 @@ class SchedulerDisaggregationDecodeMixin:
             and get_tensor_model_parallel_rank() == 0
         )
         prof_bs = int(os.getenv("SGLANG_NPU_PROFILING_BS", "1"))
-        skip_tokens = int(os.getenv("SGLANG_NPU_PROFILING_SKIP_TOKENS", "10"))
+        skip_tokens = int(os.getenv("SGLANG_NPU_PROFILING_SKIP_TOKENS", "100"))
         prof_wait, prof_warmup, prof_active, prof_skip_first = 1, 1, 10, 1
         prof_step = prof_skip_first + prof_wait + prof_warmup + prof_active + 2
         prof_cnt = 0
@@ -2356,11 +2356,21 @@ class SchedulerDisaggregationDecodeMixin:
                     ):
                         prof.start()
                         prof_cnt += 1
+                        logger.info(
+                            f"[Profiling] START fired: decode_cnt={decode_cnt}, "
+                            f"#reqs={len(batch.reqs)}, "
+                            f"mode={batch.forward_mode}"
+                        )
                     if prof_cnt > 0 and is_prof_stage:
                         prof_cnt += 1
                     if prof_cnt == prof_step and is_prof_stage:
                         torch.npu.synchronize()
                         prof.stop()
+                        logger.info(
+                            f"[Profiling] STOP fired (prof_cnt={prof_cnt}); "
+                            f"dir listing: {os.listdir(profiling_path)} "
+                            f"(async export may still be in flight)"
+                        )
 
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
