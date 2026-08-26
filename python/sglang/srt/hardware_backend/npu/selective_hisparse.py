@@ -361,6 +361,11 @@ class NPUSelectiveHiSparseCoordinator:
         self.staging_free_event: torch.npu.Event = self._initial_event
         self.backup_done_event: dict[int, torch.npu.Event] = {}
         self._eager_async_pending = False
+        # E7 (C6 probe): capture-time state for deferred D2H launch —
+        # holds (layer_id, N) of the selected layer whose D2H kernel has
+        # been captured-later than its scratch copy_ (see
+        # publish_new_packed_kv). Python-only, consumed during capture.
+        self._pending_d2h: Optional[tuple] = None
 
         # Device staging buffers (allocated once)
         self._alloc_staging_buffers()
@@ -960,6 +965,22 @@ class NPUSelectiveHiSparseCoordinator:
         ]
         scratch[:T].copy_(packed_kv.view(torch.uint8))
 
+        # E7 (C6 probe, env-gated, graph mode only): flush the PREVIOUS
+        # selected layer's D2H now. Its scratch copy_ was issued one full
+        # selected-cycle (4 model layers of compute + attention) earlier on
+        # the VECTOR queue; launching its MIX D2H here puts enough stream
+        # distance that the copy_ has completed even without cross-queue
+        # ordering — closing the stale-scratch read window that the E3/E4
+        # sleep matrix localized to 19 layers.
+        _defer_d2h = (
+            self._graph_mode
+            and os.getenv("SGLANG_SELECTIVE_DEFER_D2H", "0") == "1"
+        )
+        if _defer_d2h and self._pending_d2h is not None:
+            _p_layer, _p_n = self._pending_d2h
+            self._pending_d2h = None
+            self._launch_deferred_d2h(_p_layer, _p_n)
+
         # C6 probe (env-gated, graph mode only): the copy above is a
         # VECTOR-queue torch op while the D2H sparse_copy_notify below runs
         # on the COMPUTE queue (MIX) — same stream, but cross-queue
@@ -1065,15 +1086,27 @@ class NPUSelectiveHiSparseCoordinator:
                     self.d2h_cnt.fill_(N)
 
                 if self._graph_mode:
-                    ret = mf_offload.sparse_copy_notify(
-                        d2h_src[:N],
-                        d2h_dst[:N],
-                        d2h_lens[:N],
-                        self.d2h_cnt,
-                        self.d2h_flag,
-                        self.device,
+                    _is_last_selected = (
+                        _si == len(self.selected_layer_ids_sorted) - 1
                     )
-                    self.d2h_expect[0].add_(self._dma_flag_block_num)
+                    if _defer_d2h and not _is_last_selected:
+                        # E7: hold the launch; flushed at the NEXT selected
+                        # layer's publish. The last selected layer has no
+                        # next publish inside this capture — launch now
+                        # (1/19 layers stays exposed; acceptable for the
+                        # probe read).
+                        self._pending_d2h = (layer_id, N)
+                        ret = 0
+                    else:
+                        ret = mf_offload.sparse_copy_notify(
+                            d2h_src[:N],
+                            d2h_dst[:N],
+                            d2h_lens[:N],
+                            self.d2h_cnt,
+                            self.d2h_flag,
+                            self.device,
+                        )
+                        self.d2h_expect[0].add_(self._dma_flag_block_num)
                 else:
                     ret = mf_offload.sparse_copy(
                         d2h_src[:N],
@@ -1099,6 +1132,31 @@ class NPUSelectiveHiSparseCoordinator:
                 self._last_backup_event = self.backup_done_event[layer_id]
 
     # === selected-layer attention ===
+
+    def _launch_deferred_d2h(self, layer_id: int, N: int):
+        """E7: launch the held D2H of a previously published layer.
+
+        Descriptor buffers (per-layer, already filled at that layer's
+        publish) are read here; only the MIX kernel launch (and its
+        expect bump) moves later in the captured stream order.
+        """
+        from memfabric_hybrid import offload as mf_offload
+
+        _si = self._layer_scratch_index[layer_id]
+        d2h_src = self.d2h_src_ptrs_all[_si]
+        d2h_dst = self.d2h_dst_ptrs_all[_si]
+        d2h_lens = self.d2h_lens_all[_si]
+        ret = mf_offload.sparse_copy_notify(
+            d2h_src[:N],
+            d2h_dst[:N],
+            d2h_lens[:N],
+            self.d2h_cnt,
+            self.d2h_flag,
+            self.device,
+        )
+        self.d2h_expect[0].add_(self._dma_flag_block_num)
+        if ret != 0:
+            raise RuntimeError(f"sparse_copy D2H (deferred) failed: ret={ret}")
 
     def run_selected_attention(
         self,
