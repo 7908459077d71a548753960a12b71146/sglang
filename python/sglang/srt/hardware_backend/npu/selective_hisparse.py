@@ -407,22 +407,16 @@ class NPUSelectiveHiSparseCoordinator:
         K = self.topk
         R = self.record_bytes
 
-        # R8 (debug): per-layer staging. The shared staging buffer was the
-        # last cross-layer shared resource on the DMA path — layer L+4's H2D
-        # sparse_copy (MIX, compute queue) overwrites the same rows layer L's
-        # unpack chain (torch ops) may still be reading. One [T, K, R] slice
-        # per selected layer removes the L-1 overwrite windows per replay.
-        # NOTE: ~T*K*R bytes per layer (193MB at Tcap=144); the pool
-        # configurator's fixed bias does NOT account for the extra copies —
-        # compensate D_MEM_FRACTION manually for debug runs.
-        # A/B switch for the R8 paired experiment: SGLANG_SELECTIVE_SHARED_STAGING=1
-        # allocates ONE slice (equivalent to the old shared buffer, memory-cheap)
-        # and makes every layer index modulo 1 — an exact replay of the pre-R8
-        # aliasing without reverting any other R5-R7 changes.
-        if os.getenv("SGLANG_SELECTIVE_SHARED_STAGING", "0") == "1":
-            _staging_slices = 1
-        else:
-            _staging_slices = len(self.selected_layer_ids_sorted)
+        # Staging ping-pong: TWO [T, K, R] slices alternating by the layer's
+        # position in the selected list (~2×193MB at Tcap=144, fixed, layer
+        # count independent) — same shape as the R9 workspace ping-pong
+        # below. Safety: adjacent selected layers are 4 apart (5, 9, 13, ...)
+        # and use opposite sets; a set is re-written only 8 model layers
+        # later, after its reader's patch+SFA has long retired. Strictly
+        # safer than one shared slice (next writer only 4 layers away);
+        # R8 A/B showed both are precision-equivalent, ping-pong is the
+        # conservative choice.
+        _staging_slices = 2
         self._staging_slices = _staging_slices
         self.packed_staging_all = torch.zeros(
             _staging_slices,
