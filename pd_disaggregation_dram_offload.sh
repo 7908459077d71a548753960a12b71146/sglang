@@ -110,11 +110,12 @@ do
         # P 为单机 8 卡: deep_ep normal 的 pure intranode dispatch 路径在当前
         # deep_ep NPU 构建上会挂死/向量核异常(507035), 已用单机非 PD 部署复现;
         # 单机无需 a2a, MoE 走标准 TP 路径(base.sh 16 rank 走 internode 故未踩中)
-        # [E8] eager 对照开关: D_EAGER=1 时关闭 NPU graph(加 --disable-cuda-graph,
-        # 去掉 --cuda-graph-bs 避免已知坑1: pool_configurator 按 bs 列表 max=512
-        # 算 selective fixed bias -> 14GB -> 启动失败)
+        # [E8] eager 对照开关: D_EAGER=1 时加 --disable-cuda-graph, 但保留显式
+        # --cuda-graph-bs —— pool_configurator 需要显式 bs 推 bcap(fixed bias),
+        # eager decode 与 graph replay 跑同样的 batch, 低估 bias 会让池吃掉
+        # staging 的内存 -> alloc_memory_pool OOM(启动期, 与 fraction 无关)
         if [[ "${D_EAGER-"0"}" == "1" ]]; then
-            GRAPH_ARGS="--disable-cuda-graph"
+            GRAPH_ARGS="--disable-cuda-graph --cuda-graph-bs ${CUDA_GRAPH_BS}"
         else
             GRAPH_ARGS="--cuda-graph-bs ${CUDA_GRAPH_BS}"
         fi
