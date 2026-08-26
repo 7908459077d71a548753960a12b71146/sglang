@@ -2371,6 +2371,20 @@ class SchedulerDisaggregationDecodeMixin:
                             f"dir listing: {os.listdir(profiling_path)} "
                             f"(async export may still be in flight)"
                         )
+                    if decode_cnt == skip_tokens + 1:
+                        # One-shot diagnostic: dump the real forward modes
+                        # seen around the trigger point so the stage gate
+                        # can be corrected without guessing.
+                        logger.info(
+                            f"[Profiling] gate diagnosis: decode_cnt="
+                            f"{decode_cnt}, this mode="
+                            f"{batch.forward_mode} "
+                            f"(is_decode={batch.forward_mode.is_decode()}, "
+                            f"is_target_verify="
+                            f"{batch.forward_mode.is_target_verify()}), "
+                            f"#reqs={len(batch.reqs)}, prof_bs={prof_bs}, "
+                            f"prof_cnt={prof_cnt}, is_prof_stage={is_prof_stage}"
+                        )
 
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
