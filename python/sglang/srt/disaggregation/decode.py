@@ -21,12 +21,10 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -35,9 +33,6 @@ from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-)
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
@@ -2243,64 +2238,6 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
-        # NPU profiling (same env gate as scheduler.event_loop_normal —
-        # ported from commit 76e2822 A5 adaption). P/D decode runs THIS
-        # loop (dispatch_event_loop routes here), so the instrumentation
-        # must live here too. Stage check includes TARGET_VERIFY: under
-        # NEXTN speculative decoding the decode-side target batches carry
-        # ForwardMode.TARGET_VERIFY, for which is_decode() is False.
-        enable_profiling = (
-            os.getenv("SGLANG_NPU_PROFILING", "0") == "1"
-            and get_tensor_model_parallel_rank() == 0
-        )
-        prof_bs = int(os.getenv("SGLANG_NPU_PROFILING_BS", "1"))
-        skip_tokens = int(os.getenv("SGLANG_NPU_PROFILING_SKIP_TOKENS", "100"))
-        prof_wait, prof_warmup, prof_active, prof_skip_first = 1, 1, 10, 1
-        prof_step = prof_skip_first + prof_wait + prof_warmup + prof_active + 2
-        prof_cnt = 0
-        decode_cnt = 0
-
-        if enable_profiling:
-            import torch_npu
-
-            experimental_config = torch_npu.profiler._ExperimentalConfig(
-                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
-                l2_cache=False,
-                data_simplification=False,
-            )
-            profiling_path = os.getenv("SGLANG_NPU_PROFILING_DIR", "profiling/")
-            Path(profiling_path).mkdir(parents=True, exist_ok=True)
-            prof = torch_npu.profiler.profile(
-                activities=[
-                    torch_npu.profiler.ProfilerActivity.CPU,
-                    torch_npu.profiler.ProfilerActivity.NPU,
-                ],
-                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                    profiling_path
-                ),
-                schedule=torch_npu.profiler.schedule(
-                    wait=prof_wait,
-                    warmup=prof_warmup,
-                    active=prof_active,
-                    repeat=1,
-                    skip_first=prof_skip_first,
-                ),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=False,
-                with_flops=False,
-                with_modules=False,
-                experimental_config=experimental_config,
-            )
-            logger.info(
-                f"[Profiling] disagg-decode loop: bs={prof_bs}, "
-                f"skip_tokens={skip_tokens}, "
-                f"schedule(wait={prof_wait}, warmup={prof_warmup}, "
-                f"active={prof_active}, skip_first={prof_skip_first}), "
-                f"prof_step={prof_step}, dir={profiling_path}"
-            )
-
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
@@ -2336,67 +2273,9 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Launch the current batch
             if batch:
-                is_prof_stage = False
-                if enable_profiling:
-                    if (
-                        batch.forward_mode.is_decode()
-                        or batch.forward_mode.is_target_verify()
-                    ):
-                        decode_cnt += 1
-                    is_prof_stage = (
-                        batch.forward_mode.is_decode()
-                        or batch.forward_mode.is_target_verify()
-                    ) and not batch.forward_mode.is_idle()
-
-                    if (
-                        decode_cnt > skip_tokens
-                        and len(batch.reqs) >= prof_bs
-                        and prof_cnt == 0
-                        and is_prof_stage
-                    ):
-                        prof.start()
-                        prof_cnt += 1
-                        logger.info(
-                            f"[Profiling] START fired: decode_cnt={decode_cnt}, "
-                            f"#reqs={len(batch.reqs)}, "
-                            f"mode={batch.forward_mode}"
-                        )
-                    if prof_cnt > 0 and is_prof_stage:
-                        prof_cnt += 1
-                    if prof_cnt == prof_step and is_prof_stage:
-                        torch.npu.synchronize()
-                        prof.stop()
-                        logger.info(
-                            f"[Profiling] STOP fired (prof_cnt={prof_cnt}); "
-                            f"dir listing: {os.listdir(profiling_path)} "
-                            f"(async export may still be in flight)"
-                        )
-                    if decode_cnt == skip_tokens + 1:
-                        # One-shot diagnostic: dump the real forward modes
-                        # seen around the trigger point so the stage gate
-                        # can be corrected without guessing.
-                        logger.info(
-                            f"[Profiling] gate diagnosis: decode_cnt="
-                            f"{decode_cnt}, this mode="
-                            f"{batch.forward_mode} "
-                            f"(is_decode={batch.forward_mode.is_decode()}, "
-                            f"is_target_verify="
-                            f"{batch.forward_mode.is_target_verify()}), "
-                            f"#reqs={len(batch.reqs)}, prof_bs={prof_bs}, "
-                            f"prof_cnt={prof_cnt}, is_prof_stage={is_prof_stage}"
-                        )
-
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
-
-                if (
-                    enable_profiling
-                    and prof_cnt > 0
-                    and prof_cnt < prof_step
-                    and is_prof_stage
-                ):
-                    prof.step()
             else:
                 batch_result = None
 
