@@ -1391,7 +1391,9 @@ class NPUSelectiveHiSparseCoordinator:
                 st.valid_mask[:T].sum(dim=-1, dtype=torch.int64)
             )
             self._dbg_q_all[_si_dbg, :T].copy_(
-                q_nope[:T].sum(dim=-1, dtype=torch.float32)
+                q_nope[:T].reshape(T, -1).sum(
+                    dim=-1, dtype=torch.float32
+                )
             )
         src_data = packed[safe_src]  # [T*K, 656]
         staging_flat[:N] = torch.where(
@@ -1460,7 +1462,9 @@ class NPUSelectiveHiSparseCoordinator:
                 )
             )
             self._dbg_out_all[_si_dbg, :T].copy_(
-                out[:T].sum(dim=-1, dtype=torch.float32)
+                out[:T].reshape(T, -1).sum(
+                    dim=-1, dtype=torch.float32
+                )
             )
             if (
                 _si_dbg == len(self.selected_layer_ids_sorted) - 1
