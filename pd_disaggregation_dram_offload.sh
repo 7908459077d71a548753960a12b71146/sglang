@@ -110,6 +110,15 @@ do
         # P 为单机 8 卡: deep_ep normal 的 pure intranode dispatch 路径在当前
         # deep_ep NPU 构建上会挂死/向量核异常(507035), 已用单机非 PD 部署复现;
         # 单机无需 a2a, MoE 走标准 TP 路径(base.sh 16 rank 走 internode 故未踩中)
+        # [E8] eager 对照开关: D_EAGER=1 时关闭 NPU graph(加 --disable-cuda-graph,
+        # 去掉 --cuda-graph-bs 避免已知坑1: pool_configurator 按 bs 列表 max=512
+        # 算 selective fixed bias -> 14GB -> 启动失败)
+        if [[ "${D_EAGER-"0"}" == "1" ]]; then
+            GRAPH_ARGS="--disable-cuda-graph"
+        else
+            GRAPH_ARGS="--cuda-graph-bs ${CUDA_GRAPH_BS}"
+        fi
+
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
             --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
@@ -183,7 +192,7 @@ do
             --moe-dense-tp-size 1 \
             --mem-fraction-static $D_MEM_FRACTION \
             --chunked-prefill-size 8192 \
-            --cuda-graph-bs ${CUDA_GRAPH_BS} \
+            ${GRAPH_ARGS} \
             --speculative-algorithm NEXTN \
             --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
             --max-running-requests 192 \
