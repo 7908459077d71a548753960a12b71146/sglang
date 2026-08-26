@@ -874,7 +874,21 @@ class NPUSelectiveHiSparseCoordinator:
                 # with the copy kernel's unconditional 64-core notify bump.
                 # Eager mode keeps the plain call (its consumer is gated by
                 # the h2d_done event instead).
-                if self._graph_mode:
+                # B3 (notify-exclusion probe): with the H2D wait skipped
+                # (SKIP_H2D_WAIT=1) and the D2H wait deleted (R11), NOBODY
+                # consumes the flags — yet every sparse_copy_notify kernel
+                # still runs its notify tail (per-core SetAtomicAdd +
+                # S_MTE3 event pair + PipeBarrier<PIPE_MTE3>): at 19L that
+                # is 38 kernels x 64 cores = 2432 atomic cacheline writes
+                # per replay, present in EVERY experiment so far and never
+                # singly excluded. SGLANG_SELECTIVE_PLAIN_COPY=1 switches
+                # graph mode to the plain notify-free sparse_copy (the
+                # kernel skips NotifyDone entirely when notify == nullptr).
+                _plain_copy = (
+                    self._graph_mode
+                    and os.getenv("SGLANG_SELECTIVE_PLAIN_COPY", "0") == "1"
+                )
+                if self._graph_mode and not _plain_copy:
                     ret = mf_offload.sparse_copy_notify(
                         h2d_src[:N],
                         h2d_dst[:N],
@@ -1107,6 +1121,15 @@ class NPUSelectiveHiSparseCoordinator:
                         # probe read).
                         self._pending_d2h = (layer_id, N)
                         ret = 0
+                    elif _plain_copy:
+                        # B3: notify-free plain copy (see H2D comment).
+                        ret = mf_offload.sparse_copy(
+                            d2h_src[:N],
+                            d2h_dst[:N],
+                            d2h_lens[:N],
+                            self.d2h_cnt,
+                            self.device,
+                        )
                     else:
                         ret = mf_offload.sparse_copy_notify(
                             d2h_src[:N],
