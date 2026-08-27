@@ -56,11 +56,15 @@ def load_dir(d, dev=None):
     files = glob.glob(os.path.join(d, "*.pt"))
     by_dev = {}
     for f in files:
-        m = re.match(r".*_dev(\d+)_step(\d+)\.pt", os.path.basename(f))
+        # Only the per-layer snapshots; the round-3 state_dev*.pt bisect
+        # files share the dir but hold a different schema.
+        m = re.fullmatch(
+            r"(eager|graph)_dev(\d+)_step(\d+)\.pt", os.path.basename(f)
+        )
         if not m:
             continue
-        by_dev.setdefault(int(m.group(1)), []).append(
-            (int(m.group(2)), f)
+        by_dev.setdefault(int(m.group(2)), []).append(
+            (int(m.group(3)), f)
         )
     if not by_dev:
         raise SystemExit(f"no snapshots found under {d}")
@@ -322,9 +326,14 @@ def main():
         # rank processes the same request stream in both runs — required
         # for step alignment beyond the warmup batch).
         def devs_of(d):
-            return {int(m.group(1)) for f in glob.glob(os.path.join(d, "*.pt"))
-                    if (m := re.match(r".*_dev(\d+)_step\d+\.pt",
-                                      os.path.basename(f)))}
+            return {
+                int(m.group(1))
+                for f in glob.glob(os.path.join(d, "*.pt"))
+                if (m := re.fullmatch(
+                    r"(eager|graph)_dev(\d+)_step\d+\.pt",
+                    os.path.basename(f),
+                ))
+            }
         common = devs_of(args.eager_dir) & devs_of(args.graph_dir)
         if not common:
             raise SystemExit("no common device between the two dirs")
