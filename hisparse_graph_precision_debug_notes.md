@@ -225,7 +225,7 @@ accept_lens 首个发散 step = S
 
 ### 第二轮探针：verify logits 指纹（2026-08-28，已埋点待跑）
 
-`on_verify_result` 增加可选 `logits_output` 参数（eagle_worker_common 调用点传入），`accept_stepNNNN.json` 从只记 accept_lens 扩展为：
+`on_verify_result` 增加可选 `logits_output` 参数（eagle_worker_common 调用点传入），json 文件名带 dev（`accept_dev{N}_step{S}.json`，防 dp8 多 rank 同目录互相覆盖），内容从只记 accept_lens 扩展为：
 
 ```json
 {"step": 1, "accept_lens": [...],
@@ -233,7 +233,7 @@ accept_lens 首个发散 step = S
  "logit_rowsum": [...]}   // next_token_logits 逐行 float32 rowsum（数值指纹）
 ```
 
-判读（对齐 step 1，即 pair 0）：
+`hisparse_diff_compare.py` 已加 `=== verify-round fingerprint ===` 段：json 是同号 step 直接比对（不走 .pt 的 q 对齐，两侧各自从 1 计数），在 .pt 对齐失败时仍能判定。判读（以首个发散 step 为准）：
 - `logit_rowsum` step 1 即偏 → **target 前向在图内发散**（非 selected 层 / lm_head / logits processor）→ 下一轮加 hidden-state 逐层（或隔层采样）rowsum 二分探针
 - rowsum 吻合但 `logit_argmax`/accept_lens 偏 → 采样器 / RNG 状态 / verify 树处理发散，模型前向无辜
 - step 1 全吻合但 step 2 输入指纹偏 → draft 侧（NEXTN draft forward）或 scheduler 状态（seq_lens/out_cache_loc 更新）发散 → 加 draft 侧指纹探针

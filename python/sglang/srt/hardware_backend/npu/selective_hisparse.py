@@ -1064,15 +1064,6 @@ class NPUSelectiveHiSparseCoordinator:
         if not self._graph_mode:
             self._selective_real_tokens.fill_(T)
 
-        if not self._graph_mode and logger.isEnabledFor(logging.INFO):
-            locs_cpu = logical_locs[:T].cpu()
-            logger.info(
-                f"[D2H] layer={layer_id} T={T} "
-                f"locs=[{locs_cpu.min().item()},{locs_cpu.max().item()}] "
-                f"packed_shape={list(packed_kv.shape)} "
-                f"packed_dtype={packed_kv.dtype}"
-            )
-
         # Record AFTER the W3 scratch copy so the eager D2H stream waits for
         # it; graph capture keeps everything on the capture stream (stream
         # order supplies the dependency) and must not record graph-owned
@@ -1488,9 +1479,13 @@ class NPUSelectiveHiSparseCoordinator:
                     rec["logit_rowsum"] = _nt.sum(
                         dim=-1, dtype=torch.float32
                     ).tolist()
+                # Filename includes the device: with DP attention every rank
+                # shares this dump dir, and a bare-step name would have the
+                # ranks overwrite each other's records.
                 accept_path = os.path.join(
                     self._dbg_dir,
-                    f"accept_step{self._dbg_accept_step:04d}.json",
+                    f"accept_dev{torch.npu.current_device()}_step"
+                    f"{self._dbg_accept_step:04d}.json",
                 )
                 with open(accept_path, "w") as f:
                     json.dump(rec, f)

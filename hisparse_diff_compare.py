@@ -27,6 +27,7 @@ per-layer divergence counts across aligned steps.
 
 import argparse
 import glob
+import json
 import os
 import re
 from collections import Counter
@@ -85,6 +86,113 @@ def rel_diff(a, b):
     return ((a - b).abs() / denom)
 
 
+def load_accept(d, dev):
+    """Load per-step verify-round json records for *dev*.
+
+    Current instrumentation writes accept_dev{N}_step{S}.json; the round-1
+    form (accept_step{S}.json, no dev) is accepted as a fallback — with
+    max-concurrency 1 only the active rank is ever non-idle, so those
+    legacy files are unambiguous.
+    """
+    recs = {}
+    legacy = {}
+    for f in glob.glob(os.path.join(d, "accept_*.json")):
+        base = os.path.basename(f)
+        m = re.match(r"accept_dev(\d+)_step(\d+)\.json", base)
+        if m:
+            if int(m.group(1)) == dev:
+                with open(f) as fh:
+                    recs[int(m.group(2))] = json.load(fh)
+            continue
+        m = re.match(r"accept_step(\d+)\.json", base)
+        if m:
+            with open(f) as fh:
+                legacy[int(m.group(1))] = json.load(fh)
+    if not recs and legacy:
+        recs = legacy
+    return recs
+
+
+def compare_accept(args, esnaps, gsnaps):
+    """Same-numbered-step comparison of the verify-round fingerprints.
+
+    Unlike the .pt snapshots, these records need NO content alignment:
+    both runs count non-idle verify rounds from 1 over the same request
+    stream, and the round-1 comparison proved no warmup offset. This
+    section answers where the step-2 divergence (which kills .pt
+    alignment) actually lives: target forward (rowsum), sampler/verify
+    tree (argmax/accept_lens with matching rowsum), or neither.
+    """
+    print("\n=== verify-round fingerprint (accept json, same-numbered "
+          "steps) ===")
+    erecs = load_accept(args.eager_dir, args.dev)
+    grecs = load_accept(args.graph_dir, args.dev)
+    if not erecs or not grecs:
+        print("(no accept jsons found on one or both sides — re-dump)")
+        return
+    has_logits = all(
+        "logit_rowsum" in r for r in list(erecs.values())[:1]
+    ) and all("logit_rowsum" in r for r in list(grecs.values())[:1])
+    if not has_logits:
+        print("(accept jsons lack the logits fingerprint — server ran the "
+              "round-1 instrumentation; re-run BOTH sides with the "
+              "round-2 code)")
+        return
+
+    common = sorted(set(erecs) & set(grecs))
+    print(f"eager steps with json: {sorted(erecs)} | graph: {sorted(grecs)}")
+
+    def row_stats(e, g):
+        """(rowsum bad?, max rel diff, argmax mismatches, n compared)"""
+        er = torch.tensor(e["logit_rowsum"], dtype=torch.float64)
+        gr = torch.tensor(g["logit_rowsum"], dtype=torch.float64)
+        n = min(len(er), len(gr))
+        rd = rel_diff(er[:n], gr[:n])
+        ea = e["logit_argmax"]
+        ga = g["logit_argmax"]
+        amis = sum(1 for i in range(min(len(ea), len(ga)))
+                   if ea[i] != ga[i])
+        return bool((rd > 5e-2).any()), float(rd.max()) if n else 0.0, amis, n
+
+    first_div = None
+    for s in common:
+        e, g = erecs[s], grecs[s]
+        rs_bad, rs_max, amis, n = row_stats(e, g)
+        acc_eq = e["accept_lens"] == g["accept_lens"]
+        if rs_bad or amis or not acc_eq:
+            if first_div is None:
+                first_div = (s, rs_bad, amis, acc_eq)
+            print(f"step {s:3d}: DIVERGE rowsum{'BAD' if rs_bad else 'ok'} "
+                  f"(max rel {rs_max:.4g}), argmax mismatches {amis}/{n}, "
+                  f"accept_lens {'same' if acc_eq else 'DIFFER'}")
+        elif s <= 3:
+            print(f"step {s:3d}: match (rowsum max rel {rs_max:.4g}, "
+                  f"argmax 0/{n}, accept_lens same "
+                  f"{e['accept_lens'][:4]})")
+    if first_div is None:
+        print(f"all {len(common)} common steps match on rowsum/argmax/"
+              "accept_lens")
+        print("=> the two runs compute IDENTICAL verify outputs; the .pt "
+              "ALIGN failure is a scheduling/ordering artifact (different "
+              "request placement or step offset) — rerun to confirm")
+        return
+    s, rs_bad, amis, acc_eq = first_div
+    print(f"\n[FINGERPRINT VERDICT] first divergent verify round: step {s}")
+    if rs_bad:
+        print("  => logit rowsum differs: TARGET FORWARD diverges in graph "
+              "(non-selected layers / lm_head / logits processor). "
+              "Selected-layer dumps are clean at step 1, so bisect with "
+              "per-layer hidden-state rowsum probes next.")
+    elif amis:
+        print("  => rowsum matches but argmax differs: near-tie logits or "
+              "sampler-side divergence (greedy: meaningful; sampled: check "
+              "RNG seed before concluding)")
+    elif not acc_eq:
+        print("  => logits match but accept_lens differ: eagle_sample / "
+              "verify-tree handling diverges, model forward is innocent")
+
+
+
 def first_bad_idx(a, b, tol):
     if tol is None:
         bad = (a != b)
@@ -121,6 +229,11 @@ def main():
     gdev, gsnaps = load_dir(args.graph_dir, dev=args.dev)
     print(f"eager: dev{edev}, {len(esnaps)} steps | "
           f"graph: dev{gdev}, {len(gsnaps)} steps")
+
+    # Verify-round fingerprints first: they need no .pt-style alignment
+    # (same-numbered steps compare directly) and answer where the
+    # divergence that breaks .pt alignment actually lives.
+    compare_accept(args, esnaps, gsnaps)
 
     layers = esnaps[0]["layers"]
     n_layers = len(layers)
