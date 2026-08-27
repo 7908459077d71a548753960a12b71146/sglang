@@ -216,3 +216,25 @@ accept_lens 首个发散 step = S
 - `stg_pre/stg_post/pkg/pub` 等 captured op 冻结的是**本轮 replay 消费时刻**的值（非 replay 后已自愈值），这是 D1 的核心机制，新探针沿用。
 - `d2h_rb` 依赖「stream sync ⇒ in-graph MIX D2H 对 Host 写可见」这一假设；若 graph 侧 d2h_rb 出现 eager 侧没有的偶发噪声，先怀疑该假设本身（本身就是有价值的发现）。
 - dump 只在前 `SGLANG_SELECTIVE_DUMP_MAX_STEPS`（默认 20）个非 idle verify 轮生效；比对时两侧用同数据集同并发（max-concurrency 1）。
+
+### 首轮 dump 比对结论（2026-08-28，20 steps，bs1）
+
+- **pair 0（step 1）全字段吻合**：pos/kin/kinv/pub/pkg/locs/stg_pre/stg_post/out 全 match（out 最大相对差 2.1e-07）→ **selected 层 KV 链路（H2D 预取、current-patch、unpack、SFA）在 step 1 完全无辜**。
+- **eager step 2 起无法对齐**（no matching graph step remains）：step 1→2 之间输出已发散，或两次跑调度错位。发散位置在探针未覆盖的区域：SFA 下游（logits/sampler/verify 树）、非 selected 层、或 draft 侧。
+- 已排除（step 1 范围内）：跨队列竞态（§4 疑点①②）、fp8 quant 图内偏差、Host pool 污染、KV 侧 RoPE 偏差。
+
+### 第二轮探针：verify logits 指纹（2026-08-28，已埋点待跑）
+
+`on_verify_result` 增加可选 `logits_output` 参数（eagle_worker_common 调用点传入），`accept_stepNNNN.json` 从只记 accept_lens 扩展为：
+
+```json
+{"step": 1, "accept_lens": [...],
+ "logit_argmax": [...],   // next_token_logits 逐行 argmax（贪心 token id）
+ "logit_rowsum": [...]}   // next_token_logits 逐行 float32 rowsum（数值指纹）
+```
+
+判读（对齐 step 1，即 pair 0）：
+- `logit_rowsum` step 1 即偏 → **target 前向在图内发散**（非 selected 层 / lm_head / logits processor）→ 下一轮加 hidden-state 逐层（或隔层采样）rowsum 二分探针
+- rowsum 吻合但 `logit_argmax`/accept_lens 偏 → 采样器 / RNG 状态 / verify 树处理发散，模型前向无辜
+- step 1 全吻合但 step 2 输入指纹偏 → draft 侧（NEXTN draft forward）或 scheduler 状态（seq_lens/out_cache_loc 更新）发散 → 加 draft 侧指纹探针
+- 全部吻合 → 纯调度错位（两次跑请求/时序不同），固定数据重跑对齐

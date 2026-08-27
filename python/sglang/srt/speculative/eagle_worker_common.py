@@ -599,6 +599,8 @@ def run_eagle_verify(
             old_seq_lens=batch.seq_lens,
             accept_lens=accept_lens,
             accept_index=accept_index,
+            # D1 round-2: logits fingerprint into the per-step dump
+            logits_output=logits_output,
         )
 
     clear_unaccepted_c128 = getattr(

@@ -904,20 +904,6 @@ class NPUSelectiveHiSparseCoordinator:
             else torch.npu.current_stream().record_event()
         )
 
-        if not self._graph_mode and logger.isEnabledFor(logging.INFO):
-            n_hist = valid.sum().item()
-            n_curr = (current_rows >= 0).sum().item()
-            n_invalid = (~(valid | (current_rows >= 0))).sum().item()
-            loc_min = locs[valid].min().item() if n_hist > 0 else -1
-            loc_max = locs[valid].max().item() if n_hist > 0 else -1
-            K = self.topk
-            logger.info(
-                f"[H2D] anchor={anchor_layer_id}→sel={selected} "
-                f"B={B} T={T} K={K} N={T*K} "
-                f"hist={n_hist} curr={n_curr} invalid={n_invalid} "
-                f"loc_range=[{loc_min},{loc_max}]"
-            )
-
         # During graph capture, run on the capture stream (no side streams).
         # During normal execution, use prefetch_stream for H2D/compute overlap.
         h2d_stream = (
@@ -983,15 +969,6 @@ class NPUSelectiveHiSparseCoordinator:
                 if ret != 0:
                     raise RuntimeError(
                         f"sparse_copy H2D failed: ret={ret}"
-                    )
-                if not self._graph_mode and logger.isEnabledFor(logging.INFO):
-                    n_h2d = valid_flat.sum().item()
-                    n_curr = (current_rows >= 0).reshape(-1).sum().item()
-                    logger.info(
-                        f"[H2D] sparse_copy ret={ret} "
-                        f"h2d={n_h2d} curr={n_curr} "
-                        f"total_valid={n_h2d + n_curr}/{N} "
-                        f"dva=0x{base_dva:x}"
                     )
             except ImportError:
                 host_tensor = self.pool.get_host_tensor(selected)
@@ -1402,19 +1379,6 @@ class NPUSelectiveHiSparseCoordinator:
                 all_valid_mask.sum(dim=-1, dtype=torch.int64)
             )
 
-        if not self._graph_mode and logger.isEnabledFor(logging.INFO):
-            n_curr = mask.sum().item()
-            n_hist = st.valid_mask[:T].sum().item()
-            n_all_valid = all_valid_mask.sum().item()
-            staging_nonzero = (
-                staging_flat[:N].sum(dim=1) > 0
-            ).sum().item()
-            logger.info(
-                f"[ATTN] layer={layer_id} T={T} K={K} "
-                f"hist={n_hist} curr={n_curr} all_valid={n_all_valid} "
-                f"staging_nonzero={staging_nonzero}/{N}"
-            )
-
         # R9-final: ping-pong workspace set — parity of the layer's position
         # in the selected list (see _alloc_staging_buffers). Adjacent
         # selected layers are 4 apart, so a set is reused only 4 layers
@@ -1494,27 +1458,42 @@ class NPUSelectiveHiSparseCoordinator:
         old_seq_lens: torch.Tensor,
         accept_lens: torch.Tensor,
         accept_index: torch.Tensor,
+        logits_output=None,
     ):
         """Called after eagle_sample returns. Records debug metrics."""
-        # D1: per-step accept lengths — the first step where the graph run's
-        # accept pattern leaves the eager run's marks where the OUTPUT
-        # diverges, without any logits dump. Step numbering matches
-        # dump_diff_snapshot (both count non-idle verify rounds).
+        # D1 round-2: per-step verify record — accept lengths plus a logits
+        # fingerprint (greedy argmax ids + float32 rowsum of
+        # next_token_logits). The selected-layer dumps proved step-1 clean,
+        # so the poison lives downstream of SFA / in non-selected layers /
+        # in the sampler; this record pins WHICH and WHERE:
+        #   rowsum differs      -> target forward diverges in graph
+        #                          (non-selected layers / lm_head path)
+        #   rowsum match, ids/accept differ -> sampler or RNG/tree handling
+        #   all match but next step's inputs differ -> draft-side or
+        #                          scheduler state divergence
         if self._dbg_dump:
             self._dbg_accept_step += 1
             if self._dbg_accept_step <= self._dbg_max_steps:
+                rec = {
+                    "step": self._dbg_accept_step,
+                    "accept_lens": accept_lens.tolist(),
+                }
+                _nt = (
+                    getattr(logits_output, "next_token_logits", None)
+                    if logits_output is not None
+                    else None
+                )
+                if _nt is not None:
+                    rec["logit_argmax"] = _nt.argmax(dim=-1).tolist()
+                    rec["logit_rowsum"] = _nt.sum(
+                        dim=-1, dtype=torch.float32
+                    ).tolist()
                 accept_path = os.path.join(
                     self._dbg_dir,
                     f"accept_step{self._dbg_accept_step:04d}.json",
                 )
                 with open(accept_path, "w") as f:
-                    json.dump(
-                        {
-                            "step": self._dbg_accept_step,
-                            "accept_lens": accept_lens.tolist(),
-                        },
-                        f,
-                    )
+                    json.dump(rec, f)
         B = accept_lens.shape[0]
         logger.debug(
             f"Selective HiSparse verify result: B={B}, "
