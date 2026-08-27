@@ -650,6 +650,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+        # D1 round-4b handle for the per-step probes in the loop below.
+        _dbg_draft_sel = getattr(
+            self.target_worker.model_runner,
+            "npu_selective_hisparse_coordinator",
+            None,
+        )
 
         maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
 
@@ -783,6 +789,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
+                # D1 round-4b: per-step draft probe (no-op unless
+                # SGLANG_SELECTIVE_DIFF_DUMP=1). The drafted-graph capture
+                # runs this same loop, so these ops bake per step.
+                if _dbg_draft_sel is not None:
+                    _dbg_draft_sel.debug_capture_draft_step(
+                        i,
+                        logits_output.next_token_logits,
+                        topk_index,
+                        hidden_states,
+                    )
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)

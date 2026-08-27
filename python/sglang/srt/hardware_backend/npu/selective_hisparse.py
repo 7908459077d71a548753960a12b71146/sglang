@@ -746,6 +746,21 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_dout_score = torch.zeros(
                 T, dtype=torch.int64, device=self.device
             )
+            # Round-4b (per-step inside the draft chain): capture-ops placed
+            # in draft_forward's step loop are baked per step at draft-graph
+            # capture time (Python i selects distinct slices), so each
+            # replay freezes every intermediate step, not just the final
+            # proposal. First dim: draft steps (num_steps<=verify_width).
+            _n_dsteps = max(self.verify_width, 8)
+            self._dbg_dstep_logits_all = torch.zeros(
+                _n_dsteps, T, dtype=torch.float32, device=self.device
+            )
+            self._dbg_dstep_toks_all = torch.zeros(
+                _n_dsteps, T, dtype=torch.int64, device=self.device
+            )
+            self._dbg_dstep_hidden_all = torch.zeros(
+                _n_dsteps, T, dtype=torch.float32, device=self.device
+            )
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg} "
@@ -1373,6 +1388,47 @@ class NPUSelectiveHiSparseCoordinator:
                     top_scores_index.reshape(-1)[:t].to(torch.int64)
                 )
 
+    def debug_capture_draft_step(
+        self,
+        step: int,
+        logits: torch.Tensor,
+        topk_index: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
+        """D1 round-4b: per-step capture INSIDE the draft chain.
+
+        Called from draft_forward's step loop after sampling (the drafted
+        graph capture runs the same loop, so the ops are baked per step:
+        the Python step index at capture time selects this step's slice).
+        Together the three fields split a draft divergence into:
+          hidden(step k-1) differs -> drifted input to step k
+          hidden same + logits differ -> draft layer/lm_head compute
+          logits same + toks differ  -> argmax flip (numerics at the top)
+        """
+        if not self._dbg_dump:
+            return
+        if step >= self._dbg_dstep_logits_all.shape[0]:
+            return
+        t = min(logits.shape[0], self.tcap)
+        if t <= 0:
+            return
+        self._dbg_dstep_logits_all[step, :t].copy_(
+            logits[:t].sum(dim=-1, dtype=torch.float32)
+        )
+        ti = min(topk_index.shape[0], self.tcap)
+        if ti > 0:
+            self._dbg_dstep_toks_all[step, :ti].copy_(
+                topk_index[:ti].reshape(-1)[:ti].to(torch.int64)
+            )
+        if hidden_states is not None:
+            th = min(hidden_states.shape[0], self.tcap)
+            if th > 0:
+                self._dbg_dstep_hidden_all[step, :th].copy_(
+                    hidden_states[:th].reshape(th, -1).sum(
+                        dim=-1, dtype=torch.float32
+                    )
+                )
+
     def dump_diff_snapshot(self, step: int, t_real: int):
         """D1: save the per-layer debug capture buffers to disk.
 
@@ -1699,6 +1755,14 @@ class NPUSelectiveHiSparseCoordinator:
                     "dout_toks": self._dbg_dout_toks[:_n_st].cpu(),
                     "dout_parent": self._dbg_dout_parent[:_n_st].cpu(),
                     "dout_score": self._dbg_dout_score[:_n_st].cpu(),
+                    # Round-4b per-step inside the chain
+                    "dstep_logits": self._dbg_dstep_logits_all[
+                        :, :_n_st
+                    ].cpu(),
+                    "dstep_toks": self._dbg_dstep_toks_all[:, :_n_st].cpu(),
+                    "dstep_hidden": self._dbg_dstep_hidden_all[
+                        :, :_n_st
+                    ].cpu(),
                 }
                 torch.save(
                     state,

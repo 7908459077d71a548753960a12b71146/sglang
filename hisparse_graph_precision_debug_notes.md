@@ -272,4 +272,17 @@ accept_lens 首个发散 step = S
   - `din_hidden` 同 + `dout_toks` 偏 → **draft 前向本身在图内发散**（draft attention/KV/metadata）
   - `dout_toks` 同但 in_ids 偏 → `build_eagle_verify_input` 树拼装 bug
 
-draft 探针埋点：`eagle_worker_v2.draft()` graph/eager 汇合点捕获 `spec_info.hidden_states/topk_index`（输入交接态）+ `parent_list/top_scores_index/draft_tokens`（输出提案），随 state_dev{N}_step{S}.pt 落盘。
+### 第四轮 dump 比对结论（2026-08-28，旧 dump 重析）
+
+**root-vs-draft 判定已出**（无需重跑）：step 3 的 in_ids 逐 token 对比——root（上轮接受 token）**吻合**（382=382），slot[1][2] 吻合，**slot[3] 偏离（eager=557，graph=0）**，slot[4][5] 吻合。
+
+- **eagle_sample/accept_index 无辜**（接受了相同 token）。
+- **draft 链第 3 个提案位发散**，且 graph 侧提案为 token 0（疑似 logits 退化/被清零的征兆）。
+- 待 draft 字段（din/dout/dstep）跑出后定：交接态偏 vs draft 前向偏 vs 树拼装偏。
+
+### 第四轮补充探针：draft 链逐 step（4b，已埋点待跑）
+
+`draft_forward` 步循环内（采样后）挂 `debug_capture_draft_step(i, logits, topk_index, hidden_states)`——draft graph capture 复用同一循环，按 Python `i` 选切片，**每步探针各自烘焙进图**，replay 冻结全部中间步。state 文件新增 `dstep_logits/dstep_toks/dstep_hidden` [S,T]。判读（首个 toks DIFFER 的 step k）：
+- `hidden(k-1)` 偏 → 第 k 步输入已漂
+- hidden 同 + logits 偏 → draft 层/lm_head 计算
+- logits 同 + toks 偏 → argmax 数值翻转（顶端近平局）

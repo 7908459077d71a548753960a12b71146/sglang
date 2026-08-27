@@ -261,6 +261,27 @@ def compare_state(args, first_fp_div):
                     print("     draft tokens match but verify in_ids "
                           "differ: build_eagle_verify_input tree "
                           "assembly bug")
+            if "dstep_toks" in e and "dstep_toks" in g:
+                print("  per-step inside the draft chain (step: toks, "
+                      "logits rel, input-hidden rel):")
+                for k in range(e["dstep_toks"].shape[0]):
+                    et, gt = e["dstep_toks"][k], g["dstep_toks"][k]
+                    toks_diff = not torch.equal(et, gt)
+                    el, gl = e["dstep_logits"][k], g["dstep_logits"][k]
+                    lrel = rel_diff(el, gl).max().item() if len(el) else 0.0
+                    eh, gh = e["dstep_hidden"][k], g["dstep_hidden"][k]
+                    hrel = rel_diff(eh, gh).max().item() if len(eh) else 0.0
+                    flag = "  <-- FIRST DIVERGENT STEP" if (
+                        toks_diff
+                        and all(
+                            torch.equal(e["dstep_toks"][j],
+                                        g["dstep_toks"][j])
+                            for j in range(k)
+                        )
+                    ) else ""
+                    print(f"    step {k}: toks {'DIFFER' if toks_diff else 'same'},"
+                          f" logits rel {lrel:.4g},"
+                          f" hidden rel {hrel:.4g}{flag}")
         if ids_bad or pos_bad:
             print("  (verify inputs differ as reported above)")
         elif first_layer == -1:
