@@ -1152,24 +1152,19 @@ class NPUSelectiveHiSparseCoordinator:
                     d2h_lens[:N] = self.record_bytes
                     self.d2h_cnt.fill_(N)
 
-                if self._graph_mode:
-                    ret = mf_offload.sparse_copy_notify(
-                        d2h_src[:N],
-                        d2h_dst[:N],
-                        d2h_lens[:N],
-                        self.d2h_cnt,
-                        self.d2h_flag,
-                        self.device,
-                    )
-                    self.d2h_expect[0].add_(self._dma_flag_block_num)
-                else:
-                    ret = mf_offload.sparse_copy(
-                        d2h_src[:N],
-                        d2h_dst[:N],
-                        d2h_lens[:N],
-                        self.d2h_cnt,
-                        self.device,
-                    )
+                # Step-1 (flag-mechanism retirement): graph-mode D2H uses the
+                # plain notify-free copy. R11 removed the D2H-side wait, so
+                # the notify tail had no consumer — pure per-core atomic
+                # overhead (38 kernels x 64 cores per replay at 19L).
+                # A/B against the 0.90 baseline: band-preserving => notify
+                # tail confirmed removable on the post-RoPE-fix code.
+                ret = mf_offload.sparse_copy(
+                    d2h_src[:N],
+                    d2h_dst[:N],
+                    d2h_lens[:N],
+                    self.d2h_cnt,
+                    self.device,
+                )
                 if ret != 0:
                     raise RuntimeError(
                         f"sparse_copy D2H failed: ret={ret}"
