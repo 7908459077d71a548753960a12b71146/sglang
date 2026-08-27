@@ -327,7 +327,7 @@ def main():
         # for step alignment beyond the warmup batch).
         def devs_of(d):
             return {
-                int(m.group(1))
+                int(m.group(2))
                 for f in glob.glob(os.path.join(d, "*.pt"))
                 if (m := re.fullmatch(
                     r"(eager|graph)_dev(\d+)_step\d+\.pt",
