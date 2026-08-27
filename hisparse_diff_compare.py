@@ -272,6 +272,9 @@ def compare_state(args, first_fp_div):
             ).max().item()
             print(f"    din(d)        max rel {rd:.4g} "
                   f"{'<-- BAD (chain input dirty)' if rd > 5e-2 else '(clean)'}")
+        if "dloc" in e and "dloc" in g:
+            same = bool(torch.equal(e["dloc"][:n], g["dloc"][:n]))
+            print(f"    dloc(d)       {'MATCH' if same else 'DIFFER <-- draft KV write addressing wrong (shared-state poison candidate)'}")
         # Root-vs-draft split: with topk=1 the verify tree is a chain and
         # in_ids[0] is the LAST ACCEPTED token of the previous round
         # (accept_lens matched there), in_ids[1:] are this round's fresh

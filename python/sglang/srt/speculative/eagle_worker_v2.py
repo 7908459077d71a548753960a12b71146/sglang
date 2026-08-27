@@ -559,6 +559,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             _sel_coord.debug_capture_draft(
                 hidden_states=getattr(_spec_in, "hidden_states", None),
                 topk_index=getattr(_spec_in, "topk_index", None),
+                out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
             )
 
         with canary_outside_ctx:

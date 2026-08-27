@@ -304,7 +304,26 @@ accept_lens 首个发散 step = S
   - `hout_live(d-1)` 净 + `dext_out(d)` 坏 → 窗口 = verify sample 后到 draft-extend gather 前（含 draft-extend replay 自身写）
   - `dext_out(d)` 净 + `din(d)` 坏 → gather/select_index 路径
   - 全净但 draft 仍 NaN → 毒不在 hidden 链（draft KV/metadata）
-- **缓解实验（兼机制证明）**：`SGLANG_SELECTIVE_CLONE_HANDOFF=1` —— `_draft_extend_for_decode` 把 verify 输出 hidden **clone 出 graph pool** 再喂 draft-extend。若精度回 0.94 → aliasing 定案 + 立即可用的 workaround；正式修复方向为 hisparse 图内临时分配持久化 / 审查 draft/verify/draft-extend 三图 pool 共享。
+### 第六轮 dump 比对结论（2026-08-28，CLONE=1 跑）
+
+- **clone 把 hidden 交接链完全洗净**：din 在 step 2-9 全 ok（此前 dinBAD），三元组 hout_live(d-1)/dext_out(d)/din(d) max rel 全 0。
+- **但 draft 链仍从 step 0 NaN**（graph 侧 dstep nan=4 不变，提案仍退化为 0）→ **NaN 源在 draft 前向自身的其他输入**（draft KV / attention metadata / out_cache_loc），不在 hidden 交接。hidden-aliasing 作为 draft NaN 解释**降级**。
+- **eager 与 graph 精度同降 0.2**（模式无关回归；本轮跑法 = DIFF_DUMP=1 + CLONE=1）。来源待隔离（见矩阵）。
+- **重新定性**：垃圾 draft 提案本身不应伤贪心精度（verify 只接受匹配 token；accept_len=1 时输出仍由 root 行 target argmax 决定）→ 0.90↔0.94 差距与双降更可能是**共享状态污染**（out_cache_loc 分配错 → KV 落位错 → draft 读垃圾 NaN、target 读错位 KV 劣化）。draft NaN 可能是同毒异症。
+
+### 隔离矩阵（下一步跑，定双降来源）
+
+CLONE 即 `SGLANG_SELECTIVE_CLONE_HANDOFF=1`（`_draft_extend_for_decode` 把 verify 输出 hidden clone 出 graph pool 再喂 draft-extend；两模式共享该路径）；DIFF_DUMP 即 `SGLANG_SELECTIVE_DIFF_DUMP=1`（全套探针）。
+
+| 跑法 | DIFF_DUMP | CLONE | 判定 |
+|---|---|---|---|
+| B（先跑） | 0 | 0 | 应回 0.94/0.90；若仍 -0.2 → 与本轮代码无关（环境/跑法） |
+| C | 0 | 1 | B 好而 C 坏 → clone 引入（两模式共享该路径） |
+| A | 1 | 0 | B 好而 A 坏 → 探针引入；同时拿 dloc 数据 |
+
+### 第六轮探针（round-6，已埋点）
+
+`dloc`：draft() 执行前捕获 `forward_batch.out_cache_loc`（draft KV 写址，精确比对）。verdict 链输出新增 dloc MATCH/DIFFER——DIFFER 即共享状态污染实锤（draft KV 落位错），同时是精度差距的机制候选。
 
 ### 第五轮探针（已埋点待跑）
 

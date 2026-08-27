@@ -780,6 +780,10 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_dext_out = torch.zeros(
                 T, dtype=torch.float32, device=self.device
             )
+            # Round-6: draft KV write addressing per round (exact compare).
+            self._dbg_dloc = torch.zeros(
+                T, dtype=torch.int64, device=self.device
+            )
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg} "
@@ -1361,6 +1365,7 @@ class NPUSelectiveHiSparseCoordinator:
         draft_tokens: Optional[torch.Tensor] = None,
         parent_list: Optional[torch.Tensor] = None,
         top_scores_index: Optional[torch.Tensor] = None,
+        out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """D1 round-4/5: bracket the NEXTN draft chain per verify round.
 
@@ -1409,6 +1414,17 @@ class NPUSelectiveHiSparseCoordinator:
             if t > 0:
                 self._dbg_dout_score[:t].copy_(
                     top_scores_index.reshape(-1)[:t].to(torch.int64)
+                )
+        # Round-6: the draft's KV write addressing. Junk proposals alone
+        # should not hurt greedy accuracy — a shared-state poison (wrong
+        # out_cache_loc → KV landed in wrong slots → draft reads garbage
+        # and NaNs, target reads displaced KV and degrades) is the leading
+        # explanation for BOTH the draft NaN and the accuracy gap.
+        if out_cache_loc is not None:
+            t = min(out_cache_loc.numel(), self.tcap)
+            if t > 0:
+                self._dbg_dloc[:t].copy_(
+                    out_cache_loc.reshape(-1)[:t].to(torch.int64)
                 )
 
     def debug_capture_dext_out(self, hidden_states: Optional[torch.Tensor]):
@@ -1819,6 +1835,8 @@ class NPUSelectiveHiSparseCoordinator:
                     "hout_live": self._dbg_hout[:_n_st].cpu(),
                     # Round-5b draft-extend output read (see _dbg_dext_out)
                     "dext_out": self._dbg_dext_out[:_n_st].cpu(),
+                    # Round-6 draft KV write addressing (exact compare)
+                    "dloc": self._dbg_dloc[:_n_st].cpu(),
                 }
                 torch.save(
                     state,
