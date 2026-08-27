@@ -243,3 +243,15 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 #     --gsp-question-len 1280 \
 #     --gsp-output-len 1000 \
 #     --warmup-requests 4
+
+# ============================================================================
+#
+# ---------- Prefill 节点 (141.61.49.198) ----------
+# bash pd_disaggregation_dram_offload.sh
+#
+# ---------- Decode 节点 (141.61.49.195) ----------
+# graph:
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph5 SGLANG_SELECTIVE_DUMP_MAX_STEPS=20 bash pd_disaggregation_dram_offload.sh
+#
+# eager:
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager5 SGLANG_SELECTIVE_DUMP_MAX_STEPS=20 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
