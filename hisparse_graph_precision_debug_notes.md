@@ -280,12 +280,18 @@ accept_lens 首个发散 step = S
 - **draft 链第 3 个提案位发散**，且 graph 侧提案为 token 0（疑似 logits 退化/被清零的征兆）。
 - 待 draft 字段（din/dout/dstep）跑出后定：交接态偏 vs draft 前向偏 vs 树拼装偏。
 
-### 第五轮 dump 比对结论（2026-08-28）
+### 第五轮 dump 比对结论（2026-08-28，旧 dump 重析）
 
-- 首发散轮（本轮为 step 2）：root 吻合，draft 提案 slot[2][3][4] 偏（graph 侧退化为 0）。
-- **`din_hidden` 偏 + dstep logits/hidden rel = nan**（steps 0-3 全 nan，未写过的 steps 4-7 双侧零吻合）→ 某侧 draft logits 含 NaN（graph 侧概率大，与提案退化为 token 0 吻合）。
-- 重要修正：round-4 的 din 读取位置在 draft 执行**之后**——读到的可能是 draft graph replay 改写后的 pool 内容。因此「din 偏」的另一解读：**verify 输出 hidden（graph pool 张量）在 draft replay 期间被覆写（pool aliasing）**，draft 读到垃圾→NaN→提案 0。该假设与全部已知事实自洽：E3（无 hisparse）干净、target in-graph frozen 逐层吻合、logits 活读（sample 时）吻合、坏值只出现在"replay 之后才读"的张量上。
-- 嫌疑机制（待证）：hisparse 在 verify 图内的额外分配（每 selected 层的 `out_padded = out.new_zeros(...)` 等 in-graph temp）加剧 graph pool 布局churn，导致 verify 输出 hidden 在仍被引用期间被后续分配（draft graph temp / 下一轮 replay temp）覆写。
+- **NaN 归属定案**：graph 侧 dstep_logits/dstep_hidden 各 4 个 NaN（= 全部 4 个已写 step，每步 1 个），eager 侧全 0；`din_hidden` 双侧无 NaN 仅数值不同。
+- **pre-div step 1 verify 全净**（含 final-hidden row）→ verify 侧至此彻底洗清。
+- slot[1]（链初始提案，来自上轮交接）吻合 + 链内 4 步输出全崩为 0 → **draft 前向从 step 0 就 NaN**。
+- 综合：handoff hidden（graph pool 张量）在 draft replay 期间内容已变（post-read 无 NaN 但数值不同 → 同一地址在 replay 过程中被写过）。**pool aliasing 假设当前最优**：hisparse 在 verify 图内的大量临时分配（build_loc_plan 的 where/arange、patch 的 gather、unpack 链、sort 等，每 replay 数百次）加剧 graph pool churn，verify 输出 hidden 在仍被 draft 引用时被覆写。
+
+### 第五轮补充判定（analyzer 已扩展）
+
+- pre-div 轮 hidden 全行 + in_ids 对比（已上，本轮"match (final-hidden row ok)"即出自它）。
+- NaN/Inf 归属表（已上）。
+- `din_topk`（链初始提案输入）vs `din_hidden`：**din_topk 同 + din_hidden 偏 = hidden 张量专属污染（pool aliasing 签名）**；两者都偏 = 交接态整体污染。
 
 ### 第五轮探针（已埋点待跑）
 

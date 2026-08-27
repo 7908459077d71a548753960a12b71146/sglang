@@ -277,6 +277,13 @@ def compare_state(args, first_fp_div):
                 dtoks_bad = not torch.equal(
                     e["dout_toks"][:dn], g["dout_toks"][:dn]
                 )
+                din_topk_bad = (
+                    not torch.equal(e["din_topk"][:dn], g["din_topk"][:dn])
+                ) if "din_topk" in e and "din_topk" in g else None
+                if din_bad and not din_topk_bad:
+                    print("     din_hidden DIFFERS but din_topk (initial "
+                          "proposal) matches: corruption specific to the "
+                          "hidden TENSOR — graph-pool aliasing signature")
                 if din_bad:
                     print("     din_hidden DIFFERS: the handoff INTO the "
                           "draft is already wrong (previous verify "
