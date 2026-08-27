@@ -772,6 +772,14 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_hout = torch.zeros(
                 T, dtype=torch.float32, device=self.device
             )
+            # Round-5b: LIVE read of the draft-extend graph's OUTPUT hidden
+            # right after its replay, before the select_index gather that
+            # produces the next chain's (fresh) input hidden. din(k+1) is a
+            # gather product — if it is dirty, the source was dirty HERE
+            # (or upstream at the verify output that fed draft-extend).
+            self._dbg_dext_out = torch.zeros(
+                T, dtype=torch.float32, device=self.device
+            )
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg} "
@@ -1403,6 +1411,21 @@ class NPUSelectiveHiSparseCoordinator:
                     top_scores_index.reshape(-1)[:t].to(torch.int64)
                 )
 
+    def debug_capture_dext_out(self, hidden_states: Optional[torch.Tensor]):
+        """D1 round-5b: draft-extend graph output hidden, live read.
+
+        Called right after the draft-extend replay and before the
+        select_index gather — the gather's source. See _dbg_dext_out.
+        """
+        if not self._dbg_dump or hidden_states is None:
+            return
+        t = min(hidden_states.shape[0], self.tcap)
+        if t <= 0:
+            return
+        self._dbg_dext_out[:t].copy_(
+            hidden_states[:t].reshape(t, -1).sum(dim=-1, dtype=torch.float32)
+        )
+
     def debug_capture_draft_step(
         self,
         step: int,
@@ -1794,6 +1817,8 @@ class NPUSelectiveHiSparseCoordinator:
                     ].cpu(),
                     # Round-5 live handoff read (see _dbg_hout comment)
                     "hout_live": self._dbg_hout[:_n_st].cpu(),
+                    # Round-5b draft-extend output read (see _dbg_dext_out)
+                    "dext_out": self._dbg_dext_out[:_n_st].cpu(),
                 }
                 torch.save(
                     state,

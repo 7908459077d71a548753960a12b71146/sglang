@@ -245,6 +245,33 @@ def compare_state(args, first_fp_div):
                 gn, gi = _nan_inf(g[fld])
                 print(f"    {fld:14s}: eager nan/inf={en}/{ei}, "
                       f"graph nan/inf={gn}/{gi}")
+        # Handoff chain for this round's bad draft input: verify(d-1)
+        # output (live, at sample) -> draft-extend(d-1) output (live, at
+        # gather) -> this round's chain input din (fresh gather product).
+        # state file k holds dext_out from round k-1's draft-extend, so the
+        # source for din(d) lives in state d (same file), hout_live for the
+        # verify that fed it lives in state d-1.
+        if first_fp_div is not None and (first_fp_div - 1) in erecs \
+                and (first_fp_div - 1) in grecs:
+            ep, gp = erecs[first_fp_div - 1], grecs[first_fp_div - 1]
+            if "hout_live" in ep and "hout_live" in gp:
+                rd = rel_diff(
+                    ep["hout_live"][:n].float(), gp["hout_live"][:n].float()
+                ).max().item()
+                print(f"    hout_live(d-1) max rel {rd:.4g} "
+                      f"{'<-- BAD (verify output already dirty at sample)' if rd > 5e-2 else '(clean)'}")
+        if "dext_out" in e and "dext_out" in g:
+            rd = rel_diff(
+                e["dext_out"][:n].float(), g["dext_out"][:n].float()
+            ).max().item()
+            print(f"    dext_out(d)   max rel {rd:.4g} "
+                  f"{'<-- BAD (draft-extend output/source dirty)' if rd > 5e-2 else '(clean)'}")
+        if "din_hidden" in e and "din_hidden" in g:
+            rd = rel_diff(
+                e["din_hidden"][:n].float(), g["din_hidden"][:n].float()
+            ).max().item()
+            print(f"    din(d)        max rel {rd:.4g} "
+                  f"{'<-- BAD (chain input dirty)' if rd > 5e-2 else '(clean)'}")
         # Root-vs-draft split: with topk=1 the verify tree is a chain and
         # in_ids[0] is the LAST ACCEPTED token of the previous round
         # (accept_lens matched there), in_ids[1:] are this round's fresh

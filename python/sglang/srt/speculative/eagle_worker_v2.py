@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import List, Optional
@@ -977,8 +978,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
+        # [hisparse aliasing mitigation] The verify graph's output hidden
+        # lives in the (shared) graph memory pool; diff-dumps showed it can
+        # be overwritten while still referenced (draft chain NaNs). Cloning
+        # at this boundary pulls the handoff out of the pool before the
+        # next replays can stomp it. Env-gated experiment.
+        _handoff_hidden = batch_result.logits_output.hidden_states
+        if (
+            os.getenv("SGLANG_SELECTIVE_CLONE_HANDOFF", "0") == "1"
+            and _handoff_hidden is not None
+        ):
+            _handoff_hidden = _handoff_hidden.clone()
         draft_extend_input = EagleDraftExtendInput(
-            hidden_states=batch_result.logits_output.hidden_states,
+            hidden_states=_handoff_hidden,
             # accept_lens includes the bonus token; correct drafts exclude it.
             num_correct_drafts=batch_result.accept_lens - 1,
             num_accept_tokens=batch_result.accept_lens,
@@ -1076,6 +1088,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
+        # D1 round-5b: live read of the draft-extend output hidden right
+        # before the select_index gather (the gather produces a fresh
+        # tensor, so a dirty next-chain din means this SOURCE was dirty).
+        _sel_coord_dext = getattr(
+            self.target_worker.model_runner,
+            "npu_selective_hisparse_coordinator",
+            None,
+        )
+        if (
+            _sel_coord_dext is not None
+            and not batch.forward_mode.is_idle()
+        ):
+            _sel_coord_dext.debug_capture_dext_out(
+                draft_logits_output.hidden_states
+            )
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
         ]

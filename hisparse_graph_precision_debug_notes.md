@@ -293,6 +293,19 @@ accept_lens 首个发散 step = S
 - NaN/Inf 归属表（已上）。
 - `din_topk`（链初始提案输入）vs `din_hidden`：**din_topk 同 + din_hidden 偏 = hidden 张量专属污染（pool aliasing 签名）**；两者都偏 = 交接态整体污染。
 
+### 第五轮重析结论（2026-08-28）
+
+**`din_topk` 吻合 + `din_hidden` 偏 → aliasing 签名命中**（hidden 张量专属污染）。链条结构理清：verify → **draft-extend**（batch 2，独立 graph）→ 下一轮 draft 链；下一轮 din 是 draft-extend 输出经 fancy-index gather 的**新张量**，其脏只能来自 gather 源（draft-extend 图输出 pool 张量）或更上游 verify 输出在 draft-extend 读它时已脏。
+
+### 第五轮 b：dext_out 探针 + clone 缓解实验（已埋点待跑）
+
+- **探针**：`hout_live`（verify 输出，sample 后活读）、`dext_out`（draft-extend 输出，gather 前活读）、`din`（draft 执行前读）——analyzer 在首发散轮打印三元组链并判定污染窗口：
+  - `hout_live(d-1)` 坏 → verify 输出在 sample 读时已脏
+  - `hout_live(d-1)` 净 + `dext_out(d)` 坏 → 窗口 = verify sample 后到 draft-extend gather 前（含 draft-extend replay 自身写）
+  - `dext_out(d)` 净 + `din(d)` 坏 → gather/select_index 路径
+  - 全净但 draft 仍 NaN → 毒不在 hidden 链（draft KV/metadata）
+- **缓解实验（兼机制证明）**：`SGLANG_SELECTIVE_CLONE_HANDOFF=1` —— `_draft_extend_for_decode` 把 verify 输出 hidden **clone 出 graph pool** 再喂 draft-extend。若精度回 0.94 → aliasing 定案 + 立即可用的 workaround；正式修复方向为 hisparse 图内临时分配持久化 / 审查 draft/verify/draft-extend 三图 pool 共享。
+
 ### 第五轮探针（已埋点待跑）
 
 1. `hout_live`：on_verify_result（eagle_sample 后）活读 `logits_output.hidden_states` rowsum。**run 内**与 in-graph frozen `hidden[-1]` 对照：不一致 → replay 后被覆写（aliasing 实锤）；跨 run 在 pre-div 轮对照。
