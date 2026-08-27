@@ -249,16 +249,12 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- 隔离矩阵（当前轮: 定 eager/graph 双降 0.2 的来源）----------
-# 跑法 B（基线锚点, 两个开关都不开; 应回 0.94/0.90, 若仍 -0.2 则与本轮代码无关）:
-# bash pd_disaggregation_dram_offload.sh
+# ---------- Round-7 dump 跑（dump 开 + clone 关; 含 dloc/dkvh/dseql 探针）----------
+# 判定: dkvh DIFFER -> draft KV 内容被污染(NaN 源); dseql DIFFER -> seq_lens 漂移;
+#       两者 MATCH -> 剩 draft attention metadata 图内路径, 下轮进 draft 模型内部
+# graph:
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_graph10 SGLANG_SELECTIVE_DUMP_MAX_STEPS=20 bash pd_disaggregation_dram_offload.sh
 #
-# 跑法 C（只开 clone; B 好而 C 坏 -> clone 引入回归）:
-# SGLANG_SELECTIVE_CLONE_HANDOFF=1 bash pd_disaggregation_dram_offload.sh
-#
-# 跑法 A（只开 dump; B 好而 A 坏 -> 探针引入回归; 同时拿 dloc/KV 写址数据）:
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_graph9 SGLANG_SELECTIVE_DUMP_MAX_STEPS=20 bash pd_disaggregation_dram_offload.sh
-#
-# eager 对照侧（配跑法 A 时用, 同目录前缀便于比对）:
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager9 SGLANG_SELECTIVE_DUMP_MAX_STEPS=20 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager9 --graph-dir /root/hisparse_graph9
+# eager:
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager10 SGLANG_SELECTIVE_DUMP_MAX_STEPS=20 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager10 --graph-dir /root/hisparse_graph10

@@ -275,6 +275,12 @@ def compare_state(args, first_fp_div):
         if "dloc" in e and "dloc" in g:
             same = bool(torch.equal(e["dloc"][:n], g["dloc"][:n]))
             print(f"    dloc(d)       {'MATCH' if same else 'DIFFER <-- draft KV write addressing wrong (shared-state poison candidate)'}")
+        if "dkvh" in e and "dkvh" in g:
+            same = bool(torch.equal(e["dkvh"][:n], g["dkvh"][:n]))
+            print(f"    dkvh(d)       {'MATCH' if same else 'DIFFER <-- draft KV history CONTENT poisoned (the NaN source candidate)'}")
+        if "dseql" in e and "dseql" in g:
+            same = bool(torch.equal(e["dseql"][:n], g["dseql"][:n]))
+            print(f"    dseql(d)      {'MATCH' if same else 'DIFFER <-- draft seq_lens drift (attention metadata candidate)'}")
         # Root-vs-draft split: with topk=1 the verify tree is a chain and
         # in_ids[0] is the LAST ACCEPTED token of the previous round
         # (accept_lens matched there), in_ids[1:] are this round's fresh

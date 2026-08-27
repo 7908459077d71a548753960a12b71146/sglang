@@ -311,15 +311,21 @@ accept_lens 首个发散 step = S
 - **eager 与 graph 精度同降 0.2**（模式无关回归；本轮跑法 = DIFF_DUMP=1 + CLONE=1）。来源待隔离（见矩阵）。
 - **重新定性**：垃圾 draft 提案本身不应伤贪心精度（verify 只接受匹配 token；accept_len=1 时输出仍由 root 行 target argmax 决定）→ 0.90↔0.94 差距与双降更可能是**共享状态污染**（out_cache_loc 分配错 → KV 落位错 → draft 读垃圾 NaN、target 读错位 KV 劣化）。draft NaN 可能是同毒异症。
 
-### 隔离矩阵（下一步跑，定双降来源）
+### 第六轮 b：跑法 A 结果（2026-08-28，DIFF_DUMP=1、CLONE=0）
 
-CLONE 即 `SGLANG_SELECTIVE_CLONE_HANDOFF=1`（`_draft_extend_for_decode` 把 verify 输出 hidden clone 出 graph pool 再喂 draft-extend；两模式共享该路径）；DIFF_DUMP 即 `SGLANG_SELECTIVE_DIFF_DUMP=1`（全套探针）。
+- **精度：eager 0.92（≈0.94 噪声带内）、graph 0.90（不变）→ diff-dump 探针基本无损**；此前 -0.2 双降主嫌收敛到 CLONE（B/C 跑法可最终确认，优先级降低）。
+- **dloc MATCH** → draft KV 写址排除。
+- 无 clone 本轮 din 却干净（上轮无 clone 时 dinBAD）→ **din 污染是布局/时序敏感的边缘现象，非稳定根因**。
+- 不变核心：graph draft 链 step 0 起 NaN、提案退化为 0；draft 已查输入（token/hidden/topk/写址/positions）全净。
+- 剩余嫌疑（round-7 目标）：**draft KV 历史内容**（写址对内容错——垃圾 fp8 解码出 inf/NaN 完全符合症状）与 **draft attention metadata（seq_lens）**。
 
-| 跑法 | DIFF_DUMP | CLONE | 判定 |
-|---|---|---|---|
-| B（先跑） | 0 | 0 | 应回 0.94/0.90；若仍 -0.2 → 与本轮代码无关（环境/跑法） |
-| C | 0 | 1 | B 好而 C 坏 → clone 引入（两模式共享该路径） |
-| A | 1 | 0 | B 好而 A 坏 → 探针引入；同时拿 dloc 数据 |
+### Round-7 探针（已埋点待跑）
+
+`dkvh`（draft KV 历史内容：每请求按 req_to_token 读全部历史 slots 的字节和，链执行前）+ `dseql`（每请求 seq_lens，精确比对）。verdict 链新增两行判定；都 MATCH 则下轮进 draft 模型内部（attention 输出 vs FFN 输出二分）。
+
+### 启动命令规则
+
+**每次试验后必须刷新 `pd_disaggregation_dram_offload.sh` 末尾的启动命令**（含当次 dump 目录/开关/比对命令）。当前尾部 = round-7 跑法（graph10/eager10）。
 
 ### 第六轮探针（round-6，已埋点）
 

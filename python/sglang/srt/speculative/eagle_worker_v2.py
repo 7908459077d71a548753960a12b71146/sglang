@@ -561,6 +561,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 topk_index=getattr(_spec_in, "topk_index", None),
                 out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
             )
+            # Round-7: draft KV history content + seq_lens fingerprints
+            # (the chain's remaining unprobed inputs).
+            _sel_coord.debug_capture_draft_kv_hist(
+                draft_pool=self.draft_runner.token_to_kv_pool,
+                req_to_token_pool=self.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+            )
 
         with canary_outside_ctx:
             # Run draft

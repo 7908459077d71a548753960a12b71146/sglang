@@ -784,6 +784,17 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_dloc = torch.zeros(
                 T, dtype=torch.int64, device=self.device
             )
+            # Round-7: the draft chain's remaining unprobed inputs — its KV
+            # history CONTENT (per-request byte-sum over req_to_token slots
+            # at chain start; dloc proved addressing matches, this proves
+            # content) and the per-request seq_lens the draft attention
+            # metadata is built from.
+            self._dbg_dkvh = torch.zeros(
+                T, dtype=torch.int64, device=self.device
+            )
+            self._dbg_dseql = torch.zeros(
+                T, dtype=torch.int64, device=self.device
+            )
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg} "
@@ -1442,6 +1453,50 @@ class NPUSelectiveHiSparseCoordinator:
             hidden_states[:t].reshape(t, -1).sum(dim=-1, dtype=torch.float32)
         )
 
+    def debug_capture_draft_kv_hist(
+        self,
+        draft_pool,
+        req_to_token_pool,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ):
+        """D1 round-7: draft KV history content + seq_lens fingerprints.
+
+        Called from EagleWorkerV2.draft() before execution. The chain's
+        token/hidden/topk/write-loc inputs are proven clean while it still
+        NaNs from step 0 in graph mode — the remaining suspects are the KV
+        it ATTENDS over (content, not addressing) and the seq_lens its
+        attention metadata is built from. Best-effort: silently skipped
+        when the draft pool layout differs from the expected NPU DSA
+        k_buffer form.
+        """
+        if not self._dbg_dump:
+            return
+        try:
+            b = min(seq_lens.shape[0], self.tcap)
+            if b <= 0:
+                return
+            self._dbg_dseql[:b].copy_(
+                seq_lens[:b].to(torch.int64)
+            )
+            kb = getattr(draft_pool, "k_buffer", None)
+            r2t = getattr(req_to_token_pool, "req_to_token", None)
+            if kb is None or r2t is None or len(kb) == 0:
+                return
+            layer = kb[0]
+            flat = layer.reshape(layer.shape[0], -1)
+            for i in range(b):
+                slots = r2t[
+                    req_pool_indices[i].item(), : seq_lens[i].item()
+                ].to(torch.int64)
+                if slots.numel() == 0:
+                    continue
+                self._dbg_dkvh[i].copy_(
+                    flat[slots].view(torch.uint8).sum(dtype=torch.int64)
+                )
+        except Exception:
+            pass
+
     def debug_capture_draft_step(
         self,
         step: int,
@@ -1837,6 +1892,9 @@ class NPUSelectiveHiSparseCoordinator:
                     "dext_out": self._dbg_dext_out[:_n_st].cpu(),
                     # Round-6 draft KV write addressing (exact compare)
                     "dloc": self._dbg_dloc[:_n_st].cpu(),
+                    # Round-7 draft KV history content + seq_lens
+                    "dkvh": self._dbg_dkvh[:_n_st].cpu(),
+                    "dseql": self._dbg_dseql[:_n_st].cpu(),
                 }
                 torch.save(
                     state,
