@@ -1206,6 +1206,8 @@ class NPUSelectiveHiSparseCoordinator:
             return
         _si = self._layer_scratch_index[layer_id]
         t = min(cache_k.shape[0], self.tcap)
+        if t <= 0:
+            return
         self._dbg_kin_all[_si, :t].copy_(
             cache_k[:t].reshape(t, -1).sum(
                 dim=-1, dtype=torch.float32
@@ -1233,7 +1235,11 @@ class NPUSelectiveHiSparseCoordinator:
         """
         if not self._dbg_dump:
             return
+        # Idle DP batches carry zero tokens; reshape(t, -1) on an empty
+        # tensor is ambiguous and raises — skip instead.
         t = min(hidden_states.shape[0], self.tcap)
+        if t <= 0:
+            return
         self._dbg_hidden_all[0, :t].copy_(
             hidden_states[:t].reshape(t, -1).sum(dim=-1, dtype=torch.float32)
         )
@@ -1260,6 +1266,8 @@ class NPUSelectiveHiSparseCoordinator:
         if row >= self._dbg_hidden_all.shape[0]:
             return
         t = min(hidden_states.shape[0], self.tcap)
+        if t <= 0:
+            return
         self._dbg_hidden_all[row, :t].copy_(
             hidden_states[:t].reshape(t, -1).sum(dim=-1, dtype=torch.float32)
         )
@@ -1280,6 +1288,8 @@ class NPUSelectiveHiSparseCoordinator:
             return
         row = min(layer_id, self._dbg_rkv_all.shape[0] - 1)
         t = min(loc.shape[0], self.tcap)
+        if t <= 0:
+            return
         self._dbg_rloc_all[row, :t].copy_(loc[:t].to(torch.int64))
         self._dbg_rkv_all[row, :t].copy_(
             packed_bytes[:t].sum(dim=-1, dtype=torch.int64)
