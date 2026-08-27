@@ -8,6 +8,7 @@ for the GLM-5.2 NPU selective HiSparse feature.  See design document
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import threading
@@ -657,9 +658,43 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_pos_all = torch.zeros(
                 _n_dbg, T, dtype=torch.int64, device=self.device
             )
+            # d2h_locs — the D2H write addressing (logical_locs from the KV
+            # pool's write loc, as consumed by the backup DMA descriptor
+            # d2h_dst). The remaining top suspect is Host-pool pollution: D2H
+            # racing the next publish's scratch overwrite or writing stale
+            # locs poisons the slots a LATER forward's H2D reads. locs (H2D
+            # read side) vs d2h_locs (D2H write side) closes the loop.
+            self._dbg_d2h_locs_all = torch.zeros(
+                _n_dbg, T, dtype=torch.int64, device=self.device
+            )
+            # qrope — q_rope rowsum (q capture only covered q_nope). Recent
+            # cos/sin recompute changes make the RoPE path a live suspect: q
+            # matching eager while qrope differs localizes divergence to the
+            # rotary branch, invisible to every other field.
+            self._dbg_qrope_all = torch.zeros(
+                _n_dbg, T, dtype=torch.float32, device=self.device
+            )
+            # unpk/unpkr — post-dequant unpack chain outputs (bf16 K rowsums,
+            # float32-accumulated). stg_post covers SFA's raw uint8 input and
+            # out covers its output; a stg_post match with out mismatch is
+            # ambiguous between the unpack chain and the SFA kernel itself.
+            # These two split that box.
+            self._dbg_unpk_all = torch.zeros(
+                _n_dbg, T, dtype=torch.float32, device=self.device
+            )
+            self._dbg_unpkr_all = torch.zeros(
+                _n_dbg, T, dtype=torch.float32, device=self.device
+            )
+            # accept_lens records (host side, written by on_verify_result,
+            # flushed as accept_stepNNNN.json): the fastest first-divergent-
+            # step signal when aligning an eager run against a graph run.
+            self._dbg_accept_step = 0
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
-                f"max_steps={self._dbg_max_steps} layers={_n_dbg}"
+                f"max_steps={self._dbg_max_steps} layers={_n_dbg} "
+                f"fields=locs,valid,stg_pre,stg_post,q,qrope,out,pkg,crow,"
+                f"allv,pub,kin,kinv,pos,d2h_locs,unpk,unpkr,scalars,"
+                f"d2h_rb,accept"
             )
         else:
             self._dbg_dump = False
@@ -1036,6 +1071,15 @@ class NPUSelectiveHiSparseCoordinator:
                     dim=-1, dtype=torch.int64
                 )
             )
+            # D2H write addressing as the backup DMA will consume it
+            # (graph: captured op → per-replay actual locs). Cross-check
+            # against the H2D read side (_dbg_locs_all): if d2h_locs match
+            # eager but a LATER step's H2D reads poisoned slots, the pool
+            # was polluted by content (D2H raced a scratch overwrite), not
+            # addressing.
+            self._dbg_d2h_locs_all[_si_pub, :T].copy_(
+                logical_locs[:T].to(torch.int64)
+            )
 
         # Eager mode syncs the device-side real-token count (harmless
         # bookkeeping, see maybe_start_prefetch). Graph mode reads the
@@ -1197,6 +1241,7 @@ class NPUSelectiveHiSparseCoordinator:
             "stg_pre": self._dbg_stg_pre_all[:, :n].cpu(),
             "stg_post": self._dbg_stg_post_all[:, :n].cpu(),
             "q": self._dbg_q_all[:, :n].cpu(),
+            "qrope": self._dbg_qrope_all[:, :n].cpu(),
             "out": self._dbg_out_all[:, :n].cpu(),
             "pkg": self._dbg_pkg_all[:, :n].cpu(),
             "crow": self._dbg_crow_all[:, :n].cpu(),
@@ -1205,7 +1250,36 @@ class NPUSelectiveHiSparseCoordinator:
             "kin": self._dbg_kin_all[:, :n].cpu(),
             "kinv": self._dbg_kinv_all[:, :n].cpu(),
             "pos": self._dbg_pos_all[:, :n].cpu(),
+            "d2h_locs": self._dbg_d2h_locs_all[:, :n].cpu(),
+            "unpk": self._dbg_unpk_all[:, :n].cpu(),
+            "unpkr": self._dbg_unpkr_all[:, :n].cpu(),
+            # Replay-time DMA scalars (post-replay values: snapshot runs
+            # before the next prepare_graph_replay can overwrite them). A
+            # wrong real_num_tokens from the runner shows up here directly
+            # as h2d_cnt/d2h_cnt diverging from the eager trajectory.
+            "real_tokens": int(self._selective_real_tokens.item()),
+            "h2d_cnt": int(self.h2d_cnt.item()),
+            "d2h_cnt": int(self.d2h_cnt.item()),
         }
+        # Host-pool readback at this step's D2H write locs — the ground
+        # truth of what the backup DMA landed in DRAM (a later forward's
+        # H2D reads exactly these slots). Graph mode: the replay is fully
+        # synced by the .cpu() calls above and the D2H is an in-graph MIX
+        # kernel on the compute queue, so its writes are visible. Eager
+        # mode: D2H is async on backup_stream — drain first or the readback
+        # races the in-flight copy.
+        if mode == "eager":
+            self.drain_all()
+        d2h_rows = self._dbg_d2h_locs_all[:, :n].cpu()
+        d2h_rb = torch.zeros(
+            len(self.selected_layer_ids_sorted), n, dtype=torch.int64
+        )
+        for _rb_i, _rb_lid in enumerate(self.selected_layer_ids_sorted):
+            _rb_view = self.pool.get_host_tensor(_rb_lid)
+            d2h_rb[_rb_i] = _rb_view[d2h_rows[_rb_i]].sum(
+                dim=-1, dtype=torch.int64
+            )
+        snap["d2h_rb"] = d2h_rb
         path = os.path.join(
             self._dbg_dir, f"{mode}_dev{dev}_step{step:04d}.pt"
         )
@@ -1296,6 +1370,11 @@ class NPUSelectiveHiSparseCoordinator:
                     dim=-1, dtype=torch.float32
                 )
             )
+            self._dbg_qrope_all[_si_dbg, :T].copy_(
+                q_rope[:T].reshape(T, -1).sum(
+                    dim=-1, dtype=torch.float32
+                )
+            )
             self._dbg_pkg_all[_si_dbg, :T].copy_(
                 packed.sum(dim=-1, dtype=torch.int64)
             )
@@ -1341,6 +1420,12 @@ class NPUSelectiveHiSparseCoordinator:
         # selected layers are 4 apart, so a set is reused only 4 layers
         # later, after its reader's SFA has long retired.
         _ws = self._layer_scratch_index[layer_id] % self._n_ws
+        if self._dbg_dump:
+            _dbg_k_sum = self._dbg_unpk_all[_si_dbg, :T]
+            _dbg_kr_sum = self._dbg_unpkr_all[_si_dbg, :T]
+        else:
+            _dbg_k_sum = None
+            _dbg_kr_sum = None
         out = selective_sparse_attention(
             q_nope=q_nope[:T],
             q_rope=q_rope[:T],
@@ -1358,6 +1443,8 @@ class NPUSelectiveHiSparseCoordinator:
             fp8_nope_buf=self.fp8_nope_buf_all[_ws],
             scales_buf=self.scales_buf_all[_ws],
             graph_mode=self._graph_mode,
+            dbg_unpack_k_sum=_dbg_k_sum,
+            dbg_unpack_k_rope_sum=_dbg_kr_sum,
         )
 
         # 5. Release staging
@@ -1409,6 +1496,25 @@ class NPUSelectiveHiSparseCoordinator:
         accept_index: torch.Tensor,
     ):
         """Called after eagle_sample returns. Records debug metrics."""
+        # D1: per-step accept lengths — the first step where the graph run's
+        # accept pattern leaves the eager run's marks where the OUTPUT
+        # diverges, without any logits dump. Step numbering matches
+        # dump_diff_snapshot (both count non-idle verify rounds).
+        if self._dbg_dump:
+            self._dbg_accept_step += 1
+            if self._dbg_accept_step <= self._dbg_max_steps:
+                accept_path = os.path.join(
+                    self._dbg_dir,
+                    f"accept_step{self._dbg_accept_step:04d}.json",
+                )
+                with open(accept_path, "w") as f:
+                    json.dump(
+                        {
+                            "step": self._dbg_accept_step,
+                            "accept_lens": accept_lens.tolist(),
+                        },
+                        f,
+                    )
         B = accept_lens.shape[0]
         logger.debug(
             f"Selective HiSparse verify result: B={B}, "

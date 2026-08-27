@@ -3,6 +3,8 @@
 > 交接文档。问题：P/D 分离 + Selective HiSparse（19 个 selected 层 KV 驻留 Host DRAM）部署 GLM-5.2 时，D 节点 decode 开启 NPU graph 后精度随 selected 层数线性劣化（7 层 0.90-0.96 → 19 层 0.74-0.82；eager 锚点 0.94）。
 >
 > **最终状态（2026-08-27）：CASE CLOSED，全部收尾完成。** 根因 = RoPE cos/sin 图捕获冻结（第三个根因，见 §4）。修复后 19 层 50 题 **0.90**，层数线性劣化机制消除。前两个根因（kernel 队列类型、ACL 回调订阅，见 §3）是更早阶段 0.7→0.9 的真实修复，仍然有效。completion-flag 协议三步退役（§5）全部完成并逐一复验 0.90。
+>
+> **补注（2026-08-28）**：第二轮 diff-dump 探针扩展已落地（见 §7），作为后续任何精度回归的定位工具备用。
 
 ## 1. 背景与架构
 
@@ -178,3 +180,39 @@ python -m sglang.test.few_shot_gsm8k --host http://141.61.49.198 --port 6688 \
 | **graph 19 层（step-3：memfabric 算子删除，最终形态）** | **0.90** |
 
 判读规则：±3pt 为噪声波段；关键结论需复测。
+
+## 7. 第二轮 dump 点扩展（2026-08-28，待跑）
+
+针对此前剩余嫌疑（torch 向量算子与 MIX copy 的跨队列竞态）及代码走读新发现的暗箱，在 D1 diff-dump 上扩展了 6 类探针。开关不变：`SGLANG_SELECTIVE_DIFF_DUMP=1`（+ 可选 `SGLANG_SELECTIVE_DUMP_DIR`、`SGLANG_SELECTIVE_DUMP_MAX_STEPS`），eager/graph 各跑一次同数据集，逐字段对齐比对。
+
+### 新增探针清单
+
+| 字段 | 采集点 | 针对嫌疑 |
+|---|---|---|
+| `d2h_locs` [L,T] | `publish_new_packed_kv`（D2H 写址 logical_locs，graph 下 captured op） | Host pool 污染——写址本身错位（与 `locs`（H2D 读址）闭环） |
+| `d2h_rb` [L,T] | `dump_diff_snapshot` 内 Host pool 按本轮 d2h_locs 回读（eager 先 drain） | Host pool 污染——写址对但内容旧/错（D2H 与下一轮 scratch overwrite 竞态的铁证） |
+| `qrope` [L,T] | `run_selected_attention`（q_rope rowsum，此前只采 q_nope） | RoPE/cos-sin recompute（最近 `fix cos/sin recompute` 提交的活跃嫌疑） |
+| `unpk`/`unpkr` [L,T] | `selective_sparse_attention` 反量化完成后、SFA 前（captured op） | 拆分「unpack 链 vs SFA kernel」：stg_post 吻合但 out 偏离时的中间盲区 |
+| 标量 `real_tokens`/`h2d_cnt`/`d2h_cnt` | `dump_diff_snapshot` post-replay 读取 | runner 传入 real_num_tokens 错误 → DMA 提交错误条目数 |
+| `accept_stepNNNN.json` | `on_verify_result`（每 verify 轮 accept_lens） | 最快找到 eager/graph 输出首个发散 step（与 snapshot step 编号 1:1） |
+
+### 判读决策树（graph vs eager 逐字段比对）
+
+```
+accept_lens 首个发散 step = S
+ └─ step S 起逐层看：
+    pos/kin/kinv 偏 → 上游 KV 投影/RoPE 输入已错（图基础设施级）
+    kin/kinv 吻合 + pub 偏 → fp8 quant 在图内产出不同（captured-replay bug）
+    pub 吻合 + pkg 偏 → patch 读到旧 scratch（跨队列竞态实锤，疑点①）
+    locs/d2h_locs 偏 → topk 或 req_to_token 映射在图内错位
+    d2h_locs 吻合 + d2h_rb 偏 → D2H 读到被覆盖的 scratch（Host pool 污染实锤，疑点②）
+    q 偏 / qrope 偏 → Q 投影 / RoPE 分支（另一路独立于 KV 链路）
+    stg_pre 偏 → H2D 数据未落地即被消费 或 Host 读址内容已错（结合 d2h_rb 判定）
+    stg_pre/stg_post 吻合 + unpk 偏 → unpack 反量化链图内行为不同
+    全部吻合但 out 偏 → SFA kernel 自身（npu_sparse_flash_attention 图 replay 问题）
+```
+
+注意事项：
+- `stg_pre/stg_post/pkg/pub` 等 captured op 冻结的是**本轮 replay 消费时刻**的值（非 replay 后已自愈值），这是 D1 的核心机制，新探针沿用。
+- `d2h_rb` 依赖「stream sync ⇒ in-graph MIX D2H 对 Host 写可见」这一假设；若 graph 侧 d2h_rb 出现 eager 侧没有的偶发噪声，先怀疑该假设本身（本身就是有价值的发现）。
+- dump 只在前 `SGLANG_SELECTIVE_DUMP_MAX_STEPS`（默认 20）个非 idle verify 轮生效；比对时两侧用同数据集同并发（max-concurrency 1）。
