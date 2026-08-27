@@ -664,26 +664,11 @@ class NPUSelectiveHiSparseCoordinator:
         else:
             self._dbg_dump = False
 
-        # Completion-flag protocol for graph-mode DMA ordering (see
-        # mf_offload.sparse_copy_notify / wait_flag). Monotonic-count
-        # variant (no host participation per replay — magic bumps would be
-        # Python and frozen at capture): every sparse_copy_notify bumps
-        # flag[0] by exactly blockDim (64) once per AIV core, and the
-        # captured code pairs each submission with a captured
-        # ``expect[0] += 64`` op. wait_flag spins until
-        # count == expect; since count only grows and each submission
-        # matches one expect increment, a stale (earlier-round) count can
-        # never satisfy a later expect. Idle replays (cnt=0) still bump:
-        # the copy kernel notifies unconditionally, so the pairing stays
-        # 1:1. Flag buffers are int32[16]: the kernel's atomic add is a
-        # 32B-aligned DataCopy over 8 lanes (lane0=+1, rest 0) and a full
-        # 64B cacheline keeps dcci spin-reads isolated from neighbors.
-        self.h2d_flag = torch.zeros(16, dtype=torch.int32, device=self.device)
-        self.h2d_expect = torch.zeros(16, dtype=torch.int32, device=self.device)
-        self.d2h_flag = torch.zeros(16, dtype=torch.int32, device=self.device)
-        self.d2h_expect = torch.zeros(16, dtype=torch.int32, device=self.device)
-        # AIV block count used by the copy kernel (sparse_copy launches 64).
-        self._dma_flag_block_num = 64
+        # Step-2 (flag-mechanism retirement): the completion-flag protocol
+        # (sparse_copy_notify + wait_flag) is fully retired from this
+        # coordinator — graph-mode H2D/D2H both use the plain MIX
+        # sparse_copy, ordered before consumers by the compute-queue FIFO.
+        # Buffers removed with the protocol.
 
         persistent_buffers = (
             self.packed_staging_all,
@@ -708,10 +693,6 @@ class NPUSelectiveHiSparseCoordinator:
             self.d2h_dst_ptrs_all,
             self.d2h_lens_all,
             self.d2h_cnt,
-            self.h2d_flag,
-            self.h2d_expect,
-            self.d2h_flag,
-            self.d2h_expect,
         )
         total_mb = sum(buf.nbytes for buf in persistent_buffers) / (1024 * 1024)
         logger.info(
@@ -951,33 +932,19 @@ class NPUSelectiveHiSparseCoordinator:
                 if not self._graph_mode:
                     self.h2d_cnt.fill_(N)
 
-                # Graph mode: use the completion-flag protocol so the
-                # in-graph consumer (current-patch + SFA) can wait for the
-                # AIV DMA via an in-graph wait_flag kernel — the stream
-                # alone does not order AIV completion before AICore ops
-                # inside an NPU graph. The expect increment below is a
-                # captured op that re-executes every replay, pairing 1:1
-                # with the copy kernel's unconditional 64-core notify bump.
-                # Eager mode keeps the plain call (its consumer is gated by
-                # the h2d_done event instead).
-                if self._graph_mode:
-                    ret = mf_offload.sparse_copy_notify(
-                        h2d_src[:N],
-                        h2d_dst[:N],
-                        h2d_lens[:N],
-                        self.h2d_cnt,
-                        self.h2d_flag,
-                        self.device,
-                    )
-                    self.h2d_expect[0].add_(self._dma_flag_block_num)
-                else:
-                    ret = mf_offload.sparse_copy(
-                        h2d_src[:N],
-                        h2d_dst[:N],
-                        h2d_lens[:N],
-                        self.h2d_cnt,
-                        self.device,
-                    )
+                # Step-2 (flag-mechanism retirement): graph-mode H2D also
+                # uses the plain notify-free copy. The in-graph wait_flag
+                # consumer is removed with this change (see
+                # run_selected_attention) — the all-MIX compute-queue FIFO
+                # orders the copy kernel before patch/SFA. A/B against the
+                # 0.90 baseline (step-1 D2H plain already band-preserving).
+                ret = mf_offload.sparse_copy(
+                    h2d_src[:N],
+                    h2d_dst[:N],
+                    h2d_lens[:N],
+                    self.h2d_cnt,
+                    self.device,
+                )
                 if ret != 0:
                     raise RuntimeError(
                         f"sparse_copy H2D failed: ret={ret}"
@@ -1283,28 +1250,11 @@ class NPUSelectiveHiSparseCoordinator:
         # 1. Wait for H2D
         if st.h2d_done is not None:
             torch.npu.current_stream().wait_event(st.h2d_done)
-        elif self._graph_mode:
-            # Graph mode: no event to wait on. The captured H2D DMA (AIV)
-            # is not ordered before this consumer (AICore) by the stream,
-            # so gate on the completion flag instead: wait_flag spins
-            # (device-side, single AIV core) until the copy kernel's 64
-            # cores all finished THIS round's magic. This op is captured
-            # into the graph between the DMA and the patch/SFA reads.
-            # E6 excluded the wait as a no-op for precision, but it is
-            # kept as the documented ordering guarantee (AIV completion
-            # before AICore reads inside an NPU graph).
-            try:
-                from memfabric_hybrid import offload as mf_offload
-
-                ret = mf_offload.wait_flag(
-                    self.h2d_flag,
-                    self.h2d_expect,
-                    self.device,
-                )
-                if ret != 0:
-                    raise RuntimeError(f"wait_flag H2D failed: ret={ret}")
-            except ImportError:
-                pass  # fallback: staging copy path, no flag protocol
+        # Step-2 (flag-mechanism retirement): graph mode no longer waits on
+        # the H2D completion flag. The plain MIX sparse_copy shares the
+        # compute queue with the patch/SFA consumers — the queue FIFO
+        # orders the copy before them, so the in-graph wait_flag kernel is
+        # redundant (and its device-side spin stalled the compute queue).
 
         # 2. Current KV patch (graph-safe: no boolean indexing / nonzero)
         # W3: read from the fixed-address scratch written by
@@ -1532,16 +1482,9 @@ class NPUSelectiveHiSparseCoordinator:
         self._selective_real_tokens.fill_(0)
         self.h2d_cnt.fill_(0)
         self.d2h_cnt.fill_(0)
-        # Drain any eager-side in-flight DMA and reset the monotonic
-        # completion counters to a consistent zero state: eager copies use
-        # the plain (flagless) path, so their completions are invisible to
-        # the flag counters. Warmup + capture runs then bump count and
-        # expect in lockstep (every notify pairs with one expect += 64).
+        # Drain any eager-side in-flight DMA so capture starts from a
+        # consistent state.
         torch.npu.synchronize()
-        self.h2d_flag.fill_(0)
-        self.h2d_expect.fill_(0)
-        self.d2h_flag.fill_(0)
-        self.d2h_expect.fill_(0)
         logger.info(
             f"SelectiveHiSparse graph capture: bs={capture_bs}, "
             f"tokens={capture_tokens}"
