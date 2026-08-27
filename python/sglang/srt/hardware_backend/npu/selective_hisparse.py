@@ -361,11 +361,6 @@ class NPUSelectiveHiSparseCoordinator:
         self.staging_free_event: torch.npu.Event = self._initial_event
         self.backup_done_event: dict[int, torch.npu.Event] = {}
         self._eager_async_pending = False
-        # E7 (C6 probe): capture-time state for deferred D2H launch —
-        # holds (layer_id, N) of the selected layer whose D2H kernel has
-        # been captured-later than its scratch copy_ (see
-        # publish_new_packed_kv). Python-only, consumed during capture.
-        self._pending_d2h: Optional[tuple] = None
 
         # Device staging buffers (allocated once)
         self._alloc_staging_buffers()
@@ -965,21 +960,7 @@ class NPUSelectiveHiSparseCoordinator:
                 # with the copy kernel's unconditional 64-core notify bump.
                 # Eager mode keeps the plain call (its consumer is gated by
                 # the h2d_done event instead).
-                # B3 (notify-exclusion probe): with the H2D wait skipped
-                # (SKIP_H2D_WAIT=1) and the D2H wait deleted (R11), NOBODY
-                # consumes the flags — yet every sparse_copy_notify kernel
-                # still runs its notify tail (per-core SetAtomicAdd +
-                # S_MTE3 event pair + PipeBarrier<PIPE_MTE3>): at 19L that
-                # is 38 kernels x 64 cores = 2432 atomic cacheline writes
-                # per replay, present in EVERY experiment so far and never
-                # singly excluded. SGLANG_SELECTIVE_PLAIN_COPY=1 switches
-                # graph mode to the plain notify-free sparse_copy (the
-                # kernel skips NotifyDone entirely when notify == nullptr).
-                _plain_copy = (
-                    self._graph_mode
-                    and os.getenv("SGLANG_SELECTIVE_PLAIN_COPY", "0") == "1"
-                )
-                if self._graph_mode and not _plain_copy:
+                if self._graph_mode:
                     ret = mf_offload.sparse_copy_notify(
                         h2d_src[:N],
                         h2d_dst[:N],
@@ -1089,39 +1070,6 @@ class NPUSelectiveHiSparseCoordinator:
                 )
             )
 
-        # E7 (C6 probe, env-gated, graph mode only): flush the PREVIOUS
-        # selected layer's D2H now. Its scratch copy_ was issued one full
-        # selected-cycle (4 model layers of compute + attention) earlier on
-        # the VECTOR queue; launching its MIX D2H here puts enough stream
-        # distance that the copy_ has completed even without cross-queue
-        # ordering — closing the stale-scratch read window that the E3/E4
-        # sleep matrix localized to 19 layers.
-        _defer_d2h = (
-            self._graph_mode
-            and os.getenv("SGLANG_SELECTIVE_DEFER_D2H", "0") == "1"
-        )
-        if _defer_d2h and self._pending_d2h is not None:
-            _p_layer, _p_n = self._pending_d2h
-            self._pending_d2h = None
-            self._launch_deferred_d2h(_p_layer, _p_n)
-
-        # C6 probe (env-gated, graph mode only): the copy above is a
-        # VECTOR-queue torch op while the D2H sparse_copy_notify below runs
-        # on the COMPUTE queue (MIX) — same stream, but cross-queue
-        # completion is unordered, so the D2H can read a one-step-stale
-        # scratch and back up poisoned KV to the host pool. At 19 layers
-        # the vector queue is deep enough to open this window (7L closed:
-        # sleep probe harmless at 7L, -10pt at 19L). Eager mode gates this
-        # via pack_ready below; this records an event after the copy and
-        # waits it before the D2H launch so the captured graph carries a
-        # cross-queue dependency edge (record+wait both inside the capture
-        # — the legal pattern; R11's error was recording outside it).
-        _d2h_gate_ev = None
-        if self._graph_mode and os.getenv(
-            "SGLANG_SELECTIVE_GATE_D2H_EVENT", "0"
-        ) == "1":
-            _d2h_gate_ev = torch.npu.current_stream().record_event()
-
         # Eager mode syncs the device-side real-token count (harmless
         # bookkeeping, see maybe_start_prefetch). Graph mode reads the
         # replay-filled value (capture sees 0 → DMA no-op).
@@ -1157,11 +1105,6 @@ class NPUSelectiveHiSparseCoordinator:
         with torch.npu.stream(d2h_stream):
             if pack_ready is not None:
                 d2h_stream.wait_event(pack_ready)
-            # C6 probe: wait the post-copy event (graph mode; d2h_stream IS
-            # the current/capture stream there) so the MIX D2H cannot pass
-            # the vector-queue copy_.
-            if _d2h_gate_ev is not None:
-                torch.npu.current_stream().wait_event(_d2h_gate_ev)
 
             N = T
 
@@ -1210,41 +1153,15 @@ class NPUSelectiveHiSparseCoordinator:
                     self.d2h_cnt.fill_(N)
 
                 if self._graph_mode:
-                    # B3: env re-read here — _plain_copy from
-                    # maybe_start_prefetch is out of scope in this method.
-                    _plain_copy_d2h = (
-                        os.getenv("SGLANG_SELECTIVE_PLAIN_COPY", "0") == "1"
+                    ret = mf_offload.sparse_copy_notify(
+                        d2h_src[:N],
+                        d2h_dst[:N],
+                        d2h_lens[:N],
+                        self.d2h_cnt,
+                        self.d2h_flag,
+                        self.device,
                     )
-                    _is_last_selected = (
-                        _si == len(self.selected_layer_ids_sorted) - 1
-                    )
-                    if _defer_d2h and not _is_last_selected:
-                        # E7: hold the launch; flushed at the NEXT selected
-                        # layer's publish. The last selected layer has no
-                        # next publish inside this capture — launch now
-                        # (1/19 layers stays exposed; acceptable for the
-                        # probe read).
-                        self._pending_d2h = (layer_id, N)
-                        ret = 0
-                    elif _plain_copy_d2h:
-                        # B3: notify-free plain copy (see H2D comment).
-                        ret = mf_offload.sparse_copy(
-                            d2h_src[:N],
-                            d2h_dst[:N],
-                            d2h_lens[:N],
-                            self.d2h_cnt,
-                            self.device,
-                        )
-                    else:
-                        ret = mf_offload.sparse_copy_notify(
-                            d2h_src[:N],
-                            d2h_dst[:N],
-                            d2h_lens[:N],
-                            self.d2h_cnt,
-                            self.d2h_flag,
-                            self.device,
-                        )
-                        self.d2h_expect[0].add_(self._dma_flag_block_num)
+                    self.d2h_expect[0].add_(self._dma_flag_block_num)
                 else:
                     ret = mf_offload.sparse_copy(
                         d2h_src[:N],
@@ -1270,31 +1187,6 @@ class NPUSelectiveHiSparseCoordinator:
                 self._last_backup_event = self.backup_done_event[layer_id]
 
     # === selected-layer attention ===
-
-    def _launch_deferred_d2h(self, layer_id: int, N: int):
-        """E7: launch the held D2H of a previously published layer.
-
-        Descriptor buffers (per-layer, already filled at that layer's
-        publish) are read here; only the MIX kernel launch (and its
-        expect bump) moves later in the captured stream order.
-        """
-        from memfabric_hybrid import offload as mf_offload
-
-        _si = self._layer_scratch_index[layer_id]
-        d2h_src = self.d2h_src_ptrs_all[_si]
-        d2h_dst = self.d2h_dst_ptrs_all[_si]
-        d2h_lens = self.d2h_lens_all[_si]
-        ret = mf_offload.sparse_copy_notify(
-            d2h_src[:N],
-            d2h_dst[:N],
-            d2h_lens[:N],
-            self.d2h_cnt,
-            self.d2h_flag,
-            self.device,
-        )
-        self.d2h_expect[0].add_(self._dma_flag_block_num)
-        if ret != 0:
-            raise RuntimeError(f"sparse_copy D2H (deferred) failed: ret={ret}")
 
     def debug_capture_kin(
         self, layer_id: int, cache_k: torch.Tensor, cache_v: torch.Tensor
@@ -1396,21 +1288,6 @@ class NPUSelectiveHiSparseCoordinator:
         # 1. Wait for H2D
         if st.h2d_done is not None:
             torch.npu.current_stream().wait_event(st.h2d_done)
-            # DEBUG (exp F): eager-side staging checksum right after the H2D
-            # wait and before the current-patch overwrite — this is the pure
-            # H2D-landed content. Compare against the graph-side dump from
-            # decode_cuda_graph_runner.execute(). Enable with
-            # SGLANG_SELECTIVE_DUMP_STAGING=1.
-            if os.getenv("SGLANG_SELECTIVE_DUMP_STAGING", "0") == "1":
-                _n = st.real_tokens * K
-                _flat = self.packed_staging_all[
-                    self._layer_scratch_index[layer_id] % self._staging_slices
-                ].view(-1)[: _n * self.record_bytes]
-                logger.info(
-                    f"[STAGING-DUMP eager] layer={layer_id} "
-                    f"N={_n} sum={_flat.sum(dtype=torch.int64).item()} "
-                    f"nonzero={int((_flat != 0).sum().item())}"
-                )
         elif self._graph_mode:
             # Graph mode: no event to wait on. The captured H2D DMA (AIV)
             # is not ordered before this consumer (AICore) by the stream,
@@ -1418,27 +1295,21 @@ class NPUSelectiveHiSparseCoordinator:
             # (device-side, single AIV core) until the copy kernel's 64
             # cores all finished THIS round's magic. This op is captured
             # into the graph between the DMA and the patch/SFA reads.
-            # R13 (A/B): skip the in-graph H2D wait entirely. In the
-            # all-MIX world the compute-queue FIFO already orders the copy
-            # kernel before patch/SFA; the wait is documented redundant
-            # insurance — but its device-side spin stalls the compute
-            # queue, and the stall window grows with layer count (11-19
-            # layers lost ~1pt/layer). If skipping restores precision, the
-            # spin itself was the enabler. Env-gated single-variable probe:
-            # SGLANG_SELECTIVE_SKIP_H2D_WAIT=1
-            if os.getenv("SGLANG_SELECTIVE_SKIP_H2D_WAIT", "0") != "1":
-                try:
-                    from memfabric_hybrid import offload as mf_offload
+            # E6 excluded the wait as a no-op for precision, but it is
+            # kept as the documented ordering guarantee (AIV completion
+            # before AICore reads inside an NPU graph).
+            try:
+                from memfabric_hybrid import offload as mf_offload
 
-                    ret = mf_offload.wait_flag(
-                        self.h2d_flag,
-                        self.h2d_expect,
-                        self.device,
-                    )
-                    if ret != 0:
-                        raise RuntimeError(f"wait_flag H2D failed: ret={ret}")
-                except ImportError:
-                    pass  # fallback: staging copy path, no flag protocol
+                ret = mf_offload.wait_flag(
+                    self.h2d_flag,
+                    self.h2d_expect,
+                    self.device,
+                )
+                if ret != 0:
+                    raise RuntimeError(f"wait_flag H2D failed: ret={ret}")
+            except ImportError:
+                pass  # fallback: staging copy path, no flag protocol
 
         # 2. Current KV patch (graph-safe: no boolean indexing / nonzero)
         # W3: read from the fixed-address scratch written by
@@ -1729,39 +1600,6 @@ class NPUSelectiveHiSparseCoordinator:
             self._selective_real_tokens.fill_(real_tokens)
             self.h2d_cnt.fill_(real_tokens * self.topk)
             self.d2h_cnt.fill_(real_tokens)
-        # DEBUG (graph-mode precision): zero the in-graph D2H backup count so
-        # the captured backup sparse_copy submits nothing at replay. If
-        # precision recovers, the backup path is corrupting the Host pool
-        # (wrong dst pointers / stale logical locs at replay) rather than the
-        # H2D prefetch being late. Enable with SGLANG_SELECTIVE_DISABLE_D2H=1.
-        if os.getenv("SGLANG_SELECTIVE_DISABLE_D2H", "0") == "1":
-            self.d2h_cnt.fill_(0)
-
-        # R7 (flag health probe): read the monotonic counters BEFORE this
-        # replay. Invariant: h2d_flag[0] == h2d_expect[0] (every captured
-        # notify is paired with one captured expect add_) — checked after a
-        # device sync so the read reflects all PREVIOUS replays' kernels.
-        # A mismatch (flag < expect: a wait passed early / notify lost;
-        # flag > expect: stray notify) means the flag protocol itself is
-        # broken at this layer count, which would invalidate every wait
-        # downstream and produce exactly the dose-response precision loss.
-        # Read-only probe: the sync makes each replay slightly slower but
-        # changes no semantics. Enable with SGLANG_SELECTIVE_CHECK_FLAGS=1.
-        if os.getenv("SGLANG_SELECTIVE_CHECK_FLAGS", "0") == "1":
-            self._dbg_replay_round = getattr(self, "_dbg_replay_round", 0) + 1
-            if self._dbg_replay_round % 100 == 1:  # sample to bound overhead
-                torch.npu.synchronize()
-                h2d_f = int(self.h2d_flag[0].item())
-                h2d_e = int(self.h2d_expect[0].item())
-                d2h_f = int(self.d2h_flag[0].item())
-                d2h_e = int(self.d2h_expect[0].item())
-                ok = (h2d_f == h2d_e) and (d2h_f == d2h_e)
-                logger.info(
-                    f"[FLAG-CHECK] round={self._dbg_replay_round} "
-                    f"h2d flag/expect={h2d_f}/{h2d_e} "
-                    f"d2h flag/expect={d2h_f}/{d2h_e} "
-                    f"{'OK' if ok else '*** MISMATCH ***'}"
-                )
 
     def finish_graph_capture(self):
         """Restore eager coordinator semantics after one graph is captured.

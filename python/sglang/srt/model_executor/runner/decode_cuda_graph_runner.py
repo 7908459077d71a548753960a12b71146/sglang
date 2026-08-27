@@ -29,7 +29,6 @@ import contextlib
 import inspect
 import logging
 import os
-import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -1394,53 +1393,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if war_record is SharedReadBoundary.PRE_REPLAY:
                 self._publish_war_read_done(in_graph=False)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
-            # DEBUG (graph-mode precision): give in-flight in-graph DMA
-            # (sparse_copy D2H backup) time to land before the next replay's
-            # H2D prefetch reads those Host pool entries. Discriminates the
-            # cross-iteration D2H->H2D landing race from in-graph staleness.
-            # Enable with SGLANG_SELECTIVE_DEBUG_SYNC=1.
-            if os.getenv("SGLANG_SELECTIVE_DEBUG_SYNC", "0") == "1":
-                torch.npu.synchronize()
-            # DEBUG: wall-clock delay after replay. npu.synchronize() only
-            # waits for device-side work; if the AIV-issued async DMA
-            # completion is processed by the host ACL report thread
-            # (fire-and-forget), sync does NOT cover it — sleep does. If
-            # precision recovers with sleep but not with sync, the DMA
-            # landing is host-report-driven and needs a real completion
-            # dependency. Enable with SGLANG_SELECTIVE_DEBUG_SLEEP_MS=<n>.
-            _sleep_ms = os.getenv("SGLANG_SELECTIVE_DEBUG_SLEEP_MS", "0")
-            if _sleep_ms != "0":
-                time.sleep(int(_sleep_ms) / 1000.0)
-            # DEBUG (exp F): graph-side staging checksum right after replay.
-            # The graph has already consumed staging (patch + SFA) by now, but
-            # staging is not overwritten until the next replay's H2D, so this
-            # is what the in-graph DMA ultimately landed (patched rows differ
-            # slightly from the eager pure-H2D dump; compare sums at scale).
-            # Enable with SGLANG_SELECTIVE_DUMP_STAGING=1.
-            if (
-                os.getenv("SGLANG_SELECTIVE_DUMP_STAGING", "0") == "1"
-                and not forward_batch.forward_mode.is_idle()
-            ):
-                _sel_coord = getattr(
-                    self.model_runner, "npu_selective_hisparse_coordinator", None
-                )
-            else:
-                _sel_coord = None
-            if (
-                _sel_coord is not None
-                and os.getenv("SGLANG_SELECTIVE_DUMP_STAGING", "0") == "1"
-            ):
-                _n = int(_sel_coord.h2d_cnt.item())
-                _flat = _sel_coord.packed_staging.view(-1)[
-                    : _n * _sel_coord.record_bytes
-                ]
-                logger.info(
-                    "[STAGING-DUMP graph] key=%s N=%d sum=%d nonzero=%d",
-                    self._replay_graph_key.size,
-                    _n,
-                    _flat.sum(dtype=torch.int64).item(),
-                    int((_flat != 0).sum().item()),
-                )
             if war_record is SharedReadBoundary.POST_REPLAY:
                 self._publish_war_read_done(in_graph=False)
             elif war_record is SharedReadBoundary.IN_REPLAY:

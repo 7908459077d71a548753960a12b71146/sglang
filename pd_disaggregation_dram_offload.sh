@@ -194,7 +194,7 @@ do
             --chunked-prefill-size 8192 \
             ${GRAPH_ARGS} \
             --speculative-algorithm NEXTN \
-            --speculative-num-steps ${SPEC_NUM_STEPS-5} --speculative-eagle-topk 1 --speculative-num-draft-tokens ${SPEC_DRAFT_TOKENS-6} \
+            --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
             --max-running-requests ${MAX_RUNNING_REQ-192} \
             --host 0.0.0.0 \
             --port 31000 \
