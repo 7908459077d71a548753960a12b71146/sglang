@@ -113,6 +113,110 @@ def load_accept(d, dev):
     return recs
 
 
+def load_state(d, dev):
+    """Load per-step target-forward bisect snapshots (state_dev{N}_step{S}.pt)."""
+    recs = {}
+    for f in glob.glob(os.path.join(d, "state_*.pt")):
+        m = re.match(r"state_dev(\d+)_step(\d+)\.pt", os.path.basename(f))
+        if m and int(m.group(1)) == dev:
+            recs[int(m.group(2))] = torch.load(
+                f, map_location="cpu", weights_only=False
+            )
+    return recs
+
+
+def compare_state(args, first_fp_div):
+    """Round-3 bisect: where inside the target forward does the first
+    divergent verify round (first_fp_div, from the fingerprint section)
+    actually drift?
+
+    hidden row 0 = embedding, row i+1 = output of decoder layer i.
+    rkv/rloc row = layer_id (resident KV written by set_kv_buffer).
+    """
+    print("\n=== target-forward bisect (state json/pt, same-numbered "
+          "steps) ===")
+    erecs = load_state(args.eager_dir, args.dev)
+    grecs = load_state(args.graph_dir, args.dev)
+    if not erecs or not grecs:
+        print("(no state snapshots on one or both sides — re-dump with "
+              "the round-3 instrumentation)")
+        return
+    common = sorted(set(erecs) & set(grecs))
+    if first_fp_div is not None and first_fp_div not in common:
+        print(f"(first fingerprint-divergent step {first_fp_div} has no "
+              f"state snapshot; showing available steps)")
+
+    def bisect_step(s):
+        e, g = erecs[s], grecs[s]
+        n = min(e["T"], g["T"], e["hidden"].shape[1], g["hidden"].shape[1])
+        ids_bad = not torch.equal(e["in_ids"][:n], g["in_ids"][:n])
+        pos_bad = not torch.equal(e["in_pos"][:n], g["in_pos"][:n])
+        first_layer = None
+        for row in range(e["hidden"].shape[0]):
+            ev, gv = e["hidden"][row, :n], g["hidden"][row, :n]
+            if bool((rel_diff(ev, gv) > 5e-2).any()):
+                first_layer = row - 1  # -1 = embedding output
+                break
+        return ids_bad, pos_bad, first_layer, n
+
+    # poison check FIRST: resident KV written by rounds BEFORE the first
+    # divergent round must match, else the divergence is explained.
+    pre = [s for s in common if first_fp_div is None or s < first_fp_div]
+    for s in pre[:4] if pre else []:
+        e, g = erecs[s], grecs[s]
+        n = min(e["T"], g["T"])
+        rkv_bad = [
+            r - 1 for r in range(e["rkv"].shape[0])
+            if bool((e["rkv"][r, :n] != g["rkv"][r, :n]).any())
+        ]
+        rloc_bad = [
+            r - 1 for r in range(e["rloc"].shape[0])
+            if bool((e["rloc"][r, :n] != g["rloc"][r, :n]).any())
+        ]
+        tag = ""
+        if rkv_bad:
+            tag += f" RKV WRITE DIFFERS at layers {rkv_bad[:8]}"
+        if rloc_bad:
+            tag += f" LOC DIFFERS at layers {rloc_bad[:8]}"
+        print(f"pre-divergence step {s}: resident-KV writes "
+              f"{'POISONED —' + tag if tag else 'match'}")
+
+    for s in common:
+        if first_fp_div is not None and s < first_fp_div:
+            continue
+        ids_bad, pos_bad, first_layer, n = bisect_step(s)
+        if ids_bad or pos_bad or first_layer is not None:
+            print(f"step {s:3d}: inputs {'IDS DIFFER' if ids_bad else 'ids same'}, "
+                  f"{'POS DIFFER' if pos_bad else 'pos same'}, "
+                  f"first divergent hidden row: "
+                  f"{'embedding' if first_layer == -1 else f'layer {first_layer}'} "
+                  f"({n} tokens compared)")
+        elif (first_fp_div is not None and s <= first_fp_div + 2) or (
+            first_fp_div is None and s <= 3
+        ):
+            print(f"step {s:3d}: hidden all match ({n} tokens)")
+
+    if first_fp_div is not None and first_fp_div in common:
+        ids_bad, pos_bad, first_layer, n = bisect_step(first_fp_div)
+        print(f"\n[BISECT VERDICT] step {first_fp_div}:")
+        if ids_bad or pos_bad:
+            print("  => verify INPUTS differ (draft/scheduler divergence) "
+                  "— target forward may be innocent; probe the draft side")
+        elif first_layer == -1:
+            print("  => embedding output differs with identical input ids "
+                  "— embedding lookup/graph input binding bug")
+        elif first_layer is None:
+            print("  => hidden matches through ALL layers but logits "
+                  "diverge — lm_head / logits processor path")
+        else:
+            print(f"  => first divergence INSIDE layer {first_layer} "
+                  f"(compute or its attention KV read). "
+                  f"Cross-check rkv/rloc at earlier steps for this layer: "
+                  "differs => poisoned resident KV written in graph; "
+                  "matches => live compute/attention-metadata divergence "
+                  "in that layer")
+
+
 def compare_accept(args, esnaps, gsnaps):
     """Same-numbered-step comparison of the verify-round fingerprints.
 
@@ -175,7 +279,7 @@ def compare_accept(args, esnaps, gsnaps):
         print("=> the two runs compute IDENTICAL verify outputs; the .pt "
               "ALIGN failure is a scheduling/ordering artifact (different "
               "request placement or step offset) — rerun to confirm")
-        return
+        return None
     s, rs_bad, amis, acc_eq = first_div
     print(f"\n[FINGERPRINT VERDICT] first divergent verify round: step {s}")
     if rs_bad:
@@ -190,6 +294,7 @@ def compare_accept(args, esnaps, gsnaps):
     elif not acc_eq:
         print("  => logits match but accept_lens differ: eagle_sample / "
               "verify-tree handling diverges, model forward is innocent")
+    return s
 
 
 
@@ -233,7 +338,10 @@ def main():
     # Verify-round fingerprints first: they need no .pt-style alignment
     # (same-numbered steps compare directly) and answer where the
     # divergence that breaks .pt alignment actually lives.
-    compare_accept(args, esnaps, gsnaps)
+    first_fp_div = compare_accept(args, esnaps, gsnaps)
+    # Round-3 bisect on the first divergent round: exact layer inside the
+    # target forward + resident-KV poison check on the rounds before it.
+    compare_state(args, first_fp_div)
 
     layers = esnaps[0]["layers"]
     n_layers = len(layers)

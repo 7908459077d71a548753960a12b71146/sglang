@@ -3143,6 +3143,12 @@ class DeepseekV2Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
         dsa_forward_uses_topk = self._dsa_forward_uses_topk()
+        # D1 round-3 bisect hooks (no-op unless SGLANG_SELECTIVE_DIFF_DUMP=1):
+        # input fingerprint + embedding at entry, per-layer hidden rowsum in
+        # the decode loop. Captured ops in graph mode — frozen per replay.
+        _dbg_sel = getattr(
+            forward_batch, "npu_selective_hisparse_coordinator", None
+        )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -3150,6 +3156,10 @@ class DeepseekV2Model(nn.Module):
                 hidden_states = input_embeds
             residual = None
             initial_topk_indices = None
+            if _dbg_sel is not None:
+                _dbg_sel.debug_capture_model_input(
+                    input_ids, positions, hidden_states
+                )
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -3251,6 +3261,8 @@ class DeepseekV2Model(nn.Module):
                     ),
                 )
                 index_topk_share.update(topk_indices)
+                if _dbg_sel is not None:
+                    _dbg_sel.debug_capture_layer_hidden(i, hidden_states)
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

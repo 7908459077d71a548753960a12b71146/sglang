@@ -327,6 +327,7 @@ class NPUSelectiveHiSparseCoordinator:
         record_bytes: int = RECORD_BYTES,
         kv_lora_rank: int = 512,
         qk_rope_head_dim: int = 64,
+        num_hidden_layers: Optional[int] = None,
     ):
         self.pool = pool
         self.req_to_token_pool = req_to_token_pool
@@ -340,6 +341,11 @@ class NPUSelectiveHiSparseCoordinator:
         self.record_bytes = record_bytes
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
+        # D1 round-3: total decoder-layer count for the per-layer hidden
+        # state bisect buffers (fallback: last selected layer + 1).
+        self.num_hidden_layers = num_hidden_layers or (
+            self.selected_layer_ids_sorted[-1] + 1
+        )
         self.device = torch.device(pool.device)
 
         # anchor → selected mapping (anchor = selected - 3)
@@ -686,15 +692,41 @@ class NPUSelectiveHiSparseCoordinator:
                 _n_dbg, T, dtype=torch.float32, device=self.device
             )
             # accept_lens records (host side, written by on_verify_result,
-            # flushed as accept_stepNNNN.json): the fastest first-divergent-
+            # flushed as accept_dev{N}_stepNNNN.json): the fastest first-divergent-
             # step signal when aligning an eager run against a graph run.
             self._dbg_accept_step = 0
+            # Round-3 (target-forward bisect): the verify fingerprint proved
+            # divergence starts INSIDE the target forward at step 3 while
+            # selected layers 1-2 are clean, so the poison is in a
+            # non-selected layer's compute, its resident-HBM KV (written by
+            # earlier verify rounds), or the model input itself. Buffers
+            # (all captured ops in graph mode, frozen per replay):
+            #   hidden [L+1, T] — row 0 = embedding output, row i+1 =
+            #             output of decoder layer i (bf16 rowsum, f32 acc)
+            #   in_ids/in_pos [T] — raw verify-round token ids / positions
+            #   rkv [L+1, T] — resident-layer packed-KV rowsum as written by
+            #             set_kv_buffer (int64 byte-sum); row = layer_id
+            #   rloc [L+1, T] — the write locations (out_cache_loc) per layer
+            # Dumped as state_dev{N}_step{S}.pt from on_verify_result (both
+            # modes, post-sample = post-sync).
+            _n_rows = self.num_hidden_layers + 1
+            self._dbg_hidden_all = torch.zeros(
+                _n_rows, T, dtype=torch.float32, device=self.device
+            )
+            self._dbg_in_ids = torch.zeros(T, dtype=torch.int64, device=self.device)
+            self._dbg_in_pos = torch.zeros(T, dtype=torch.int64, device=self.device)
+            self._dbg_rkv_all = torch.zeros(
+                _n_rows, T, dtype=torch.int64, device=self.device
+            )
+            self._dbg_rloc_all = torch.zeros(
+                _n_rows, T, dtype=torch.int64, device=self.device
+            )
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg} "
                 f"fields=locs,valid,stg_pre,stg_post,q,qrope,out,pkg,crow,"
                 f"allv,pub,kin,kinv,pos,d2h_locs,unpk,unpkr,scalars,"
-                f"d2h_rb,accept"
+                f"d2h_rb,accept,hidden,rkv"
             )
         else:
             self._dbg_dump = False
@@ -1185,6 +1217,74 @@ class NPUSelectiveHiSparseCoordinator:
             )
         )
 
+    def debug_capture_model_input(
+        self,
+        input_ids: Optional[torch.Tensor],
+        positions: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+    ):
+        """D1 round-3: verify-round input fingerprint + embedding output.
+
+        Called from the model forward entry (embedding computed); in graph
+        mode a captured op, freezing the per-replay inputs. in_ids/in_pos
+        are compared EXACTLY: a mismatch at the first divergent step means
+        the divergence is upstream of the target forward (draft/scheduler),
+        not inside it.
+        """
+        if not self._dbg_dump:
+            return
+        t = min(hidden_states.shape[0], self.tcap)
+        self._dbg_hidden_all[0, :t].copy_(
+            hidden_states[:t].reshape(t, -1).sum(dim=-1, dtype=torch.float32)
+        )
+        if input_ids is not None:
+            ti = min(input_ids.shape[0], self.tcap)
+            self._dbg_in_ids[:ti].copy_(input_ids[:ti].to(torch.int64))
+        if positions is not None:
+            tp = min(positions.shape[0], self.tcap)
+            self._dbg_in_pos[:tp].copy_(positions[:tp].to(torch.int64))
+
+    def debug_capture_layer_hidden(
+        self, layer_idx: int, hidden_states: torch.Tensor
+    ):
+        """D1 round-3: per-decoder-layer output rowsum (bisect probe).
+
+        Row layout: 0 = embedding, i+1 = output of layer i. The first row
+        that diverges between eager and graph pins the exact layer whose
+        compute (or KV read) first drifts — the selected-layer dumps cover
+        only the 19 selected layers, this covers ALL of them.
+        """
+        if not self._dbg_dump:
+            return
+        row = layer_idx + 1
+        if row >= self._dbg_hidden_all.shape[0]:
+            return
+        t = min(hidden_states.shape[0], self.tcap)
+        self._dbg_hidden_all[row, :t].copy_(
+            hidden_states[:t].reshape(t, -1).sum(dim=-1, dtype=torch.float32)
+        )
+
+    def debug_capture_resident_write(
+        self, layer_id: int, loc: torch.Tensor, packed_bytes: torch.Tensor
+    ):
+        """D1 round-3: resident-layer KV write fingerprint (set_kv_buffer).
+
+        packed_bytes is the [T, 656] uint8 view of the fp8 packed record
+        about to be scatter-written into the resident HBM KV. If earlier
+        verify rounds (1-2) wrote different bytes/locs in graph than eager,
+        the step-3 divergence is KV pollution, not compute. Row = layer_id
+        (selected layers land in their row too — harmless, the D1 pkg/pub
+        fields already cover them at higher fidelity).
+        """
+        if not self._dbg_dump:
+            return
+        row = min(layer_id, self._dbg_rkv_all.shape[0] - 1)
+        t = min(loc.shape[0], self.tcap)
+        self._dbg_rloc_all[row, :t].copy_(loc[:t].to(torch.int64))
+        self._dbg_rkv_all[row, :t].copy_(
+            packed_bytes[:t].sum(dim=-1, dtype=torch.int64)
+        )
+
     def dump_diff_snapshot(self, step: int, t_real: int):
         """D1: save the per-layer debug capture buffers to disk.
 
@@ -1479,9 +1579,9 @@ class NPUSelectiveHiSparseCoordinator:
                     rec["logit_rowsum"] = _nt.sum(
                         dim=-1, dtype=torch.float32
                     ).tolist()
-                # Filename includes the device: with DP attention every rank
-                # shares this dump dir, and a bare-step name would have the
-                # ranks overwrite each other's records.
+                # Filenames include the device: with DP attention every
+                # rank shares this dump dir, and a bare-step name would
+                # have the ranks overwrite each other's records.
                 accept_path = os.path.join(
                     self._dbg_dir,
                     f"accept_dev{torch.npu.current_device()}_step"
@@ -1489,6 +1589,30 @@ class NPUSelectiveHiSparseCoordinator:
                 )
                 with open(accept_path, "w") as f:
                     json.dump(rec, f)
+                # Round-3 state snapshot: input fingerprint + per-layer
+                # hidden bisect + resident-KV write fingerprint, frozen by
+                # the captured ops during THIS verify round (post-sample =
+                # post-sync here, so .cpu() reads the round's values).
+                _n_st = int(self._selective_real_tokens.item())
+                _n_st = min(max(_n_st, 1), self.tcap)
+                state = {
+                    "step": self._dbg_accept_step,
+                    "T": _n_st,
+                    "n_rows": int(self._dbg_hidden_all.shape[0]),
+                    "in_ids": self._dbg_in_ids[:_n_st].cpu(),
+                    "in_pos": self._dbg_in_pos[:_n_st].cpu(),
+                    "hidden": self._dbg_hidden_all[:, :_n_st].cpu(),
+                    "rkv": self._dbg_rkv_all[:, :_n_st].cpu(),
+                    "rloc": self._dbg_rloc_all[:, :_n_st].cpu(),
+                }
+                torch.save(
+                    state,
+                    os.path.join(
+                        self._dbg_dir,
+                        f"state_dev{torch.npu.current_device()}_step"
+                        f"{self._dbg_accept_step:04d}.pt",
+                    ),
+                )
         B = accept_lens.shape[0]
         logger.debug(
             f"Selective HiSparse verify result: B={B}, "

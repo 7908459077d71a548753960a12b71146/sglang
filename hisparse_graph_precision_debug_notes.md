@@ -238,3 +238,22 @@ accept_lens 首个发散 step = S
 - rowsum 吻合但 `logit_argmax`/accept_lens 偏 → 采样器 / RNG 状态 / verify 树处理发散，模型前向无辜
 - step 1 全吻合但 step 2 输入指纹偏 → draft 侧（NEXTN draft forward）或 scheduler 状态（seq_lens/out_cache_loc 更新）发散 → 加 draft 侧指纹探针
 - 全部吻合 → 纯调度错位（两次跑请求/时序不同），固定数据重跑对齐
+
+### 第二轮 dump 比对结论（2026-08-28，bs 默认 8 16）
+
+- **首个发散点钉死：verify round step 3 的 target 前向**（logits rowsum rel 0.77、argmax 4/6 偏）；step 1-2 指纹完全吻合（rowsum rel 0）。
+- step 3 同时 `.pt` 对齐断在 L5 的 q 上 → 发散在**进入 layer 5 之前**（layer 0-4 非 selected 层计算、或其 resident KV 被 step 1-2 写坏）或 step 3 输入本身已偏。
+- step 9 起 token 数 6→18（更多请求加入），其后全崩（含 accept_lens）——下游级联，非独立事件。
+- **已排除**：selected 层全链路（step 1-2 全字段吻合）、跨迭代竞态（exp R2 级别，因 step 1-2 输出一致）。
+
+### 第三轮探针：target 前向逐层二分（2026-08-28，已埋点待跑）
+
+| 字段（state_dev{N}_step{S}.pt） | 采集点 | 判定 |
+|---|---|---|
+| `in_ids`/`in_pos` [T] | 模型 forward 入口（embedding 后；graph 下 captured） | step 3 输入即偏 → draft/scheduler 侧，target 无辜 |
+| `hidden` [L+1,T] | 逐 decoder 层输出 rowsum（row 0=embedding，i+1=层 i；captured） | 首个发散 row = 首个发散层（embedding/中间层/全过→lm_head） |
+| `rkv`/`rloc` [L+1,T] | `set_kv_buffer` resident 路径（packed rowsum + 写址；captured） | **step<3 的 rkv/rloc 偏 → resident KV 被 graph 写坏（毒源实锤）**；吻合 → live 计算/attn metadata 偏 |
+
+改动文件：`selective_hisparse.py`（buffer+方法+state 落盘）、`model_runner.py`（传 num_hidden_layers）、`deepseek_v2.py`（forward 入口 + 层循环两个 hook，`forward_batch.npu_selective_hisparse_coordinator` 获取）、`memory_pool_npu.py`（resident 写捕获）、`hisparse_diff_compare.py`（`=== target-forward bisect ===` 段 + `[BISECT VERDICT]`）。
+
+判读（`[BISECT VERDICT]` 自动输出）：inputs 偏 → 查 draft/scheduler；embedding row 偏 → 绑定 bug；层 k 内偏 → 查 k 的 rkv/rloc（偏=KV 毒化，同=live 计算）；全过但 logits 偏 → lm_head/logits processor。

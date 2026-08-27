@@ -986,6 +986,7 @@ class ModelRunner:
             record_bytes=RECORD_BYTES,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+            num_hidden_layers=self.model_config.num_hidden_layers,
         )
 
         # Wire coordinator into pool
