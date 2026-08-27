@@ -721,6 +721,31 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_rloc_all = torch.zeros(
                 _n_rows, T, dtype=torch.int64, device=self.device
             )
+            # Round-4 (draft-chain bracket): the bisect proved verify
+            # INPUTS differ at the first divergent round while everything
+            # target-side (hidden, resident-KV writes, logits) matched up
+            # to that point — the poison is in the NEXTN draft chain or
+            # its input handoff. Buffers per verify round:
+            #   din_hidden  — draft input hidden_states rowsum (handoff
+            #                 from the previous target verify round)
+            #   din_topk    — draft input topk_index rowsum
+            #   dout_toks   — raw draft token ids (EXACT compare)
+            #   dout_parent/dout_score — tree structure rowsums
+            self._dbg_din_hidden = torch.zeros(
+                T, dtype=torch.float32, device=self.device
+            )
+            self._dbg_din_topk = torch.zeros(
+                T, dtype=torch.int64, device=self.device
+            )
+            self._dbg_dout_toks = torch.zeros(
+                T, dtype=torch.int64, device=self.device
+            )
+            self._dbg_dout_parent = torch.zeros(
+                T, dtype=torch.int64, device=self.device
+            )
+            self._dbg_dout_score = torch.zeros(
+                T, dtype=torch.int64, device=self.device
+            )
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg} "
@@ -1295,6 +1320,59 @@ class NPUSelectiveHiSparseCoordinator:
             packed_bytes[:t].sum(dim=-1, dtype=torch.int64)
         )
 
+    def debug_capture_draft(
+        self,
+        hidden_states: Optional[torch.Tensor],
+        topk_index: Optional[torch.Tensor],
+        draft_tokens: torch.Tensor,
+        parent_list: Optional[torch.Tensor],
+        top_scores_index: Optional[torch.Tensor],
+    ):
+        """D1 round-4: bracket the NEXTN draft chain per verify round.
+
+        Called from EagleWorkerV2.draft() after the draft executes (graph
+        or eager path alike), before build_eagle_verify_input. Together
+        with the verify-round in_ids this splits a divergence into:
+          din_* differ  -> the handoff INTO the draft is already wrong
+                           (previous verify round's sample/compaction)
+          din_* match + dout_toks differ -> draft forward itself diverges
+          dout_* match + verify in_ids differ -> build_eagle_verify_input
+                           (tree assembly) bug
+        """
+        if not self._dbg_dump:
+            return
+        if hidden_states is not None:
+            t = min(hidden_states.shape[0], self.tcap)
+            if t > 0:
+                self._dbg_din_hidden[:t].copy_(
+                    hidden_states[:t].reshape(t, -1).sum(
+                        dim=-1, dtype=torch.float32
+                    )
+                )
+        if topk_index is not None:
+            t = min(topk_index.numel(), self.tcap)
+            if t > 0:
+                self._dbg_din_topk[:t].copy_(
+                    topk_index.reshape(-1)[:t].to(torch.int64)
+                )
+        t = min(draft_tokens.numel(), self.tcap)
+        if t > 0:
+            self._dbg_dout_toks[:t].copy_(
+                draft_tokens.reshape(-1)[:t].to(torch.int64)
+            )
+        if parent_list is not None:
+            t = min(parent_list.numel(), self.tcap)
+            if t > 0:
+                self._dbg_dout_parent[:t].copy_(
+                    parent_list.reshape(-1)[:t].to(torch.int64)
+                )
+        if top_scores_index is not None:
+            t = min(top_scores_index.numel(), self.tcap)
+            if t > 0:
+                self._dbg_dout_score[:t].copy_(
+                    top_scores_index.reshape(-1)[:t].to(torch.int64)
+                )
+
     def dump_diff_snapshot(self, step: int, t_real: int):
         """D1: save the per-layer debug capture buffers to disk.
 
@@ -1614,6 +1692,13 @@ class NPUSelectiveHiSparseCoordinator:
                     "hidden": self._dbg_hidden_all[:, :_n_st].cpu(),
                     "rkv": self._dbg_rkv_all[:, :_n_st].cpu(),
                     "rloc": self._dbg_rloc_all[:, :_n_st].cpu(),
+                    # Round-4 draft-chain bracket (captured this round,
+                    # before the verify forward ran)
+                    "din_hidden": self._dbg_din_hidden[:_n_st].cpu(),
+                    "din_topk": self._dbg_din_topk[:_n_st].cpu(),
+                    "dout_toks": self._dbg_dout_toks[:_n_st].cpu(),
+                    "dout_parent": self._dbg_dout_parent[:_n_st].cpu(),
+                    "dout_score": self._dbg_dout_score[:_n_st].cpu(),
                 }
                 torch.save(
                     state,

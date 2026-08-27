@@ -256,4 +256,20 @@ accept_lens 首个发散 step = S
 
 改动文件：`selective_hisparse.py`（buffer+方法+state 落盘）、`model_runner.py`（传 num_hidden_layers）、`deepseek_v2.py`（forward 入口 + 层循环两个 hook，`forward_batch.npu_selective_hisparse_coordinator` 获取）、`memory_pool_npu.py`（resident 写捕获）、`hisparse_diff_compare.py`（`=== target-forward bisect ===` 段 + `[BISECT VERDICT]`）。
 
-判读（`[BISECT VERDICT]` 自动输出）：inputs 偏 → 查 draft/scheduler；embedding row 偏 → 绑定 bug；层 k 内偏 → 查 k 的 rkv/rloc（偏=KV 毒化，同=live 计算）；全过但 logits 偏 → lm_head/logits processor。
+### 第三轮 dump 比对结论（2026-08-28）
+
+- **step 1-2 resident-KV 写完全吻合**（rkv/rloc 逐层 match）→ **resident KV 毒化排除**。
+- **step 3 起 verify 输入 token id 即不同**（positions 相同、树形一致）→ **target 前向无辜**（不同输入当然不同输出），毒在 **NEXTN draft 链或 verify→draft 交接**。
+- 至此 target 侧全链路（selected 层、resident 层 KV 写、逐层 hidden、logits）在 step 1-2 全部证实干净。
+
+### 第四轮探针：root-vs-draft 二分 + draft 链 bracket（2026-08-28，已埋点待跑）
+
+**无需重跑即可先做的判定**（analyzer 已扩展，对现有 dump 重跑比对即出）：首个发散 step 打印 in_ids 逐 token 对比。topk=1 时 verify 输入是链式：`in_ids[0]` = 上一轮**接受 token**（上轮 logits/accept_lens 已证相同，理应一致），`in_ids[1:]` = 本轮 draft 新提案。
+
+- `in_ids[0]` 偏 → **eagle_sample/accept_index compaction bug**（logits 相同却接受了不同 token）
+- `in_ids[0]` 同、后面偏 → **draft 链发散** → 看新 draft 字段：
+  - `din_hidden` 偏 → 交接进 draft 的 hidden 态已错（上一轮 verify 的 hidden/采样态）
+  - `din_hidden` 同 + `dout_toks` 偏 → **draft 前向本身在图内发散**（draft attention/KV/metadata）
+  - `dout_toks` 同但 in_ids 偏 → `build_eagle_verify_input` 树拼装 bug
+
+draft 探针埋点：`eagle_worker_v2.draft()` graph/eager 汇合点捕获 `spec_info.hidden_states/topk_index`（输入交接态）+ `parent_list/top_scores_index/draft_tokens`（输出提案），随 state_dev{N}_step{S}.pt 落盘。

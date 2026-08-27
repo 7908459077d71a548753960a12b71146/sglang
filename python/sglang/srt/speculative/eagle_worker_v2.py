@@ -559,6 +559,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
                 )
+            # D1 round-4: bracket the draft chain (no-op unless
+            # SGLANG_SELECTIVE_DIFF_DUMP=1). The handoff state comes from
+            # spec_info; outputs from whichever path executed above.
+            _sel_coord = getattr(
+                self.target_worker.model_runner,
+                "npu_selective_hisparse_coordinator",
+                None,
+            )
+            if (
+                _sel_coord is not None
+                and not forward_batch.forward_mode.is_idle()
+            ):
+                _spec_in = forward_batch.spec_info
+                _sel_coord.debug_capture_draft(
+                    hidden_states=getattr(_spec_in, "hidden_states", None),
+                    topk_index=getattr(_spec_in, "topk_index", None),
+                    draft_tokens=draft_tokens,
+                    parent_list=parent_list,
+                    top_scores_index=top_scores_index,
+                )
 
         return build_eagle_verify_input(
             batch,

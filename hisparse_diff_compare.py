@@ -189,23 +189,80 @@ def compare_state(args, first_fp_div):
         if first_fp_div is not None and s < first_fp_div:
             continue
         ids_bad, pos_bad, first_layer, n = bisect_step(s)
+        draft_msg = ""
+        if "dout_toks" in erecs[s] and "dout_toks" in grecs[s]:
+            e, g = erecs[s], grecs[s]
+            dn = min(e["T"], g["T"], len(e["dout_toks"]), len(g["dout_toks"]))
+            dtoks_bad = not torch.equal(
+                e["dout_toks"][:dn], g["dout_toks"][:dn]
+            )
+            din_bad = bool(
+                (rel_diff(e["din_hidden"][:dn], g["din_hidden"][:dn]) > 5e-2)
+                .any()
+            ) if "din_hidden" in e and "din_hidden" in g else None
+            draft_msg = (f", draft: din{'BAD' if din_bad else 'ok'} "
+                         f"dout_toks{'DIFFER' if dtoks_bad else 'same'}")
         if ids_bad or pos_bad or first_layer is not None:
             print(f"step {s:3d}: inputs {'IDS DIFFER' if ids_bad else 'ids same'}, "
                   f"{'POS DIFFER' if pos_bad else 'pos same'}, "
                   f"first divergent hidden row: "
                   f"{'embedding' if first_layer == -1 else f'layer {first_layer}'} "
-                  f"({n} tokens compared)")
+                  f"({n} tokens compared){draft_msg}")
         elif (first_fp_div is not None and s <= first_fp_div + 2) or (
             first_fp_div is None and s <= 3
         ):
-            print(f"step {s:3d}: hidden all match ({n} tokens)")
+            print(f"step {s:3d}: hidden all match ({n} tokens){draft_msg}")
 
     if first_fp_div is not None and first_fp_div in common:
-        ids_bad, pos_bad, first_layer, n = bisect_step(first_fp_div)
+        e, g = erecs[first_fp_div], grecs[first_fp_div]
+        n = min(e["T"], g["T"])
+        ids_bad, pos_bad, first_layer, _ = bisect_step(first_fp_div)
+        # Root-vs-draft split: with topk=1 the verify tree is a chain and
+        # in_ids[0] is the LAST ACCEPTED token of the previous round
+        # (accept_lens matched there), in_ids[1:] are this round's fresh
+        # draft proposals.
         print(f"\n[BISECT VERDICT] step {first_fp_div}:")
+        print(f"  in_ids side-by-side (T={n}):")
+        for i in range(n):
+            ev, gv = int(e["in_ids"][i]), int(g["in_ids"][i])
+            mark = "  <-- DIFFER" if ev != gv else ""
+            role = "root(last-accepted)" if i == 0 else "draft"
+            print(f"    [{i}] {role:20s} eager={ev:>8d} graph={gv:>8d}{mark}")
+        n_diff_root = int(e["in_ids"][0] != g["in_ids"][0])
+        n_diff_draft = sum(
+            1 for i in range(1, n) if int(e["in_ids"][i]) != int(g["in_ids"][i])
+        )
+        if n_diff_root:
+            print("  => ROOT token differs: the previous round ACCEPTED a "
+                  "different token despite identical logits+accept_lens — "
+                  "eagle_sample/accept-index compaction bug in graph mode")
+        elif n_diff_draft:
+            print(f"  => root matches, {n_diff_draft}/{n - 1} draft "
+                  "proposals differ: DRAFT CHAIN divergence — "
+                  "cross-check draft fields:")
+            if "dout_toks" in e and "dout_toks" in g:
+                dn = min(n, len(e["dout_toks"]), len(g["dout_toks"]))
+                din_bad = bool(
+                    (rel_diff(e["din_hidden"][:dn], g["din_hidden"][:dn])
+                     > 5e-2).any()
+                ) if "din_hidden" in e and "din_hidden" in g else None
+                dtoks_bad = not torch.equal(
+                    e["dout_toks"][:dn], g["dout_toks"][:dn]
+                )
+                if din_bad:
+                    print("     din_hidden DIFFERS: the handoff INTO the "
+                          "draft is already wrong (previous verify "
+                          "round's hidden/sample state)")
+                elif dtoks_bad:
+                    print("     din_hidden matches + draft tokens differ: "
+                          "the DRAFT FORWARD itself diverges in graph "
+                          "(draft attention/KV or its metadata)")
+                else:
+                    print("     draft tokens match but verify in_ids "
+                          "differ: build_eagle_verify_input tree "
+                          "assembly bug")
         if ids_bad or pos_bad:
-            print("  => verify INPUTS differ (draft/scheduler divergence) "
-                  "— target forward may be innocent; probe the draft side")
+            print("  (verify inputs differ as reported above)")
         elif first_layer == -1:
             print("  => embedding output differs with identical input ids "
                   "— embedding lookup/graph input binding bug")
