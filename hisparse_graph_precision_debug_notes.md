@@ -121,13 +121,15 @@ if rope_cache is None or _capturing:
 - `npu_mlaprolog_runtime_cache`（LongCat，layer0 无条件刷新，语义正确）
 - `rotary_emb.sin_cos_cache`（start_layer 条件刷新，同型风险，建议复核）
 
-## 5. 收尾清理（flag 机制退役）
+## 5. 收尾清理（flag 机制退役，全部完成）
 
-RoPE 修复后，completion-flag 协议（`sparse_copy_notify` + `wait_flag`）按 A/B 步进退役（每步 50 题验证波段保持）：
+RoPE 修复后，completion-flag 协议（`sparse_copy_notify` + `wait_flag`）按 A/B 步进退役（每步 50 题验证波段保持，三步均为 **0.90**）：
 
-- **step-1（已完成，0.90 验证通过）**：graph D2H 切 plain `sparse_copy`（R11 删 D2H wait 后 notify tail 无消费者，纯开销）
-- **step-2（验证中）**：graph H2D 切 plain `sparse_copy` + 删 `wait_flag` 调用 + 删 4 个 flag/expect 缓冲。依赖：copy 与消费者同在计算队列 FIFO 有序；ACL 流订阅保留
-- **step-3（待 step-2 通过）**：memfabric 仓库删除 `sparse_copy_notify`/`wait_flag` 导出算子及 kernel 内 notify 尾巴，重编部署
+- **step-1（完成，0.90）**：graph D2H 切 plain `sparse_copy`（R11 删 D2H wait 后 notify tail 无消费者，纯开销）
+- **step-2（完成，0.90）**：graph H2D 切 plain `sparse_copy` + 删 `wait_flag` 调用 + 删 4 个 flag/expect 缓冲。依据：copy 与消费者同在计算队列 FIFO 有序；ACL 流订阅保留
+- **step-3（完成，0.90，重编部署后复验）**：memfabric 仓库全链删除 `sparse_copy_notify`/`wait_flag`——kernel 内 notify 尾巴与 `OffloadWaitFlagKernel` 类、`OffloadOpsWaitFlag`/`AccOffloadWaitFlag` launch 链、entry 层 `WaitSparseCopyDone`、C API `offload_sparse_copy_notify`/`offload_wait_flag`、pybind 与 python 导出（共 14 处，涉及 `acc_offload_sparse_copy.h/.cpp`、`acc_offload_operators.h`、launch 三件套、entry 四件套、`acc_offload.cpp`、`acc_offload.h`、`pymf_acc_offload.cpp`、`mf_acc_offload.py`、`__init__.py`）。`offload_sparse_copy` 吸收原 notify 实现为唯一入口；`KERNEL_TYPE_MIX_AIV_1_0`（根因 1 修复）保留
+
+最终形态：图内外 H2D/D2H 均为 plain MIX `sparse_copy`，无任何 flag/wait 机制；数据通路排序完全依赖计算队列 FIFO + ACL 流订阅。
 
 debug 探针清理（已完成）：`SGLANG_SELECTIVE_PLAIN_COPY/DEFER_D2H/GATE_D2H_EVENT/SKIP_H2D_WAIT/DUMP_STAGING/DISABLE_D2H/CHECK_FLAGS/DEBUG_SYNC/DEBUG_SLEEP_MS` 及 `_pending_d2h`/`_launch_deferred_d2h` 等全部删除。**保留**：DIFF_DUMP 全套（`SGLANG_SELECTIVE_DIFF_DUMP/DUMP_DIR/DUMP_MAX_STEPS`、`_dbg_*` 缓冲、`dump_diff_snapshot`、`debug_capture_kin`、npu_graph_runner replay 触发）、`D_EAGER`/`MAX_RUNNING_REQ`（eager 对照 dump 工作流）、`STAGING_SLICES`/`UNPACK_WS`（ping-pong 设计参数）、eager 诊断日志、`hisparse_diff_compare.py`。
 
@@ -135,10 +137,13 @@ debug 探针清理（已完成）：`SGLANG_SELECTIVE_PLAIN_COPY/DEFER_D2H/GATE_
 
 ### sglang 侧最终形态
 - RoPE 捕获期重算（根因 3 修复）：`deepseek_v2_attention_mla_npu.py`
-- 图模式 H2D/D2H 均 plain `sparse_copy`（step-2 后），ACL 流订阅无条件保留：`selective_hisparse.py`
+- 图模式 H2D/D2H 均 plain `sparse_copy`（flag 协议已退役），ACL 流订阅无条件保留：`selective_hisparse.py`
 - per-layer staging/scratch/loc-plan + ping-pong workspace（R5/R9/R10，防跨层竞争）：`selective_hisparse.py`
 - idle 早退先于 forward_metadata 访问：`dsa_npu_indexer.py`
 - DIFF_DUMP 埋点与比对工具：`selective_hisparse.py` / `memory_pool_npu.py` / `npu_graph_runner.py` / `hisparse_diff_compare.py`
+
+### memfabric 侧最终形态
+- `sparse_copy` 为唯一拷贝入口（`KERNEL_TYPE_MIX_AIV_1_0`），kernel 无 notify 尾巴；`sparse_copy_notify`/`wait_flag` 全链移除（详见 §5 step-3）
 
 ### 验证配置速查
 ```bash
@@ -167,6 +172,9 @@ python -m sglang.test.few_shot_gsm8k --host http://141.61.49.198 --port 6688 \
 |---|---|
 | eager 19 层 | 0.94（锚点） |
 | graph 19 层（修复前） | 0.74-0.82（线性劣化） |
-| **graph 19 层（修复后）** | **0.90**（step-1 后复测同 0.90） |
+| graph 19 层（修复后） | **0.90** |
+| graph 19 层（step-1：D2H plain） | 0.90 |
+| graph 19 层（step-2：H2D plain + 删 wait/flag） | 0.90 |
+| **graph 19 层（step-3：memfabric 算子删除，最终形态）** | **0.90** |
 
 判读规则：±3pt 为噪声波段；关键结论需复测。
