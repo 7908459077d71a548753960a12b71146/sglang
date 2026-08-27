@@ -541,6 +541,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
+        # D1 round-4/5: capture the draft input handoff BEFORE execution —
+        # a post-execution read could observe the draft graph overwriting
+        # the (graph-pool) hidden tensor, which is itself evidence of pool
+        # aliasing, not of a bad handoff. No-op unless diff-dump enabled.
+        _sel_coord = getattr(
+            self.target_worker.model_runner,
+            "npu_selective_hisparse_coordinator",
+            None,
+        )
+        if (
+            _sel_coord is not None
+            and not forward_batch.forward_mode.is_idle()
+        ):
+            _spec_in = forward_batch.spec_info
+            _sel_coord.debug_capture_draft(
+                hidden_states=getattr(_spec_in, "hidden_states", None),
+                topk_index=getattr(_spec_in, "topk_index", None),
+            )
+
         with canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
@@ -559,22 +578,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
                 )
-            # D1 round-4: bracket the draft chain (no-op unless
-            # SGLANG_SELECTIVE_DIFF_DUMP=1). The handoff state comes from
-            # spec_info; outputs from whichever path executed above.
-            _sel_coord = getattr(
-                self.target_worker.model_runner,
-                "npu_selective_hisparse_coordinator",
-                None,
-            )
+            # D1 round-4: capture the draft outputs (graph/eager converge
+            # here; inputs were captured before execution above).
             if (
                 _sel_coord is not None
                 and not forward_batch.forward_mode.is_idle()
             ):
-                _spec_in = forward_batch.spec_info
                 _sel_coord.debug_capture_draft(
-                    hidden_states=getattr(_spec_in, "hidden_states", None),
-                    topk_index=getattr(_spec_in, "topk_index", None),
                     draft_tokens=draft_tokens,
                     parent_list=parent_list,
                     top_scores_index=top_scores_index,

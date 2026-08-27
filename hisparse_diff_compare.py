@@ -177,13 +177,29 @@ def compare_state(args, first_fp_div):
             r - 1 for r in range(e["rloc"].shape[0])
             if bool((e["rloc"][r, :n] != g["rloc"][r, :n]).any())
         ]
+        hrows_bad = [
+            r - 1 for r in range(e["hidden"].shape[0])
+            if bool((rel_diff(e["hidden"][r, :n], g["hidden"][r, :n])
+                     > 5e-2).any())
+        ]
+        ids_bad = not torch.equal(e["in_ids"][:n], g["in_ids"][:n])
         tag = ""
+        if ids_bad:
+            tag += " IN_IDS DIFFER"
+        if hrows_bad:
+            tag += f" HIDDEN rows bad {hrows_bad[:8]}"
         if rkv_bad:
-            tag += f" RKV WRITE DIFFERS at layers {rkv_bad[:8]}"
+            tag += f" RKV layers {rkv_bad[:8]}"
         if rloc_bad:
-            tag += f" LOC DIFFERS at layers {rloc_bad[:8]}"
-        print(f"pre-divergence step {s}: resident-KV writes "
-              f"{'POISONED —' + tag if tag else 'match'}")
+            tag += f" LOC layers {rloc_bad[:8]}"
+        last = e["hidden"].shape[0] - 1
+        last_ok = not bool(
+            (rel_diff(e["hidden"][last, :n], g["hidden"][last, :n])
+             > 5e-2).any()
+        )
+        print(f"pre-divergence step {s}: "
+              f"{'POISONED —' + tag if tag else 'match'} "
+              f"(final-hidden row {'ok' if last_ok else 'BAD'})")
 
     for s in common:
         if first_fp_div is not None and s < first_fp_div:
@@ -217,6 +233,18 @@ def compare_state(args, first_fp_div):
         e, g = erecs[first_fp_div], grecs[first_fp_div]
         n = min(e["T"], g["T"])
         ids_bad, pos_bad, first_layer, _ = bisect_step(first_fp_div)
+
+        def _nan_inf(t):
+            return int(torch.isnan(t).sum()), int(torch.isinf(t).sum())
+
+        print(f"\nNaN/Inf attribution at step {first_fp_div} "
+              f"(eager, graph):")
+        for fld in ("din_hidden", "dstep_logits", "dstep_hidden"):
+            if fld in e and fld in g:
+                en, ei = _nan_inf(e[fld])
+                gn, gi = _nan_inf(g[fld])
+                print(f"    {fld:14s}: eager nan/inf={en}/{ei}, "
+                      f"graph nan/inf={gn}/{gi}")
         # Root-vs-draft split: with topk=1 the verify tree is a chain and
         # in_ids[0] is the LAST ACCEPTED token of the previous round
         # (accept_lens matched there), in_ids[1:] are this round's fresh

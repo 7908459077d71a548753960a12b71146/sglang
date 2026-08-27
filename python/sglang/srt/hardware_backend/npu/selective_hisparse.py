@@ -761,6 +761,17 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_dstep_hidden_all = torch.zeros(
                 _n_dsteps, T, dtype=torch.float32, device=self.device
             )
+            # Round-5 (handoff aliasing check): LIVE post-replay read of
+            # the verify round's output hidden (logits_output.hidden_states
+            # in on_verify_result) vs the IN-GRAPH frozen final-layer row
+            # (hidden[-1]). If they disagree WITHIN a run, the graph-pool
+            # tensor was overwritten between replay-end and the sample —
+            # pool aliasing, the leading mechanism hypothesis (hisparse's
+            # in-graph temps increase pool churn; draft then reads the
+            # garbage and its logits NaN out).
+            self._dbg_hout = torch.zeros(
+                T, dtype=torch.float32, device=self.device
+            )
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg} "
@@ -1337,17 +1348,20 @@ class NPUSelectiveHiSparseCoordinator:
 
     def debug_capture_draft(
         self,
-        hidden_states: Optional[torch.Tensor],
-        topk_index: Optional[torch.Tensor],
-        draft_tokens: torch.Tensor,
-        parent_list: Optional[torch.Tensor],
-        top_scores_index: Optional[torch.Tensor],
+        hidden_states: Optional[torch.Tensor] = None,
+        topk_index: Optional[torch.Tensor] = None,
+        draft_tokens: Optional[torch.Tensor] = None,
+        parent_list: Optional[torch.Tensor] = None,
+        top_scores_index: Optional[torch.Tensor] = None,
     ):
-        """D1 round-4: bracket the NEXTN draft chain per verify round.
+        """D1 round-4/5: bracket the NEXTN draft chain per verify round.
 
-        Called from EagleWorkerV2.draft() after the draft executes (graph
-        or eager path alike), before build_eagle_verify_input. Together
-        with the verify-round in_ids this splits a divergence into:
+        Called twice from EagleWorkerV2.draft(): before execution with the
+        input handoff only (a post-execution read of the graph-pool hidden
+        would observe the draft graph's own writes — aliasing evidence, not
+        a bad handoff), and after execution with the outputs only.
+        Together with the verify-round in_ids this splits a divergence
+        into:
           din_* differ  -> the handoff INTO the draft is already wrong
                            (previous verify round's sample/compaction)
           din_* match + dout_toks differ -> draft forward itself diverges
@@ -1370,11 +1384,12 @@ class NPUSelectiveHiSparseCoordinator:
                 self._dbg_din_topk[:t].copy_(
                     topk_index.reshape(-1)[:t].to(torch.int64)
                 )
-        t = min(draft_tokens.numel(), self.tcap)
-        if t > 0:
-            self._dbg_dout_toks[:t].copy_(
-                draft_tokens.reshape(-1)[:t].to(torch.int64)
-            )
+        if draft_tokens is not None:
+            t = min(draft_tokens.numel(), self.tcap)
+            if t > 0:
+                self._dbg_dout_toks[:t].copy_(
+                    draft_tokens.reshape(-1)[:t].to(torch.int64)
+                )
         if parent_list is not None:
             t = min(parent_list.numel(), self.tcap)
             if t > 0:
@@ -1723,6 +1738,20 @@ class NPUSelectiveHiSparseCoordinator:
                     rec["logit_rowsum"] = _nt.sum(
                         dim=-1, dtype=torch.float32
                     ).tolist()
+                # Round-5: LIVE read of the verify round's output hidden
+                # right after eagle_sample (before anything else can touch
+                # it). Compare WITHIN-run against the in-graph frozen
+                # final-layer row (state hidden[-1]) and ACROSS-run at
+                # pre-divergence steps.
+                _hs = getattr(logits_output, "hidden_states", None)
+                if _hs is not None:
+                    _th = min(_hs.shape[0], self.tcap)
+                    if _th > 0:
+                        self._dbg_hout[:_th].copy_(
+                            _hs[:_th].reshape(_th, -1).sum(
+                                dim=-1, dtype=torch.float32
+                            )
+                        )
                 # Filenames include the device: with DP attention every
                 # rank shares this dump dir, and a bare-step name would
                 # have the ranks overwrite each other's records.
@@ -1763,6 +1792,8 @@ class NPUSelectiveHiSparseCoordinator:
                     "dstep_hidden": self._dbg_dstep_hidden_all[
                         :, :_n_st
                     ].cpu(),
+                    # Round-5 live handoff read (see _dbg_hout comment)
+                    "hout_live": self._dbg_hout[:_n_st].cpu(),
                 }
                 torch.save(
                     state,

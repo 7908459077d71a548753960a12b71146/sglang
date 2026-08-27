@@ -280,9 +280,17 @@ accept_lens 首个发散 step = S
 - **draft 链第 3 个提案位发散**，且 graph 侧提案为 token 0（疑似 logits 退化/被清零的征兆）。
 - 待 draft 字段（din/dout/dstep）跑出后定：交接态偏 vs draft 前向偏 vs 树拼装偏。
 
-### 第四轮补充探针：draft 链逐 step（4b，已埋点待跑）
+### 第五轮 dump 比对结论（2026-08-28）
 
-`draft_forward` 步循环内（采样后）挂 `debug_capture_draft_step(i, logits, topk_index, hidden_states)`——draft graph capture 复用同一循环，按 Python `i` 选切片，**每步探针各自烘焙进图**，replay 冻结全部中间步。state 文件新增 `dstep_logits/dstep_toks/dstep_hidden` [S,T]。判读（首个 toks DIFFER 的 step k）：
-- `hidden(k-1)` 偏 → 第 k 步输入已漂
-- hidden 同 + logits 偏 → draft 层/lm_head 计算
-- logits 同 + toks 偏 → argmax 数值翻转（顶端近平局）
+- 首发散轮（本轮为 step 2）：root 吻合，draft 提案 slot[2][3][4] 偏（graph 侧退化为 0）。
+- **`din_hidden` 偏 + dstep logits/hidden rel = nan**（steps 0-3 全 nan，未写过的 steps 4-7 双侧零吻合）→ 某侧 draft logits 含 NaN（graph 侧概率大，与提案退化为 token 0 吻合）。
+- 重要修正：round-4 的 din 读取位置在 draft 执行**之后**——读到的可能是 draft graph replay 改写后的 pool 内容。因此「din 偏」的另一解读：**verify 输出 hidden（graph pool 张量）在 draft replay 期间被覆写（pool aliasing）**，draft 读到垃圾→NaN→提案 0。该假设与全部已知事实自洽：E3（无 hisparse）干净、target in-graph frozen 逐层吻合、logits 活读（sample 时）吻合、坏值只出现在"replay 之后才读"的张量上。
+- 嫌疑机制（待证）：hisparse 在 verify 图内的额外分配（每 selected 层的 `out_padded = out.new_zeros(...)` 等 in-graph temp）加剧 graph pool 布局churn，导致 verify 输出 hidden 在仍被引用期间被后续分配（draft graph temp / 下一轮 replay temp）覆写。
+
+### 第五轮探针（已埋点待跑）
+
+1. `hout_live`：on_verify_result（eagle_sample 后）活读 `logits_output.hidden_states` rowsum。**run 内**与 in-graph frozen `hidden[-1]` 对照：不一致 → replay 后被覆写（aliasing 实锤）；跨 run 在 pre-div 轮对照。
+2. `din_*` 改为 draft 执行**前**读取（真 handoff 语义）；输出 `dout_*` 仍在执行后。
+3. analyzer：pre-div 轮现在对比 in_ids + hidden 全行（含 final row）；verdict 增加 NaN/Inf 归属表（eager vs graph 侧各自计数）。
+
+判读：`hout_live(k) == hidden[-1](k)` 但 `din(k+1)` 偏 → 覆写发生在 verify 返回与 draft 读之间（pool aliasing 窗口）；`hout_live(k) != hidden[-1](k)` → 覆写发生在 replay 结束到 sample 之间；`din(k+1) == hout_live(k)` 且都偏 → 上一轮 verify 输出本体就偏。
