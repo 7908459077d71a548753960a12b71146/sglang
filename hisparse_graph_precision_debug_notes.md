@@ -1,8 +1,8 @@
-# NPU Selective HiSparse 图模式精度问题 — 调试记录与当前状态
+# NPU Selective HiSparse 图模式精度问题 — 调试记录与最终结论
 
-> 交接文档。问题：P/D 分离 + Selective HiSparse（19 个 selected 层 KV 驻留 Host DRAM）部署 GLM-5.2 时，D 节点 decode 开启 NPU graph 后数据集准确率 ~0.7（期望 0.94，eager 模式正常）。
+> 交接文档。问题：P/D 分离 + Selective HiSparse（19 个 selected 层 KV 驻留 Host DRAM）部署 GLM-5.2 时，D 节点 decode 开启 NPU graph 后精度随 selected 层数线性劣化（7 层 0.90-0.96 → 19 层 0.74-0.82；eager 锚点 0.94）。
 >
-> 当前状态（2026-08-25）：**已从 0.7 修复到 0.9**，距期望 0.94 还差 4 个点，剩余问题定位中。
+> **最终状态（2026-08-27）：CASE CLOSED，全部收尾完成。** 根因 = RoPE cos/sin 图捕获冻结（第三个根因，见 §4）。修复后 19 层 50 题 **0.90**，层数线性劣化机制消除。前两个根因（kernel 队列类型、ACL 回调订阅，见 §3）是更早阶段 0.7→0.9 的真实修复，仍然有效。completion-flag 协议三步退役（§5）全部完成并逐一复验 0.90。
 
 ## 1. 背景与架构
 
@@ -11,134 +11,162 @@
 ```
 anchor 层(L-3) topk 计算
     → build_loc_plan: topk 位置 → Host pool 逻辑 loc
-    → H2D: sparse_copy 把 topk KV 从 Host DRAM 预取到 HBM packed_staging   [AIV DMA]
+    → H2D: sparse_copy 把 topk KV 从 Host DRAM 预取到 HBM packed_staging   [MIX DMA]
     → selected 层(L) set_kv_buffer → publish_new_packed_kv:
         · new_packed_scratch.copy_(packed_kv)                               [torch 向量算子]
-        · D2H: sparse_copy 把新 KV 备份到 Host DRAM                          [AIV DMA]
+        · D2H: sparse_copy 把新 KV 备份到 Host DRAM                          [MIX DMA]
     → run_selected_attention:
-        · wait H2D → current-patch: 用 scratch 内容覆盖 staging 的 current 行 [torch 向量算子]
+        · current-patch: 用 scratch 内容覆盖 staging 的 current 行           [torch 向量算子]
         · unpack 656B → BF16 → SFA 稀疏注意力                                [计算算子]
 ```
 
 关键文件：
-- sglang: `python/sglang/srt/hardware_backend/npu/selective_hisparse.py`（coordinator，全部 DMA/等待逻辑）
-- sglang: `python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py`（graph capture/replay 集成）
-- sglang: `python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py`（**NPU 实际走的 execute override**）
+- sglang: `python/sglang/srt/hardware_backend/npu/selective_hisparse.py`（coordinator，DMA/patch/SFA 编排）
+- sglang: `python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py`（**RoPE 根因所在**）
+- sglang: `python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py`（NPU 实际走的 execute override）
+- sglang: `python/sglang/srt/hardware_backend/npu/memory_pool_npu.py`（set_kv_buffer → pack → publish）
 - memfabric: `src/acc_offload/csrc/operators/acc_offload_sparse_copy.h/.cpp`（sparse_copy AIV kernel）
-- memfabric: `src/acc_offload/csrc/launch/`（RunOpApiV2 下发链路）
 
-### 已确认的硬件/调度事实（本次调试的核心认知）
-
-**NPU 的 kernel 任务类型决定调度队列**：
+### 硬件/调度事实
 
 | kernel 类型 | 调度队列 | 图 replay 行为 |
 |---|---|---|
 | `KERNEL_TYPE_AIV_ONLY` | 独立向量核队列 | 与计算队列**并行推进、无完成排序** |
 | `KERNEL_TYPE_MIX_AIV_1_0` | 计算核队列 | 与计算算子 **FIFO 串行** |
 
-- 图 replay 时 AIV_ONLY kernel 与计算核算子跨队列并行，stream 只保证发射顺序，不保证完成顺序 → 图内消费者读到未落地的 DMA 数据。
-- zbal 系（`app/zbal/...`）在 decode 图内与 MoE 计算算子正确共存，全部用 `MIX_AIV_1_0`（launch 语法相同，仅任务类型不同）——这是现网已验证的先例。
-- AIV kernel 内部 MTE 队列（TQueBind Alloc/EnQue/DeQue）的异步完成依赖 **ACL host 回调线程**处理 `acl.rt.process_report`；订阅是**按流**的（`acl.rt.subscribe_report`）。
+- AIV kernel 内部 MTE 异步完成依赖 ACL host 回调线程处理 `acl.rt.process_report`；订阅按流（`acl.rt.subscribe_report`）。
+- **NPU graph capture 流程**（`npu_cudagraph_backend.capture_one`）：先对**同一个 forward_batch** 跑 2 次 warmup，再正式 capture —— 这是根因 3 的触发条件。
 
-## 2. 实验与结论时间线
+## 2. 时间线总览
 
-所有图模式实验统一 `--cuda-graph-bs 1`、单请求/数据集（max-concurrency 1）。
-
-| # | 实验 | 结果 | 结论 |
+| 阶段 | 实验 | 结果 | 结论 |
 |---|---|---|---|
-| 0 | eager（`--disable-cuda-graph`） | 精度正常 | 逻辑（W3 scratch、门控、patch、unpack）本身正确；问题图模式专属 |
-| A | 订阅 replay 流到 ACL 回调线程（`SGLANG_SELECTIVE_SUBSCRIBE_REPLAY_STREAM=1`） | 略有改善 | 回调处理与数据落地相关，但非唯一问题 |
-| B | replay 后 `torch.npu.synchronize()` | 无效 | ~~排除跨迭代竞态~~ **结论作废**：探针加错了文件（见下） |
-| C | replay 后 sleep 200ms | 无效 | ~~数据是错的不是晚的~~ **结论作废**：同上 |
-| E | 图内 D2H 备份置零（`SGLANG_SELECTIVE_DISABLE_D2H=1`） | 准确率崩到 0.16 | D2H 备份是主数据路径（decode 前 N 步 KV 必须备份进 Host pool 供后续 H2D 读），不是错误源 |
-| F | staging checksum dump（eager vs graph） | **两侧 sum/nonzero 逐层逐 step 精确吻合** | DMA 数据最终全部正确落地 → 问题 100% 是图内**消费时序**（SFA 读早于 DMA 落地），不是数据错误 |
-| G | flag 协议 v1：copy 尾部原子计数 + AIV wait_flag 自旋 | 精度不变（0.7） | **修复无效原因**：wait_flag 也是 AIV_ONLY，与 copy 同在向量队列，FIFO 使自旋恒真；真正要 gate 的 SFA 在计算队列，不受影响 |
-| H | copy/wait_flag 改 `KERNEL_TYPE_MIX_AIV_1_0` | 0.7 → 0.78 | 队列修复部分起效（copy 与 SFA 同队列 FIFO 有序） |
-| I | H 基础上再开实验 A 的订阅 | **0.78 → 0.9** | 订阅 replay 流是独立必要条件（MTE 异步完成的 host 侧处理） |
+| 早期 | eager 基线 | 0.94 正常 | 逻辑本身正确，问题图模式专属 |
+| 早期 | exp F staging checksum | 两侧逐层吻合 | DMA 数据落地正确 → 时序问题 |
+| 根因 1 | sparse_copy/wait_flag 改 `MIX_AIV_1_0` | 0.70 → 0.78 | copy 与 SFA 同队列 FIFO 有序 |
+| 根因 2 | 订阅 replay 流到 ACL 回调线程 | 0.78 → 0.90 | MTE 完成报告的 host 侧处理 |
+| 层数扫描 | 7L/10L/19L | 0.90-0.96 / 0.88 / 0.74-0.82 | **7-9 层阈值 + 线性劣化 ~1.25pt/层** |
+| 排除法 R5-R13 | per-layer staging/scratch/loc-plan、ping-pong、删 D2H wait、H2D wait A/B、MTE3_S 回退 | 全部波段内 no-op | python 可及的所有杠杆均非毒源 |
+| 排除法 B/C/E/C8 | notify tail、plain copy、spec 维度（draft=1/3/6） | 全部波段内 no-op | flag 协议、spec 维度排除 |
+| **D1 定位** | 内容级 diff dump（eager vs graph 逐字段） | kin 位级一致 / **kinv 差 65%** / pos 一致 | **锁定 RoPE**（见 §4） |
+| **修复** | 捕获期强制重算 cos/sin | 19 层 **0.90** | 案件关闭 |
+| 收尾 step-1 | graph D2H 切 plain sparse_copy | 0.90 | notify tail 无消费者，可删（修复后复验） |
+| 收尾 step-2 | graph H2D 切 plain + 删 wait_flag/flag 缓冲 | 0.90 | H2D wait 与 flag 协议 python 侧证伪 |
+| 收尾 step-3 | memfabric 删 sparse_copy_notify/wait_flag 算子及 notify 尾巴，重编部署 | 0.90 | flag 机制整体退役收官，纯 MIX plain copy 即最终形态 |
 
-**重要教训（B/C 作废原因）**：NPU 的 decode verify 走 `NPUGraphRunner.execute()`（`npu_graph_runner.py`），完全 override 父类 `DecodeCudaGraphRunner.execute()`（`decode_cuda_graph_runner.py`）。探针加在父类是死代码。改 NPU 侧 runner 逻辑必须改 `npu_graph_runner.py`。
+**排除法全程的重要方法论**：gsm8k 50 题单次运行有 ±3pt 散布，判读必须用波段；前 15 轮"no-op"结论中有部分是在 RoPE bug 主导噪声下测的，修复后需复验（step-1/2 即此目的）。
 
-## 3. 最终确认的根因（两个叠加）
+## 3. 根因 1/2（早期已修复，0.7 → 0.9）
 
-### 根因 1：kernel 队列类型错误（已修复 → 0.78）
+### 根因 1：kernel 队列类型错误
+`sparse_copy` 原为 `KERNEL_TYPE_AIV_ONLY`：图 replay 时 copy 在向量队列、patch/SFA 在计算队列并行推进 → SFA 读到未落地的 DMA 数据。
+**修复**：copy 与 wait_flag 改 `KERNEL_TYPE_MIX_AIV_1_0`（zbal 范式）。文件：`acc_offload_sparse_copy.cpp`。
 
-`sparse_copy` 原为 `KERNEL_TYPE_AIV_ONLY`：图 replay 时 copy 在向量队列、patch/SFA 在计算队列，并行推进 → SFA 读 staging 时 H2D DMA 未落地 → 读到上一步旧数据。随生成长错误累积（表现：长输出先对后错、陷入复读循环）。
-**修复**：copy 与 wait_flag 改 `KERNEL_TYPE_MIX_AIV_1_0`（zbal 范式），与计算算子同队列 FIFO。文件：`acc_offload_sparse_copy.cpp`。
+### 根因 2：ACL 回调未订阅 replay 流
+MTE 异步完成报告按流路由；原实现只订阅 capture 流，replay 在主流执行从未被订阅 → 图内 sparse_copy 的完成报告无人处理。
+**修复**：`prepare_graph_replay` 中无条件订阅当前流（幂等）——此订阅在 flag 协议退役后仍保留（plain copy 的 DMA 完成同样依赖它）。
 
-### 根因 2：ACL 回调未订阅 replay 流（已修复 → 0.9）
+## 4. 根因 3（最终根因）：RoPE cos/sin 图捕获冻结
 
-AIV kernel 的 MTE 异步搬运完成依赖 host 侧 `acl.rt.process_report` 被处理；订阅按流路由。原实现只订阅 capture 流，replay 在主流执行、从未被订阅 → 图内 sparse_copy 的 MTE 完成报告无人处理。
-**修复**：`prepare_graph_replay` 中订阅当前流（目前仍由 `SGLANG_SELECTIVE_SUBSCRIBE_REPLAY_STREAM=1` 门控，**待固化为无条件**）。
+### 现象约束（15 轮排除法收敛出的指纹）
+- 纯层数效应：7-9 层阈值 + 线性 1.25pt/层
+- eager 完全干净（跨 run 位级确定）
+- 所有同步机制（flag/wait/notify/sleep/sync）全部 no-op
 
-## 4. 当前剩余问题（0.9 → 0.94，待定位）
+### 定位过程（D1 内容级 diff，逐字段二分）
+工具：`selective_hisparse.py` 的 DIFF_DUMP 埋点（`SGLANG_SELECTIVE_DIFF_DUMP=1`）+ `hisparse_diff_compare.py`（repo 根目录）。warmup 步（所有 DP rank 内容相同）即可定罪。
 
-已排除：数据错误（exp F dump 证明落地数据正确）、D2H 备份写坏、跨迭代竞态。
-
-### 主要嫌疑：torch 向量算子与 MIX copy 的跨队列竞态（根因修复引入的）
-
-改 MIX 后 copy 挪到计算队列，但 patch/scratch 的 torch 算子（`torch.where`、`copy_`）若调度在向量队列，原 AIV_ONLY 时代同队列 FIFO 保证的两个有序关系被破坏：
-
-| 操作对 | AIV_ONLY 时代（同向量队列，有序） | MIX 时代（可能竞态） |
+| 步骤 | 证据 | 排除/锁定 |
 |---|---|---|
-| H2D copy ↔ current-patch（读 staging） | ✓ | 竞态 |
-| D2H copy ↔ 下层 `new_packed_scratch.copy_`（写 scratch） | ✓ | 竞态（D2H 备份了"下一层"数据 → Host pool 污染） |
+| ① | q margin 6.5e-08、locs/valid/stg_pre 精确匹配 | 上游模型状态、H2D 数据、patch 计划全部排除 |
+| ② | pub == pkg（run 内比较，两侧 0/6） | stale scratch 读取排除 |
+| ③ | eager vs eager2 跨 run 全字段位级 MATCH | 量化算子非确定性排除 |
+| ④ | **kin（k_nope，不旋转）0/6 bad vs kinv（k_rope，过 RoPE）6/6 bad rel 0.65** | 锁定 RoPE——同一投影输出的两个切片，没旋转的位级一致 |
+| ⑤ | pos（forward_batch.positions）匹配 | positions buffer 本身排除 → 毒在 RoPE 读 positions 的方式 |
 
-### 下一步计划（按序）
+### 根因机制
+`_apply_dsa_interleave_half_rope`（`SGLANG_NPU_USE_MLAPO=1` 启用，DSA 路径）把 cos/sin latch 到 `forward_batch.npu_dsa_interleave_half_rope_cache` 供层间复用：
 
-1. **校准基线**：同数据集跑 eager 准确率，确认 0.94 是 eager 实测值（若 eager 也 ~0.9，剩余差距与图模式无关）
-2. **固化订阅**：去掉 `SGLANG_SELECTIVE_SUBSCRIBE_REPLAY_STREAM` env 门控，`prepare_graph_replay` 无条件订阅（幂等）
-3. **dump 比对**：在 0.9 配置上重跑 exp F（`SGLANG_SELECTIVE_DUMP_STAGING=1`），找 sum 开始偏离 eager 轨迹的 step/层，定位到 H2D 或 D2H 哪条链路
-4. **若确认跨队列竞态**：架构改为「copy 保持 AIV_ONLY（回向量队列，与 torch 向量算子同队列 FIFO）+ wait_flag 改 MIX（计算队列自旋等 copy 完成再放行 SFA）」——flag 协议的原始设计意图；注意 expect 的 `add_` 是 torch 算子（队列不确定），需改为 kernel 内部轮次计数
-5. **多 bs 回归 + 性能**：`--cuda-graph-bs 8 16` 回归；MIX copy 与计算抢核的性能代价评估（必要时双模式：图内 MIX/图外 AIV_ONLY 或减 blockDim）
+1. capture 流程先跑 2 次 warmup（同一个 forward_batch）→ 第 1 次 warmup 用**假 positions** 算出 cos/sin 并 latch
+2. capture run 走缓存分支 → **`index_select(positions)` 计算链从未被录进图**
+3. 每次 replay：positions buffer 正确更新（pos 捕获证实），但 cos/sin 永远是 warmup 时刻的角度 → q_pe/k_pe 全部用错角度旋转
+4. 每个 selected layer 每步都把错角度 k_rope 写进 KV/host 池 → 毒按层数线性累积
 
-## 5. 已实现的代码改动清单
+完美解释全部观测：kin 位级一致（不旋转）、kinv 差 65%（角度错）、pos 匹配（buffer 没问题）、线性劣化（每层注入同剂量毒）、eager 干净（每步新 ForwardBatch 重算）。
 
-### memfabric（需重编 `libmf_hybm_accoffload.so` + 重装 python 包）
+### 修复（一处改动，覆盖所有图）
+`deepseek_v2_attention_mla_npu.py` `_apply_dsa_interleave_half_rope`：
 
-| 文件 | 改动 |
-|---|---|
-| `src/acc_offload/csrc/operators/acc_offload_sparse_copy.h` | ① `OffloadSparseCopyKernel` 增 `notify` 参数 + `NotifyDone()`（TBuf + S_MTE3 硬事件，32B 对齐 8-lane 原子加，lane0=+1）；② 新增 `OffloadWaitFlagKernel`（单核 dcci 自旋 `flag[0]==expect[0] && flag[2]==expect[1]`，超时 assert） |
-| `src/acc_offload/csrc/operators/acc_offload_sparse_copy.cpp` | 两个 kernel 均改 `KERNEL_TYPE_MIX_AIV_1_0`（**核心修复**）；`OffloadOpsWaitFlag`（blockDim=1） |
-| `src/acc_offload/csrc/operators/acc_offload_operators.h` | 签名加 `notifyPtr`；声明 `OffloadOpsWaitFlag` |
-| `src/acc_offload/csrc/launch/acc_offload_operators_launch.cpp` | `AccOffloadSparseCopy` 透传 notify + A5 上 blockDim=64；新增 `AccOffloadWaitFlag`（RunOpApiV2 `"acc_wait_flag"`） |
-| `src/acc_offload/csrc/launch/acc_offload_launch.h/.cpp` | dlopen 符号表增 `AccOffloadWaitFlag`，函数指针类型更新 |
-| `src/acc_offload/csrc/acc_offload_entry.h`、两个 entry `.h/.cpp`、`acc_offload_entry_manager.h/.cpp` | `SparseCopy` 增 notifyPtr；新增 `WaitFlag` |
-| `src/acc_offload/include/host/acc_offload.h`、`src/acc_offload/csrc/acc_offload.cpp` | C API：`offload_sparse_copy_notify`（旧入口转调、notify=0 兼容）、`offload_wait_flag` |
-| `src/acc_offload/csrc/python_wrapper/pymf_acc_offload.cpp` | pybind：`sparse_copy_notify` / `wait_flag` |
-| `src/smem/python/memfabric_hybrid/memfabric_hybrid/mf_acc_offload.py`、`__init__.py` | python wrapper（torch.device → `.index`、`.data_ptr()`）+ 导出 `offload.sparse_copy_notify` / `offload.wait_flag` |
+```python
+_capturing = False
+try:
+    _capturing = torch.npu.is_current_stream_capturing()
+except (AttributeError, RuntimeError):
+    pass
+if rope_cache is None or _capturing:
+    m.rotary_emb.get_cos_sin_with_position(positions)
+    ...  # 重算并 latch
+```
 
-### sglang（`python/sglang/srt/hardware_backend/npu/selective_hisparse.py`）
+捕获期强制重算 → 计算链被录进图 → replay 用真实 positions 重算。eager latch 语义不变。
 
-- **flag buffers**（`_alloc_staging_buffers`）：`h2d_flag/h2d_expect/d2h_flag/d2h_expect` 各 int32[16]（64B 独占 cacheline）；`_dma_flag_block_num = 64`
-- **单调计数协议**（magic 方案已废弃——magic bump 是 Python 值会被 capture 固化）：每次 `sparse_copy_notify`（kernel 无条件 +64）配对一个 **captured op** `expect[0].add_(64)`；`wait_flag` 自旋 `count == expect`；count 只增 + 1:1 配对 → 陈旧 flag 不可能通过
-- **H2D 提交**（`maybe_start_prefetch`）：图模式走 `sparse_copy_notify` + `expect += 64`
-- **H2D 消费**（`run_selected_attention`）：图模式在 patch/SFA 前 `wait_flag`
-- **D2H 提交**（`publish_new_packed_kv`）：图模式走 `sparse_copy_notify` + `expect += 64`
-- **D2H 消费**（`publish` 开头）：覆盖共享 scratch 前 `wait_flag`（首轮 count==expect==0 直过）
-- **capture 前**（`prepare_graph_capture`）：`npu.synchronize()` + 四个 flag/expect 清零
-- **eager→graph 桥接**（`_bridge_eager_to_graph`）：有 eager DMA 在飞时补 `npu.synchronize()`（eager 路径无 flag，防首轮假通过）
-- **eager 路径完全未动**（原 event 机制）
-- 调试开关（env，默认关）：`SGLANG_SELECTIVE_DUMP_STAGING`（staging checksum，eager 侧打每层、graph 侧在 `npu_graph_runner.py` execute 里打每 replay）、`SGLANG_SELECTIVE_SUBSCRIBE_REPLAY_STREAM`、`SGLANG_SELECTIVE_DEBUG_SYNC`、`SGLANG_SELECTIVE_DEBUG_SLEEP_MS`、`SGLANG_SELECTIVE_DISABLE_D2H`
+### 验证
+- warmup 步 dump：kinv/pub/stg_post 0/6 bad，out max rel diff 2.1e-07（全字段位级一致）
+- 19 层 50 题：**0.90**（修复前 0.74-0.82；npu graph True 全图生效）
+- 剩余 4pt = graph/eager 常规数值差（7 层时代即有同款 gap）
 
-### 注意：MIX 类型下 flag 协议目前是冗余保险
+### 通用教训（同类隐患模式）
+任何「首次计算后 latch 到 forward_batch 供后续层复用」的 positions 依赖缓存，在 NPU capture 流程（warmup×2 + capture 共用同一 forward_batch）下都会把计算链挡在图外。排查清单：
+- `npu_dsa_interleave_half_rope_cache`（已修）
+- `npu_mlaprolog_runtime_cache`（LongCat，layer0 无条件刷新，语义正确）
+- `rotary_emb.sin_cos_cache`（start_layer 条件刷新，同型风险，建议复核）
 
-copy 与 wait_flag 同在计算队列后 FIFO 已保证有序，wait 恒瞬过（零自旋开销）。若第 4 步把 copy 改回 AIV_ONLY，flag 协议才真正承担 gating 职责。
+## 5. 收尾清理（flag 机制退役）
 
-## 6. 验证配置速查
+RoPE 修复后，completion-flag 协议（`sparse_copy_notify` + `wait_flag`）按 A/B 步进退役（每步 50 题验证波段保持）：
 
+- **step-1（已完成，0.90 验证通过）**：graph D2H 切 plain `sparse_copy`（R11 删 D2H wait 后 notify tail 无消费者，纯开销）
+- **step-2（验证中）**：graph H2D 切 plain `sparse_copy` + 删 `wait_flag` 调用 + 删 4 个 flag/expect 缓冲。依赖：copy 与消费者同在计算队列 FIFO 有序；ACL 流订阅保留
+- **step-3（待 step-2 通过）**：memfabric 仓库删除 `sparse_copy_notify`/`wait_flag` 导出算子及 kernel 内 notify 尾巴，重编部署
+
+debug 探针清理（已完成）：`SGLANG_SELECTIVE_PLAIN_COPY/DEFER_D2H/GATE_D2H_EVENT/SKIP_H2D_WAIT/DUMP_STAGING/DISABLE_D2H/CHECK_FLAGS/DEBUG_SYNC/DEBUG_SLEEP_MS` 及 `_pending_d2h`/`_launch_deferred_d2h` 等全部删除。**保留**：DIFF_DUMP 全套（`SGLANG_SELECTIVE_DIFF_DUMP/DUMP_DIR/DUMP_MAX_STEPS`、`_dbg_*` 缓冲、`dump_diff_snapshot`、`debug_capture_kin`、npu_graph_runner replay 触发）、`D_EAGER`/`MAX_RUNNING_REQ`（eager 对照 dump 工作流）、`STAGING_SLICES`/`UNPACK_WS`（ping-pong 设计参数）、eager 诊断日志、`hisparse_diff_compare.py`。
+
+## 6. 当前代码状态与验证配置
+
+### sglang 侧最终形态
+- RoPE 捕获期重算（根因 3 修复）：`deepseek_v2_attention_mla_npu.py`
+- 图模式 H2D/D2H 均 plain `sparse_copy`（step-2 后），ACL 流订阅无条件保留：`selective_hisparse.py`
+- per-layer staging/scratch/loc-plan + ping-pong workspace（R5/R9/R10，防跨层竞争）：`selective_hisparse.py`
+- idle 早退先于 forward_metadata 访问：`dsa_npu_indexer.py`
+- DIFF_DUMP 埋点与比对工具：`selective_hisparse.py` / `memory_pool_npu.py` / `npu_graph_runner.py` / `hisparse_diff_compare.py`
+
+### 验证配置速查
 ```bash
-# 当前 0.9 的配置（D 节点）
-export SGLANG_SELECTIVE_SUBSCRIBE_REPLAY_STREAM=1
-# 启动参数（其余同 pd_disaggregation_dram_offload.sh 默认）
---cuda-graph-bs 1
-# eager 基线
---cuda-graph-bs 8 16 --disable-cuda-graph   # 保留 bs 参数防 fixed bias 膨胀到 14GB（bug：disable_cuda_graph 时 bias 仍按默认 bs 列表 512 计算，见下）
+# D 节点启动（19 层标准规格，repo 根目录）
+D_MEM_FRACTION=0.915 \
+SELECTIVE_LAYER_IDS="5 9 13 17 21 25 29 33 37 41 45 49 53 57 61 65 69 73 77" \
+bash pd_disaggregation_dram_offload.sh
+
+# bench（路由节点）
+python -m sglang.test.few_shot_gsm8k --host http://141.61.49.198 --port 6688 \
+    --num-questions 50 --num-shots 5 --data-path /home/r00648901/GSM8K.jsonl
+
+# diff-dump 对照（需要时）
+# eager 侧: D_EAGER=1 MAX_RUNNING_REQ=24 + SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=<dir>
+# graph 侧: 标准启动 + 同款 dump env；比对: python hisparse_diff_compare.py --eager-dir <e> --graph-dir <g>
+#   工具自动取两边共同 dev（同 DP rank 同请求流）；[VERDICT] 段自动裁决量化输入/输出
 
 # 已知配置坑
-# 1) --disable-cuda-graph 时若删掉 --cuda-graph-bs，pool_configurator 的
-#    _compute_selective_fixed_bias 取默认 bs 列表 max=512 → bias 14GB → 启动失败
-#    （fix：disable_cuda_graph 时不该用 graph bs cap bcap；尚欠代码修复）
-# 2) eager 满载时 token 数超过 SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
-#    会复发 161002（当前 max-concurrency 1 不受影响）
-# 3) D_MEM_FRACTION=0.92 与图模式配对可过；eager 激活峰值更高需下调
+# 1) --disable-cuda-graph 时保留 --cuda-graph-bs，否则 fixed bias 按默认 bs 列表 max=512 计算到 14GB
+# 2) eager 满载 token 数超 SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128 复发 161002
+# 3) eager 19 层需 MAX_RUNNING_REQ=24 压内存
 ```
+
+### 精度矩阵（RoPE 修复后）
+| 配置 | 精度 |
+|---|---|
+| eager 19 层 | 0.94（锚点） |
+| graph 19 层（修复前） | 0.74-0.82（线性劣化） |
+| **graph 19 层（修复后）** | **0.90**（step-1 后复测同 0.90） |
+
+判读规则：±3pt 为噪声波段；关键结论需复测。
