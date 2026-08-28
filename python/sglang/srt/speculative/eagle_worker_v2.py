@@ -562,7 +562,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
                 # real (non-bucket-padded) rows per chain step; topk=1
                 # chains carry one row per real request
-                real_chain_tokens=int(batch.batch_size) * self.topk,
+                real_chain_tokens=int(batch.batch_size()) * self.topk,
             )
             # Round-7: draft KV history content + seq_lens fingerprints
             # (the chain's remaining unprobed inputs).
