@@ -418,7 +418,16 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 - attn hook 的 [0,2,3] 错位确认（hook 与直捕不一致时以直捕为准），不再追。
 - 附带确认：am_seqlens graph [6,7,8,9] = seq+step+1 逐后端独立刷新 ✓（round-12 修复的旁证）。
 
-### Round-16 探针（已埋点待跑）：kernel 最后两个未验证输入
+### Round-16 重采判读（2026-08-29）
+
+- **`am_tik` rel=0**：sparse_indices 与 eager 逐位一致 → **indexer 排除**。
+- **`am_qpe` rel=1**：q_rope 有差异，但 step-0 值未打印（analyzer 已补 am_qpe/am_tik/am_bt/attn_raw 进逐链步数值打印）。
+- 注意：graph 侧 am_q/am_qpe 的 steps1-3 为 0 = 探针未写入零（forward_sparse 探针只在 step0 成功写入），判读只看 step0。
+- 待办：重跑比对看 am_qpe[0]：
+  - 不一致 → q_rope 在图内 RoPE 时读到脏 cos/sin cache（`fix cos/sin recompute` 路径）→ 探 rotary cache 内容
+  - 一致 → kernel 全部输入逐位一致仍输出 NaN → captured-replay kernel bug → 升级 CANN/算子侧
+
+### Round-16 探针（2026-08-29，已埋点）
 
 `am_tik`（sparse_indices——DSA indexer 的 KV 位置选择）+ `am_qpe`（q_rope）。判定：
 - `am_tik` 不一致 → indexer 在图内读到脏 **index_k cache**（DSA indexer 自己的 cache，dkvh 未覆盖；与主 KV 同类的图内状态问题）→ 下轮探 set_index_k_buffer 路径

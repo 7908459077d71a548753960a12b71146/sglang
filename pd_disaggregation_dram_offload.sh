@@ -249,19 +249,16 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-16: kernel 内部最后一层未验证输入 ----------
-# Round-15 定案: attn_raw NaN@[0,1,2,3] —— NaN 诞生于 attention kernel 内部;
-# 而其已验证输入 q/kvlen/block_tables 全部与 eager 逐位一致。
-# 剩余两个未验证输入, 新增探针(显式 step):
-#   am_tik — sparse_indices (DSA indexer 的 KV 位置选择; 垃圾索引 = OOB 读)
-#   am_qpe — q_rope (query 的另一半)
-# 判定: am_tik 不一致 -> indexer 在图内读到脏 index_k cache(与主 KV 同类,
-#   dkvh 未覆盖) -> 下轮探 set_index_k_buffer 的 cache 内容;
-#   am_tik 一致 + am_qpe 一致但 kernel 仍 NaN -> kernel 自身对相同输入在
-#   图内算出 NaN(captured-replay bug) -> 升级给 CANN/算子侧
-# graph: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph20 bash pd_disaggregation_dram_offload.sh
-# eager: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager20 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager20 --graph-dir /root/hisparse_dump/graph20
+# ---------- Round-16 b: am_qpe step0 值判定（无需重采）----------
+# Round-16: am_tik rel=0(sparse_indices 逐位一致, indexer 排除); am_qpe rel=1
+# (q_rope 有差异但 step0 值未打印); attn_raw 仍 NaN@[0-3]。
+# 重跑比对(同 graph20/eager20 dump), 看 am_qpe 逐链步数值:
+# python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager20 --graph-dir /root/hisparse_dump/graph20
+# 判定(看 step0, 即第一个元素; steps1-3 的 0 是未写入零, 忽略):
+#   am_qpe[0] 不一致 -> q_rope 在图内 RoPE 时读到脏 cos/sin cache
+#     (fix cos/sin recompute 路径) -> 探 rotary cache 内容
+#   am_qpe[0] 也一致 -> kernel 全部输入逐位一致仍输出 NaN
+#     -> captured-replay kernel bug, 升级 CANN/算子侧
 #
 # [可选实证] E3 warmup 对比: 证明 draft NaN 与 hi-sparse 无关(git 考古已证
 #   代码路径早于 hi-sparse; 此实验为运行时铁证):

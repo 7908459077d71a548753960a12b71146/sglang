@@ -323,7 +323,8 @@ def compare_state(args, first_fp_div):
                 print(f"    {k:8s}: {ev[0].tolist()} | {gv[0].tolist()}")
         # Attention metadata probes: print ALL chain steps — the kvlen the
         # graph attention sees vs eager is the round-11 poison candidate.
-        for k in ("am_kvlen", "am_seqlens", "am_q"):
+        for k in ("am_kvlen", "am_seqlens", "am_q", "am_qpe", "am_tik",
+                  "am_bt", "attn_raw"):
             if f"dm_{k}" in e and f"dm_{k}" in g:
                 ev, gv = e[f"dm_{k}"], g[f"dm_{k}"]
                 print(f"    {k:8s}: {ev.flatten().tolist()} | "
