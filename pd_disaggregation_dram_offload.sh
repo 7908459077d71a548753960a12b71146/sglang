@@ -249,20 +249,24 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-12: 根因定案 + 修复验证（warmup 采集即可）----------
-# 根因定案: graph 下 draft 链 attention 读到的 KV 长度是 capture 烘焙常数
-# (am_kvlen: eager [6,7,8,9] vs graph [15,15,15,15]), step0 的 q 两侧完全
-# 一致 -> 唯一差异是 kvlen; 越界读未初始化 KV -> NaN -> 提案退化 0。
-# 已实施修复: _apply_cuda_graph_metadata 随 seq_lens 一并原地刷新
-# actual_seq_lengths_kv; 并新增 am_seqlens 探针(metadata.seq_lens)。
-# 验证(warmup 采集, 无需请求/精度):
-# graph: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph16 bash pd_disaggregation_dram_offload.sh
-# eager: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager16 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager16 --graph-dir /root/hisparse_dump/graph16
-# 判定:
-#   dstep_toks graph 侧不再是 0 / dstep_logits 无 NaN -> 修复生效
-#   am_kvlen 仍 15 且 am_seqlens 正确(6/7/8/9) -> 换 actual_seq_lengths_kv
-#     的赋值来源(找 DSA 路径把它设成 baked 张量的位置), 改为 buffer+refresh
-#   am_seqlens 也 15 -> replay 刷新路径本身没跑/写错, 查 wrapper 分发
+# ---------- Round-12 b: 修复未生效, 分析 am_seqlens（无需重采）----------
+# 修复未命中: am_kvlen 仍 [15,15,15,15]; 但新增 am_seqlens(rel 2) 与 am_kvlen
+# 不同 -> forward_sparse 走的不是回退分支, actual_seq_lengths_kv 是独立的
+# baked 张量, 且我的刷新没写到它(或写的 metadata 对象不是 forward_sparse 读的)。
+# 重跑比对(同 graph16/eager16 dump), 看 am_seqlens 逐链步数值:
+# python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager16 --graph-dir /root/hisparse_dump/graph16
+# 判读(待数值):
+#   am_seqlens = 6/7/8/9(正确) -> seq_lens 刷新正常, 15 只在
+#     actual_seq_lengths_kv 上 -> 找到它被赋值的 DSA 路径, 把 baked 张量改为
+#     buffer+refresh(赋值点在哪, am_seqlens 正确说明 refresh 机制本身通的)
+#   am_seqlens 也是常数 15 -> wrapper 的 replay 刷新对 per-step 后端没生效,
+#     查 AscendAttnMultiStepDraftBackend.init_forward_metadata_out_graph 分发
 # 修复确认后: 跑 gsm8k 200 题复核精度对齐(50 题噪声 ±2pt, 今日两模式
 #   全部落在 0.88~0.94 交叠带, 垃圾提案不影响贪心精度)。
+#
+# [可选实证] E3 warmup 对比: 证明 draft NaN 与 hi-sparse 无关(git 考古已证
+#   代码路径早于 hi-sparse; 此实验为运行时铁证):
+# graph: SELECTIVE_LAYER_IDS="" SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph17e3 bash pd_disaggregation_dram_offload.sh
+# eager: SELECTIVE_LAYER_IDS="" SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager17e3 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager17e3 --graph-dir /root/hisparse_dump/graph17e3
+# (E3 下 selective 探针不触发属预期; 看 dstep_logits 的 graph NaN 是否仍在)

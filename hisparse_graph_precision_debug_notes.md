@@ -375,6 +375,22 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 - `am_kvlen` 仍 15 且新增 `am_seqlens`（metadata.seq_lens）正确（6/7/8/9）→ 15 在别的字段，找 DSA 路径把 actual_seq_lengths_kv 设成 baked 张量的赋值点改为 buffer+refresh
 - `am_seqlens` 也 15 → replay 刷新路径本身没跑/写错，查 wrapper 分发
 
+### Round-12 b：修复未命中，分析 am_seqlens（2026-08-28）
+
+- 修复未生效：`am_kvlen` 仍 [15,15,15,15]。
+- 但 `am_seqlens`（metadata.seq_lens，rel 2）与 `am_kvlen`（rel 1.5）**数值不同** → forward_sparse 走的不是回退分支，`actual_seq_lengths_kv` 是**独立存在的 baked 张量**，且我的刷新没写到它（或写的 metadata 对象不是 forward_sparse 读的那个）。
+- 本轮精度 eager 0.96 / graph 0.92——eager 自身跨跑 0.88~0.96 波动，噪声带结论进一步巩固。
+- 待办：重跑比对看 am_seqlens 逐链步数值（analyzer 已补打印）：
+  - am_seqlens = 6/7/8/9（正确）→ seq_lens 刷新正常，15 只在 actual_seq_lengths_kv 上 → 找到它的 DSA 赋值点，把 baked 张量改为 buffer+refresh
+  - am_seqlens 也是常数 15 → wrapper 的 replay 刷新对 per-step 后端没生效，查 `AscendAttnMultiStepDraftBackend.init_forward_metadata_out_graph` 分发
+
+### 归属结论：该 bug 与 hi-sparse 无关（2026-08-28）
+
+- **Git 考古**：问题路径（`AscendAttnMultiStepDraftBackend` + `_apply_cuda_graph_metadata` 缺失 `actual_seq_lengths_kv` replay 刷新）源自 2025-12-04 / 2026-06-02 的提交；本分支触及 ascend_backend.py 的仅 3 个提交——hi-sparse 功能（36 行，纯 forward_sparse selected 层路由）+ 调试探针/修复。
+- **机制上不可能是精度差距成因**：bug 效果 = 垃圾提案 → 接受率塌 1 → 性能损失；贪心精度由 target argmax 决定（已证 target 前向对相同输入逐位一致）。
+- **为何现在才暴露**：hi-sparse 排查建的 diff-dump 第一次深入 draft 链内部；此前该 bug 一直默默吃掉 spec 加速。
+- **运行时铁证（可选，warmup 级成本）**：E3 warmup 对比（SELECTIVE_LAYER_IDS=""），NaN 仍在即终证。
+
 ### Round-11 重采判读（2026-08-28，warmup-only dump）
 
 1. **dump 全部来自 warmup（未发任何请求）**：
