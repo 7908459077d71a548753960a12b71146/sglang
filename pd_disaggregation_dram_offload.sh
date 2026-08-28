@@ -249,13 +249,19 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-9 判读推进（无需重采——analyzer 已加 step-0 明细）----------
-# 上轮结论: lmw 权重逐位一致(权重被踩排除); lmout(processor 出口)graph 无 NaN
-# 而 dstep_logits(draft_forward 内)每步 NaN -> NaN 在 runner 尾部写入共享
-# logits buffer, 或 lmout/dstep 之间发生了缓冲区替换。
-# 重跑比对命令即可(同 graph13/eager13 dump), 新输出含 step-0 链值明细:
-#   out -> lmin -> lmw -> lmout -> dstep_logits 逐位置 eager|graph 值,
-#   第一个 graph 侧变 NaN 的位置 = 毒点写入点。
-# python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager13 --graph-dir /root/hisparse_dump/graph13
+# ---------- Round-10 dump 跑（修复 dm 切片索引——本轮必须重采）----------
+# 上轮 step-0 表暴露: inner/outer 双 begin 计数器基线在 eager(每轮经 draft()
+# 重置)与 graph(capture 时基线任意)之间错位, dm 全表跨 run 比对不可信。
+# 已修: draft_forward 循环内 debug_draft_mark_step(i) 显式标记链 step,
+# 模型文件全部改读 current step; 链尾 mark(-1) 防 draft-extend 污染。
+# 重采后 dm 表(按管线序 ids/pos -> prevraw/prev -> emb -> eh -> attn/mlp
+# -> out -> lmin -> lmw -> lmout)首次完全可信: graph 侧首个 NaN/发散键 = 毒点。
+# 已知可靠事实: dstep_logits graph 侧 4 个已执行链步(0-3)全部 NaN, 链输入全净。
 #
-# (若需重采, 命令同前: DIFF_DUMP=1 + DUMP_DIR=/root/hisparse_dump/{graph,eager}13 + curl 单请求)
+# 快速采集(不跑精度, 单请求短输出):
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph14 bash pd_disaggregation_dram_offload.sh
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager14 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+#   采集请求(路由节点发一次即可; 同一 prompt 两侧各发一次):
+# curl http://141.61.49.195:31000/generate -H 'Content-Type: application/json' \
+#   -d '{"text": "The capital of France is", "sampling_params": {"max_new_tokens": 64, "temperature": 0}}'
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager14 --graph-dir /root/hisparse_dump/graph14

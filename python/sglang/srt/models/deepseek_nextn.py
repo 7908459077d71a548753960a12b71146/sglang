@@ -245,7 +245,10 @@ class DeepseekModelNextN(nn.Module):
                     else input_embeds.device
                 )
                 if _dm_coord is not None:
-                    _dm_step = _dm_coord.debug_draft_model_begin()
+                    # Round-10: slice = the chain step marked by
+                    # draft_forward (debug_draft_mark_step) — true step
+                    # index, aligned across eager/graph.
+                    _dm_step = _dm_coord.debug_draft_current_step()
                     _dm_coord.debug_capture_draft_inner(
                         _dm_step, "ids", input_ids
                     )
@@ -480,7 +483,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             input_ids.device
         )
         _lm_step = (
-            _lm_coord.debug_draft_model_begin()
+            _lm_coord.debug_draft_current_step()
             if _lm_coord is not None
             else -1
         )

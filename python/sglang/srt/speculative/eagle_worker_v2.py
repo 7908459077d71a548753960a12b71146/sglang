@@ -751,6 +751,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
                 spec_info.hidden_states = hidden_states
+                # D1 round-10: mark the true chain step for the model-file
+                # probes (slice index = i, aligned across eager/graph).
+                if _dbg_draft_sel is not None:
+                    _dbg_draft_sel.debug_draft_mark_step(i)
 
                 canary_index_ctx = (
                     c.with_active_single_forward_manager(i)
@@ -822,6 +826,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         topk_index,
                         hidden_states,
                     )
+            # D1 round-10: unmark so non-chain forwards (draft-extend)
+            # never write chain slices.
+            if _dbg_draft_sel is not None:
+                _dbg_draft_sel.debug_draft_mark_step(-1)
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)

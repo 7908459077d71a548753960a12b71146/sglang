@@ -340,11 +340,19 @@ accept_lens 首个发散 step = S
 - **核心矛盾对**：`lmout`（processor 出口，graph **NaN=0**）vs `dstep_logits`（draft_forward 内，graph **NaN=4**）——同一 `next_token_logits` 字段两次图内捕获，中间只隔 runner 尾部代码。**NaN 是在这两位置之间被写入共享 logits buffer 的**（`next_token_logits_buffer` 是 graph 共享固定地址 buffer），或 lmout/dstep 之间发生了缓冲区替换（runner 对 logits 做了 gather/copy 重建）。
 - 其余键（ids 3192 / pos 0.2 / prevraw 4.0 / emb 9.3 / eh 1.6 / attn 9.2 / mlp 3.9e6 / out 1.4e7）均为 step0-NaN → 垃圾 token → 级联放大。
 
-### Round-9 b（无需重采）：step-0 链值明细
+### Round-9 b 重跑判读（2026-08-28）— step-0 表暴露 dm 切片索引缺陷
 
-analyzer 已加 step-0 逐位置表：`out → lmin → lmw → lmout → dstep_logits（及 dstep_tok）` 各自 eager|graph 值。**重跑比对命令即可**（同 graph13/eager13 dump）。判读：第一个 graph 侧 NaN 的位置即毒点写入处：
-- lmout(0) 已 NaN → processor 内部 matmul/gather（enable_dp_lm_head 路径）
-- lmout(0) 净 + dstep_logits(0) NaN → runner 尾部对 logits buffer 的写入/替换 → 下一轮在 ModelRunner.forward 尾部埋点
+step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应是同一张量却双双对不上 → **inner/outer 双 begin 计数器的基线在 eager（每轮经 draft() 重置）与 graph（capture 时基线任意）之间错位，dm 全表跨 run 比对不可信**（含之前各轮的 dm 数值，仅 NaN 计数与 dstep_* 可靠）。
+
+**仍然坚实的可靠结论**（dstep_* 用循环变量 i 切片）：graph 链全部 4 个已执行步（0-3）logits 均 NaN、提案 token=0，而链的全部输入（token seed / hidden / KV 内容 / seq_lens / 写址）已证干净。lm_head 权重 lmw 因索引缺陷本轮无效，待重验。
+
+### Round-10（已埋点，必须重采）：显式链 step 索引
+
+- `draft_forward` 循环内 `debug_draft_mark_step(i)`（runner forward 前），链尾 `mark_step(-1)`（防 draft-extend 写链切片）；
+- `deepseek_nextn` inner/outer 全部改读 `debug_draft_current_step()`（begin 计数器退役）；
+- 效果：dm 各键切片 = 真实链 step，eager/graph 对齐，dump 表首次完全可信。
+
+判读（重采后）：按管线序 ids/pos → prevraw/prev → emb → eh → attn/mlp → out → lmin → lmw → lmout，**graph 侧首个 NaN/发散键 = 毒点**；若直到 lmw 全净而 lmout NaN → processor 内部 matmul/DP-gather；若 attn/mlp 先坏 → draft decoder 内部（其 KV 读已证净，怀疑 attention metadata 图内路径）。
 
 ### Round-8 全量探针 + 采集降本（2026-08-28，已埋点）
 

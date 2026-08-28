@@ -1453,9 +1453,11 @@ class NPUSelectiveHiSparseCoordinator:
         """
         if not self._dbg_dump:
             return
-        # Round-8: reset the per-invocation draft-model capture counter
-        # for this round (host-side; graph slices were baked at capture).
+        # Round-10: reset the chain-step mark (slices are indexed by the
+        # loop step via debug_draft_mark_step; the old begin-counter is
+        # retired — its base desynced between eager and graph capture).
         self._dbg_dm_step = 0
+        self._dbg_dm_cur = -1
         # Real (non-bucket-padded) chain rows: graph buckets pad the batch
         # (e.g. bs8), and padded rows hold stale static-buffer values —
         # comparing them against eager's unwritten rows is an artifact.
@@ -1521,6 +1523,22 @@ class NPUSelectiveHiSparseCoordinator:
         self._dbg_dext_out[:t].copy_(
             hidden_states[:t].reshape(t, -1).sum(dim=-1, dtype=torch.float32)
         )
+
+    def debug_draft_mark_step(self, step: int):
+        """Round-10: mark the CURRENT chain step for model-file probes.
+
+        draft_forward calls this with the loop index before each step's
+        runner forward (and -1 after the chain) so every dm capture —
+        inner model, outer lm_head segment, hooks — lands on the true
+        chain-step slice. This replaces the begin()-counter scheme, whose
+        counter base desynced between eager (reset per round via draft())
+        and graph (baked at capture time with an arbitrary base), making
+        dm comparisons across runs meaningless.
+        """
+        self._dbg_dm_cur = step
+
+    def debug_draft_current_step(self) -> int:
+        return getattr(self, "_dbg_dm_cur", -1)
 
     def debug_draft_model_begin(self) -> int:
         """Round-8: called once per draft-model forward invocation.
