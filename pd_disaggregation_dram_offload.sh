@@ -249,18 +249,21 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-12 b: 修复未生效, 分析 am_seqlens（无需重采）----------
-# 修复未命中: am_kvlen 仍 [15,15,15,15]; 但新增 am_seqlens(rel 2) 与 am_kvlen
-# 不同 -> forward_sparse 走的不是回退分支, actual_seq_lengths_kv 是独立的
-# baked 张量, 且我的刷新没写到它(或写的 metadata 对象不是 forward_sparse 读的)。
-# 重跑比对(同 graph16/eager16 dump), 看 am_seqlens 逐链步数值:
-# python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager16 --graph-dir /root/hisparse_dump/graph16
-# 判读(待数值):
-#   am_seqlens = 6/7/8/9(正确) -> seq_lens 刷新正常, 15 只在
-#     actual_seq_lengths_kv 上 -> 找到它被赋值的 DSA 路径, 把 baked 张量改为
-#     buffer+refresh(赋值点在哪, am_seqlens 正确说明 refresh 机制本身通的)
-#   am_seqlens 也是常数 15 -> wrapper 的 replay 刷新对 per-step 后端没生效,
-#     查 AscendAttnMultiStepDraftBackend.init_forward_metadata_out_graph 分发
+# ---------- Round-13: 刷新为什么没生效——host 侧打印直接看（只需 graph 侧）----------
+# am_seqlens 数值: eager [5,5,5,5](原始 seq_lens, 偏移走 cpu_int 分支) |
+# graph [15,15,15,15] -> replay 刷新(metadata.seq_lens.copy_)没达到
+# baked kernel 读的对象。已加 [DBG-META] host 打印: 刷新是否执行/写的什么值。
+# 操作(只起 graph 侧, warmup 即触发, 无需请求; 打印进 decode 日志):
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph16 bash pd_disaggregation_dram_offload.sh
+# 然后在 decode 日志里 grep:
+#   grep DBG-META logs/decode_*.log | head -40
+# 判读(每 replay 应有 4 行, 对应 4 个 per-step 后端):
+#   打印 seq_lens=[6,7,8,9] 类正确值 -> 刷新在跑且值对, 15 是 baked probe 引用
+#     了别的张量 -> 修 forward_sparse 的取值来源/forward_metadata 重绑定
+#   打印 [15,...] 或没打印 -> 刷新没跑或输入错: 查 wrapper 分发
+#     (AscendAttnMultiStepDraftBackend.init_forward_metadata_out_graph)
+#     与 A5 replay 打包路径是否绕过了它
+# eager 侧不需要(不走该路径)。
 # 修复确认后: 跑 gsm8k 200 题复核精度对齐(50 题噪声 ±2pt, 今日两模式
 #   全部落在 0.88~0.94 交叠带, 垃圾提案不影响贪心精度)。
 #

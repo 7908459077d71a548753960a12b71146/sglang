@@ -375,14 +375,19 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 - `am_kvlen` 仍 15 且新增 `am_seqlens`（metadata.seq_lens）正确（6/7/8/9）→ 15 在别的字段，找 DSA 路径把 actual_seq_lengths_kv 设成 baked 张量的赋值点改为 buffer+refresh
 - `am_seqlens` 也 15 → replay 刷新路径本身没跑/写错，查 wrapper 分发
 
+### Round-13：am_seqlens 数值 + 刷新路径取证（2026-08-28）
+
+- `am_seqlens`（metadata.seq_lens）：eager [5,5,5,5]（原始 seq_lens，per-step 偏移在 eager 走 `seq_lens_cpu_int` 分支）| **graph [15,15,15,15]** → replay 刷新（`_apply_cuda_graph_metadata` 的 `metadata.seq_lens.copy_`）没有达到 baked kernel 读的对象。
+- 三种可能：刷新没跑 / 输入就是 15 / 写的对象 ≠ baked 引用的张量。已加 `[DBG-META]` host 打印（env 门控同 DIFF_DUMP）在 `_apply_cuda_graph_metadata` 尾部：打印 per-backend step_id、in_capture、刷新后的 seq_lens 值。
+- 取证操作（**只需 graph 侧**，warmup 即触发）：起服务后 `grep DBG-META logs/decode_*.log | head -40`，每 replay 应有 4 行（对应 4 个 per-step 后端）。
+  - 打印正确值（6/7/8/9 类）→ 刷新在跑且值对，15 是 baked probe 引用了别的张量 → 修 forward_sparse 取值来源 / forward_metadata 重绑定
+  - 打印 [15,...] 或无打印 → 刷新没跑或输入错 → 查 `AscendAttnMultiStepDraftBackend.init_forward_metadata_out_graph` 分发与 A5 replay 打包路径是否绕过它
+
 ### Round-12 b：修复未命中，分析 am_seqlens（2026-08-28）
 
 - 修复未生效：`am_kvlen` 仍 [15,15,15,15]。
 - 但 `am_seqlens`（metadata.seq_lens，rel 2）与 `am_kvlen`（rel 1.5）**数值不同** → forward_sparse 走的不是回退分支，`actual_seq_lengths_kv` 是**独立存在的 baked 张量**，且我的刷新没写到它（或写的 metadata 对象不是 forward_sparse 读的那个）。
 - 本轮精度 eager 0.96 / graph 0.92——eager 自身跨跑 0.88~0.96 波动，噪声带结论进一步巩固。
-- 待办：重跑比对看 am_seqlens 逐链步数值（analyzer 已补打印）：
-  - am_seqlens = 6/7/8/9（正确）→ seq_lens 刷新正常，15 只在 actual_seq_lengths_kv 上 → 找到它的 DSA 赋值点，把 baked 张量改为 buffer+refresh
-  - am_seqlens 也是常数 15 → wrapper 的 replay 刷新对 per-step 后端没生效，查 `AscendAttnMultiStepDraftBackend.init_forward_metadata_out_graph` 分发
 
 ### 归属结论：该 bug 与 hi-sparse 无关（2026-08-28）
 

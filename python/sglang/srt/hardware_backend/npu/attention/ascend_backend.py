@@ -1047,6 +1047,21 @@ class AscendAttnBackend(AttentionBackend):
                 seq_lens[:bs].to(metadata.actual_seq_lengths_kv.dtype)
             )
 
+        # D1: host-side visibility into the per-replay metadata refresh —
+        # does it run, on which backend/step, and with what values? (The
+        # draft chain's frozen dm probe showed constant 15, meaning the
+        # refresh never reaches what the baked attention reads.)
+        import os as _os
+
+        if _os.getenv("SGLANG_SELECTIVE_DIFF_DUMP", "0") == "1":
+            print(
+                f"[DBG-META] step={getattr(self, 'speculative_step_id', '?')} "
+                f"in_capture={in_capture} bs={bs} "
+                f"seq_lens={metadata.seq_lens[:bs].tolist()} "
+                f"input_seq_lens={seq_lens[:bs].tolist()}",
+                flush=True,
+            )
+
         self.forward_metadata = metadata
 
         self.graph_mode = True
