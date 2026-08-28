@@ -298,15 +298,19 @@ def compare_state(args, first_fp_div):
             dm_keys.sort(key=lambda k: order.index(k)
                          if k in order else len(order))
             print("  draft-model sub-block fingerprints "
-                  "(eager nan, graph nan, max rel):")
+                  "(eager nan, graph nan, max rel, graph-NaN steps):")
             for k in dm_keys:
                 ev, gv = e[f"dm_{k}"], g[f"dm_{k}"]
                 enan = int(torch.isnan(ev.float()).sum())
                 gnan = int(torch.isnan(gv.float()).sum())
+                gsteps = torch.nonzero(
+                    torch.isnan(gv.float()).any(dim=-1)
+                ).flatten().tolist()
                 rd = rel_diff(
                     ev.flatten().float(), gv.flatten().float()
                 ).max().item() if ev.numel() else 0.0
-                print(f"    {k:8s}: {enan}, {gnan}, {rd:.4g}")
+                print(f"    {k:8s}: {enan}, {gnan}, {rd:.4g}, "
+                      f"nan@steps{gsteps}")
         # Per-step stream-order table for the lm_head segment: the first
         # position (in replay stream order) whose GRAPH value is NaN /
         # diverges at step 0 is where the poison enters. Stream order:

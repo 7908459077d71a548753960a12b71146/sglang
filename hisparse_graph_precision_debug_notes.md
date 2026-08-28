@@ -402,6 +402,15 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 - 但 `am_seqlens`（metadata.seq_lens，rel 2）与 `am_kvlen`（rel 1.5）**数值不同** → forward_sparse 走的不是回退分支，`actual_seq_lengths_kv` 是**独立存在的 baked 张量**，且我的刷新没写到它（或写的 metadata 对象不是 forward_sparse 读的那个）。
 - 本轮精度 eager 0.96 / graph 0.92——eager 自身跨跑 0.88~0.96 波动，噪声带结论进一步巩固。
 
+### Round-14 b：kvlen 修复生效，暴露第二毒点——draft MoE（2026-08-29）
+
+- **am_kvlen 完全吻合**（eager [6,7,8,9] == graph [6,7,8,9]）→ 别名修复对 attention metadata 生效。
+- **attn NaN 4→3**：step 0 attention 干净（q、kvlen 均正确）。
+- **mlp NaN=4（含 step 0）**：step 0 链路 = eh 净 → attn 净 → **MLP 产 NaN** → out/lmout/logits NaN → 级联 step1-3。
+- **第二毒点：draft 的 MLP（GLM-5.2 为 MoE）在图内对干净输入产出 NaN**。与 attention 的 kvlen bug 同类（图 replay 状态陈旧），嫌疑集中在 MoE dispatch/combine（deepep LL 静态 buffer）或 expert 权重/scale 的图内路径。
+- 待消歧：attn 的 3 个 NaN 是 {1,2,3}（级联，预期）还是别的——analyzer 已加逐 step NaN 位置打印（nan@steps），同 dump 重跑比对即得。
+- 若确认 MLP@0 NaN：下一轮探针进 MoE（router 输出 / dispatch 后 token 数 / expert 输出三切片）。
+
 ### 归属结论：该 bug 与 hi-sparse 无关（2026-08-28）
 
 - **Git 考古**：问题路径（`AscendAttnMultiStepDraftBackend` + `_apply_cuda_graph_metadata` 缺失 `actual_seq_lengths_kv` replay 刷新）源自 2025-12-04 / 2026-06-02 的提交；本分支触及 ascend_backend.py 的仅 3 个提交——hi-sparse 功能（36 行，纯 forward_sparse selected 层路由）+ 调试探针/修复。

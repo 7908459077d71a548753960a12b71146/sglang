@@ -257,17 +257,17 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # 修复: _init_cuda_graph_metadata 给每个后端分配独立 seq_lens buffer (clone),
 # 切断别名; 同时消除对 runner 输入 buffer 的原地污染。
 # 验证(只起 graph 侧, warmup 即可):
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph18 bash pd_disaggregation_dram_offload.sh
-#   1) grep DBG-META logs/decode_*.log | tail -12
-#      预期: 同一轮内 step=0..3 的 seq_lens 各不相同(=真实seq+各自偏移,
-#      对齐 eager 的 6/7/8/9 模式), 且 input_seq_lens 不再被改写
-#   2) 完整对比(eager 也跑一次):
-#      SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager18 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-#      python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager18 --graph-dir /root/hisparse_dump/graph18
-#      预期: dstep_toks 不再全 0, dstep_logits 无 NaN, attn/out 不再 NaN
-#   3) 通过后: gsm8k 200 题精度对齐复核 + accept_len(接受率)恢复观察
-# 修复确认后: 跑 gsm8k 200 题复核精度对齐(50 题噪声 ±2pt, 今日两模式
-#   全部落在 0.88~0.94 交叠带, 垃圾提案不影响贪心精度)。
+# 第 1 步(最小命令, 只看 DBG-META 打印):
+# SGLANG_SELECTIVE_DIFF_DUMP=1 bash pd_disaggregation_dram_offload.sh
+#   grep DBG-META logs/decode_*.log | tail -12
+#   预期: 同一轮内 step=0..3 的 seq_lens 各不相同(=真实seq+各自偏移,
+#   对齐 eager 的 6/7/8/9 模式), 且 input_seq_lens 不再被改写
+# 第 2 步(完整 dump 对比, 确认 NaN 消失):
+# graph: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph18 bash pd_disaggregation_dram_offload.sh
+# eager: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager18 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+# python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager18 --graph-dir /root/hisparse_dump/graph18
+#   预期: dstep_toks 不再全 0, dstep_logits/attn/out 无 NaN
+# 第 3 步(通过后): gsm8k 200 题精度对齐复核 + accept_len(接受率)恢复观察
 #
 # [可选实证] E3 warmup 对比: 证明 draft NaN 与 hi-sparse 无关(git 考古已证
 #   代码路径早于 hi-sparse; 此实验为运行时铁证):
