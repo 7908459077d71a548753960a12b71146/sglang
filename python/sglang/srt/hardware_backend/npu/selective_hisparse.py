@@ -851,6 +851,7 @@ class NPUSelectiveHiSparseCoordinator:
             }
             self._dbg_dm_step = 0
             self._dbg_dm_hooks_done = False
+            self._dbg_dchain_real = 1
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg} "
@@ -1433,6 +1434,7 @@ class NPUSelectiveHiSparseCoordinator:
         parent_list: Optional[torch.Tensor] = None,
         top_scores_index: Optional[torch.Tensor] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
+        real_chain_tokens: Optional[int] = None,
     ):
         """D1 round-4/5: bracket the NEXTN draft chain per verify round.
 
@@ -1453,6 +1455,13 @@ class NPUSelectiveHiSparseCoordinator:
         # Round-8: reset the per-invocation draft-model capture counter
         # for this round (host-side; graph slices were baked at capture).
         self._dbg_dm_step = 0
+        # Real (non-bucket-padded) chain rows: graph buckets pad the batch
+        # (e.g. bs8), and padded rows hold stale static-buffer values —
+        # comparing them against eager's unwritten rows is an artifact.
+        # dstep/dm dumps slice to this many rows per step.
+        self._dbg_dchain_real = max(
+            1, min(int(real_chain_tokens or 1), self.tcap)
+        )
         if hidden_states is not None:
             t = min(hidden_states.shape[0], self.tcap)
             if t > 0:
@@ -2006,13 +2015,18 @@ class NPUSelectiveHiSparseCoordinator:
                     "dout_toks": self._dbg_dout_toks[:_n_st].cpu(),
                     "dout_parent": self._dbg_dout_parent[:_n_st].cpu(),
                     "dout_score": self._dbg_dout_score[:_n_st].cpu(),
-                    # Round-4b per-step inside the chain
+                    # Round-4b per-step inside the chain (REAL rows only:
+                    # graph bucket padding rows hold stale static-buffer
+                    # values and must not be compared against eager)
+                    "dchain_real": self._dbg_dchain_real,
                     "dstep_logits": self._dbg_dstep_logits_all[
-                        :, :_n_st
+                        :, : self._dbg_dchain_real
                     ].cpu(),
-                    "dstep_toks": self._dbg_dstep_toks_all[:, :_n_st].cpu(),
+                    "dstep_toks": self._dbg_dstep_toks_all[
+                        :, : self._dbg_dchain_real
+                    ].cpu(),
                     "dstep_hidden": self._dbg_dstep_hidden_all[
-                        :, :_n_st
+                        :, : self._dbg_dchain_real
                     ].cpu(),
                     # Round-5 live handoff read (see _dbg_hout comment)
                     "hout_live": self._dbg_hout[:_n_st].cpu(),
@@ -2023,9 +2037,9 @@ class NPUSelectiveHiSparseCoordinator:
                     # Round-7 draft KV history content + seq_lens
                     "dkvh": self._dbg_dkvh[:_n_st].cpu(),
                     "dseql": self._dbg_dseql[:_n_st].cpu(),
-                    # Round-8 draft-model sub-block bisect [S, T] (all keys)
+                    # Round-8 draft-model sub-block bisect [S, real]
                     **{
-                        f"dm_{k}": v[:, :_n_st].cpu()
+                        f"dm_{k}": v[:, : self._dbg_dchain_real].cpu()
                         for k, v in self._dbg_dm.items()
                     },
                 }

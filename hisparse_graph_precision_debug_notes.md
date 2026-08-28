@@ -325,7 +325,14 @@ accept_lens 首个发散 step = S
 - 本轮精度 eager 0.90 / graph 0.92 互换，且 eager 侧提案 token 跨 run 变动 → **eager 存在核级非确定性**（±2pt 波动为其表现）；graph 的 NaN 崩塌远超噪声、每轮复现，判读不受影响。
 - accuracy 跑法 A 已证 dump 探针无损；CLONE 主嫌未最终确认（B/C 可选）。
 
-### Round-8 全量探针 + 采集降本（2026-08-28，已埋点待跑）
+### Round-8 首采判读（2026-08-28，快采 curl 单请求）
+
+- **dm/dstep 表的天文数字（1e8~1e11）大部分是桶填充伪影**：本跑未设 CUDA_GRAPH_BS（默认桶 bs=8），graph 链每步 8 行（1 真 + 7 填充，填充行是静态 buffer 陈旧值），eager 每步 1 行；按 verify token 数切片把两者比到了一起。bt/topk 双侧 0 = 未写（NPU 无 block_tables 属性、无 topk 种子），非吻合。
+- **已修**：state 记录 `dchain_real`（真实行数，draft 时按 `batch.batch_size*topk` 传入），dstep/dm 只落真实行；旧 dump 不可回溯修，需重采。
+- **真实信号**：短 prompt 下 **round 1 即发散**（in_ids slot[4]: eager 997 vs graph 0）——此前 gsm8k 长 prompt 全部 round 1 吻合、round 2-3 才发散。毒**不需要暖机轮次**，且对 prompt 长度/首链路径敏感（bootstrap 后首条 draft 链就坏）。
+- 注意：快采跑法未带 `SGLANG_SELECTIVE_DUMP_MAX_STEPS`，默认已降为 6。
+
+### Round-8 全量探针 + 采集降本（2026-08-28，已埋点）
 
 **目标：一跑定案。** 剩余全部可疑点一次埋全（`deepseek_nextn.forward` 内 11 个 dm 键，按管线顺序）：
 
@@ -349,7 +356,7 @@ accept_lens 首个发散 step = S
 
 ### 启动命令规则
 
-**每次试验后必须刷新 `pd_disaggregation_dram_offload.sh` 末尾的启动命令**（含当次 dump 目录/开关/比对命令）。当前尾部 = round-8 快速采集（graph11/eager11 + curl 单请求）。
+**每次试验后必须刷新 `pd_disaggregation_dram_offload.sh` 末尾的启动命令**（含当次 dump 目录/开关/比对命令）。当前尾部 = round-8 快采重采（graph12/eager12 + curl 单请求，真实行比对已修）。
 
 ### 第六轮探针（round-6，已埋点）
 

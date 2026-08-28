@@ -249,18 +249,17 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-8 dump 跑（全可疑点一次埋全; dump 开 + clone 关）----------
-# 成本已降: 默认只采前 6 个 verify 轮(首发散总在 step2-3); host 回读默认关。
-# dm 表按管线顺序输出: ids/pos(图静态输入) -> bt/topk(attention 索引源)
-#   -> prevraw/prev(图内交接 hidden 读, rot 前后) -> emb -> eh -> attn/mlp -> out
-# graph 侧首个 NaN/发散键 = 毒点。dump 目录统一 /root/hisparse_dump/。
+# ---------- Round-8 dump 跑（快采; 已修真实行比对——本轮 dump 需重采）----------
+# 上轮快采的 dm/dstep 天文数字是桶填充伪影(bs8 桶 vs eager bs1, 填充行是静态
+# buffer 陈旧值)。已修: state 记录 dchain_real, dstep/dm 只落真实行。
+# 真实信号: 短 prompt 下 round 1 即发散(此前长 prompt round 1 总是吻合)。
+# dm 表按管线顺序: ids/pos(图静态输入) -> bt/topk -> prevraw/prev -> emb
+#   -> eh -> attn/mlp -> out; graph 侧首个 NaN/发散键 = 毒点。
 #
-# 快速采集(推荐, 不跑精度, 单请求短输出, 只为拿 dump):
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph11 bash pd_disaggregation_dram_offload.sh
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager11 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-#   采集请求(路由节点发一次即可):
+# 快速采集(不跑精度, 单请求短输出):
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph12 bash pd_disaggregation_dram_offload.sh
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager12 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+#   采集请求(路由节点发一次即可; 同一 prompt 两侧各发一次):
 # curl http://141.61.49.195:31000/generate -H 'Content-Type: application/json' \
 #   -d '{"text": "The capital of France is", "sampling_params": {"max_new_tokens": 64, "temperature": 0}}'
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager11 --graph-dir /root/hisparse_dump/graph11
-#
-# 完整版(带精度, 需要时): 加 SGLANG_SELECTIVE_DUMP_MAX_STEPS=20 + 跑 gsm8k
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager12 --graph-dir /root/hisparse_dump/graph12
