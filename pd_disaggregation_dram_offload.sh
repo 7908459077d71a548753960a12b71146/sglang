@@ -249,14 +249,14 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-17 b: 修正 am_pgsum 探针（上一版有聚合伪影，需重采）----------
-# 上轮 am_pgsum 628K vs 8.76亿 是探针伪影: 整行页表求和 + clamp(0) 把 page0
-# 重复计入, 而 eager(动态宽)/graph(固定宽)行宽不同, page0 累加次数不同。
-# 已修: 只对 kernel 实际读的第一个页 (block_table[0,0]=page1, kvlen<=page_size
-# 只占一页) 求字节和。
-# graph: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph22 bash pd_disaggregation_dram_offload.sh
-# eager: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager22 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager22 --graph-dir /root/hisparse_dump/graph22
+# ---------- Round-23: am_pgsum 重采（探针修复版，round-22 图捕获崩溃已修）----------
+# round-22 的 t[0,0] 产生 0-dim 张量, NPU auto-dispatch 图捕获拒绝该算子链,
+# graph 模式启动即崩(draft 链图捕获期)。已修: 语义不变(只求 block_table[0,0]
+# 指向的单页字节和), 改用 [:1,:1] 切片保持全程 >=1-D 算子; 且探针计算现在
+# 门控在 SGLANG_SELECTIVE_DIFF_DUMP 下(不开 dump 时零开销、不进图)。
+# graph: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph23 bash pd_disaggregation_dram_offload.sh
+# eager: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager23 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager23 --graph-dir /root/hisparse_dump/graph23
 # 判定: am_pgsum(=page1 字节和)一致 + attn_raw 仍 NaN -> kernel 输入完全相同
 #   仍输出 NaN = captured-replay kernel bug, 证据链完整 -> 升级 CANN/算子侧
 #   (临时缓解: draft 链 eager attention / non-quant kernel 路径)

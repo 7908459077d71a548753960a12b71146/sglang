@@ -1630,20 +1630,27 @@ class AscendAttnBackend(AttentionBackend):
                 # replayed kernel actually reads). NOTE: summing the whole
                 # padded block_table row was an artifact — eager and graph
                 # rows have different widths, so page-0 clamp terms
-                # dominated the sum.
-                _kn_u8 = (
-                    k_nope
-                    if k_nope.dtype == torch.uint8
-                    else k_nope.view(torch.uint8)
-                )
-                _kn_pages = _kn_u8.reshape(
-                    -1, self.page_size * _kn_u8.shape[-1]
-                ).sum(dim=1, dtype=torch.int64)
-                _bt00 = self.forward_metadata.block_tables[0, 0].clamp(
-                    min=0
-                ).to(torch.int64)
-                _pgsum = _kn_pages[_bt00].reshape(1)
-                _dbg_am.debug_capture_draft_inner(_am_step, "am_pgsum", _pgsum)
+                # dominated the sum. The [:1, :1] slice keeps every op
+                # >=1-D: t[0, 0] yields 0-dim tensors and the clamp/index
+                # chain over them is rejected by NPU auto-dispatch graph
+                # capture (draft-graph capture crashed at startup). Math
+                # only runs when diff-dump is enabled (zero cost otherwise).
+                if getattr(_dbg_am, "_dbg_dump", False) and (
+                    self.forward_metadata.block_tables is not None
+                ):
+                    _kn_u8 = (
+                        k_nope
+                        if k_nope.dtype == torch.uint8
+                        else k_nope.view(torch.uint8)
+                    )
+                    _kn_pages = _kn_u8.reshape(
+                        -1, self.page_size * _kn_u8.shape[-1]
+                    ).sum(dim=1, dtype=torch.int64)
+                    _bt0 = self.forward_metadata.block_tables[:1, :1].flatten().to(
+                        torch.int64
+                    )
+                    _pgsum = _kn_pages[_bt0.clamp(min=0)].sum().reshape(1)
+                    _dbg_am.debug_capture_draft_inner(_am_step, "am_pgsum", _pgsum)
 
         if (
             is_prefill
