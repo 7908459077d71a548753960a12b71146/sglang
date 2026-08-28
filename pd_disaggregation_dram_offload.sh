@@ -249,20 +249,13 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-9 dump 跑（NaN 已定位到 lm_head 段; 拆 processor 内部）----------
-# 上轮定案: draft 模型本体输出 dm_out 全程无 NaN, 而 next_token_logits 每步 NaN
-# -> NaN 产生在 logits_processor/lm_head 内。新增探针:
-#   lmin  — 进 processor 的 hidden(与 dm_out 同一张量, 异常=回放中被踩)
-#   lmw   — lm_head 权重 rowsum(精确比对; fp8 权重/scale buffer 被踩 ->
-#           干净输入出 NaN logits 的首要嫌疑)
-#   lmout — processor 出口的 logits
-# 判定: lmin 坏 -> hidden 在 model 返回与 matmul 之间被踩; lmin 净+lmw 坏 ->
-# 权重 buffer 被踩(aliasing); lmw 净+lmout NaN -> matmul/gather 本身(查 DP gather)。
+# ---------- Round-9 判读推进（无需重采——analyzer 已加 step-0 明细）----------
+# 上轮结论: lmw 权重逐位一致(权重被踩排除); lmout(processor 出口)graph 无 NaN
+# 而 dstep_logits(draft_forward 内)每步 NaN -> NaN 在 runner 尾部写入共享
+# logits buffer, 或 lmout/dstep 之间发生了缓冲区替换。
+# 重跑比对命令即可(同 graph13/eager13 dump), 新输出含 step-0 链值明细:
+#   out -> lmin -> lmw -> lmout -> dstep_logits 逐位置 eager|graph 值,
+#   第一个 graph 侧变 NaN 的位置 = 毒点写入点。
+# python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager13 --graph-dir /root/hisparse_dump/graph13
 #
-# 快速采集(不跑精度, 单请求短输出):
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph13 bash pd_disaggregation_dram_offload.sh
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager13 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-#   采集请求(路由节点发一次即可; 同一 prompt 两侧各发一次):
-# curl http://141.61.49.195:31000/generate -H 'Content-Type: application/json' \
-#   -d '{"text": "The capital of France is", "sampling_params": {"max_new_tokens": 64, "temperature": 0}}'
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager13 --graph-dir /root/hisparse_dump/graph13
+# (若需重采, 命令同前: DIFF_DUMP=1 + DUMP_DIR=/root/hisparse_dump/{graph,eager}13 + curl 单请求)

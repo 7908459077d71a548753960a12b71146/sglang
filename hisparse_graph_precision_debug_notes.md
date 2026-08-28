@@ -333,14 +333,18 @@ accept_lens 首个发散 step = S
 
 另证：真实行修复后 round 1 恢复吻合（此前"round1 即发散"是首采请求流未对齐的假象），发散仍在 round 2。
 
-### Round-9 探针（已埋点待跑）：拆 logits_processor/lm_head 段
+### Round-9 重采判读（2026-08-28）— 权重排除，NaN 写入点收窄到 runner 尾部
 
-`DeepseekV3ForCausalLMNextN.forward` 内三个新 dm 键（inner/outer 两次 begin 交错占片，两侧模式一致，各 key 独立比对）：
-- `lmin`：进 processor 的 hidden（与 dm_out 同一张量；异常 = 回放中 model 返回后、matmul 前被踩）
-- `lmw`：**lm_head 权重 rowsum（精确比对）——fp8 权重/scale buffer 在图内被踩是"干净输入→NaN logits"的首要嫌疑**
-- `lmout`：processor 出口 logits
+- **`lmw` = 0（逐位一致）→ lm_head 权重/scale buffer 被踩排除**。
+- `lmin` rel 与 `out` 完全相同（同一张量两次捕获，1.397e+07 为级联污染值）。
+- **核心矛盾对**：`lmout`（processor 出口，graph **NaN=0**）vs `dstep_logits`（draft_forward 内，graph **NaN=4**）——同一 `next_token_logits` 字段两次图内捕获，中间只隔 runner 尾部代码。**NaN 是在这两位置之间被写入共享 logits buffer 的**（`next_token_logits_buffer` 是 graph 共享固定地址 buffer），或 lmout/dstep 之间发生了缓冲区替换（runner 对 logits 做了 gather/copy 重建）。
+- 其余键（ids 3192 / pos 0.2 / prevraw 4.0 / emb 9.3 / eh 1.6 / attn 9.2 / mlp 3.9e6 / out 1.4e7）均为 step0-NaN → 垃圾 token → 级联放大。
 
-判定：lmin 坏 → hidden 返回后被踩；lmin 净 + lmw 坏 → 权重 buffer aliasing；lmw 净 + lmout NaN → matmul/DP gather 本身（enable_dp_lm_head 路径）。
+### Round-9 b（无需重采）：step-0 链值明细
+
+analyzer 已加 step-0 逐位置表：`out → lmin → lmw → lmout → dstep_logits（及 dstep_tok）` 各自 eager|graph 值。**重跑比对命令即可**（同 graph13/eager13 dump）。判读：第一个 graph 侧 NaN 的位置即毒点写入处：
+- lmout(0) 已 NaN → processor 内部 matmul/gather（enable_dp_lm_head 路径）
+- lmout(0) 净 + dstep_logits(0) NaN → runner 尾部对 logits buffer 的写入/替换 → 下一轮在 ModelRunner.forward 尾部埋点
 
 ### Round-8 全量探针 + 采集降本（2026-08-28，已埋点）
 

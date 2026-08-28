@@ -307,6 +307,21 @@ def compare_state(args, first_fp_div):
                     ev.flatten().float(), gv.flatten().float()
                 ).max().item() if ev.numel() else 0.0
                 print(f"    {k:8s}: {enan}, {gnan}, {rd:.4g}")
+        # Per-step stream-order table for the lm_head segment: the first
+        # position (in replay stream order) whose GRAPH value is NaN /
+        # diverges at step 0 is where the poison enters. Stream order:
+        # out -> lmin -> lmw -> lmout -> [runner tail] -> dstep_logits.
+        print("  step-0 chain values (eager | graph):")
+        for k in ("out", "lmin", "lmw", "lmout"):
+            if f"dm_{k}" in e:
+                ev, gv = e[f"dm_{k}"], g[f"dm_{k}"]
+                print(f"    {k:8s}: {ev[0].tolist()} | {gv[0].tolist()}")
+        if "dstep_logits" in e:
+            print(f"    dstep_log: {e['dstep_logits'][:2].tolist()} | "
+                  f"{g['dstep_logits'][:2].tolist()}")
+        if "dstep_toks" in e:
+            print(f"    dstep_tok: {e['dstep_toks'][:2].tolist()} | "
+                  f"{g['dstep_toks'][:2].tolist()}")
         # Root-vs-draft split: with topk=1 the verify tree is a chain and
         # in_ids[0] is the LAST ACCEPTED token of the previous round
         # (accept_lens matched there), in_ids[1:] are this round's fresh
