@@ -131,6 +131,20 @@ def register_npu_selective_callback_stream(stream, device):
     reporter.subscribe(stream)
 
 
+# Per-device coordinator registry so model files (deepseek_nextn) can
+# reach the debug capture methods without a forward_batch attachment —
+# the draft forward's forward_batch does not carry the coordinator.
+_COORDINATORS: dict = {}
+
+
+def get_npu_selective_hisparse_coordinator(device=None):
+    """Return this device's coordinator (or None). Debug hooks only."""
+    if device is None:
+        return next(iter(_COORDINATORS.values()), None)
+    idx = device.index if getattr(device, "index", None) is not None else device
+    return _COORDINATORS.get(int(idx))
+
+
 # ---------------------------------------------------------------------------
 # SelectiveHostKVPool — memfabric URMA registered Host memory
 # ---------------------------------------------------------------------------
@@ -347,6 +361,15 @@ class NPUSelectiveHiSparseCoordinator:
             self.selected_layer_ids_sorted[-1] + 1
         )
         self.device = torch.device(pool.device)
+
+        # D1 round-8: model-file debug hooks (deepseek_nextn) reach this
+        # coordinator through the module registry.
+        try:
+            _COORDINATORS[int(self.device.index
+                              if self.device.index is not None
+                              else torch.npu.current_device())] = self
+        except Exception:
+            pass
 
         # anchor → selected mapping (anchor = selected - 3)
         self._anchor_to_selected: dict[int, int] = {}
@@ -795,6 +818,21 @@ class NPUSelectiveHiSparseCoordinator:
             self._dbg_dseql = torch.zeros(
                 T, dtype=torch.int64, device=self.device
             )
+            # Round-8: sub-block bisect INSIDE the draft model forward
+            # (per chain step; slices baked per step at draft-graph
+            # capture like _dbg_dstep_*). Points along the NEXTN path:
+            #   emb  — post token-embedding hidden
+            #   prev — spec_info.hidden after the rot_weight matmul (the
+            #          actual in-graph read of the handoff tensor)
+            #   eh   — post eh_proj (decoder-layer input)
+            #   out  — final normed output (feeds lm_head)
+            _n_dm = max(self.verify_width, 8)
+            self._dbg_dm = {
+                k: torch.zeros(_n_dm, T, dtype=torch.float32,
+                               device=self.device)
+                for k in ("emb", "prev", "eh", "out")
+            }
+            self._dbg_dm_step = 0
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg} "
@@ -1394,6 +1432,9 @@ class NPUSelectiveHiSparseCoordinator:
         """
         if not self._dbg_dump:
             return
+        # Round-8: reset the per-invocation draft-model capture counter
+        # for this round (host-side; graph slices were baked at capture).
+        self._dbg_dm_step = 0
         if hidden_states is not None:
             t = min(hidden_states.shape[0], self.tcap)
             if t > 0:
@@ -1451,6 +1492,36 @@ class NPUSelectiveHiSparseCoordinator:
             return
         self._dbg_dext_out[:t].copy_(
             hidden_states[:t].reshape(t, -1).sum(dim=-1, dtype=torch.float32)
+        )
+
+    def debug_draft_model_begin(self) -> int:
+        """Round-8: called once per draft-model forward invocation.
+
+        Returns this invocation's slice index and increments the counter
+        (host-side only; in the drafted graph the baked captures keep
+        their capture-time slices). The counter is reset per verify round
+        by debug_capture_draft.
+        """
+        if not self._dbg_dump:
+            return -1
+        s = self._dbg_dm_step
+        self._dbg_dm_step += 1
+        return s
+
+    def debug_capture_draft_inner(
+        self, step: int, which: str, tensor: Optional[torch.Tensor]
+    ):
+        """Round-8: freeze a sub-block rowsum inside the draft forward."""
+        if not self._dbg_dump or tensor is None or step < 0:
+            return
+        buf = self._dbg_dm.get(which)
+        if buf is None or step >= buf.shape[0]:
+            return
+        t = min(tensor.shape[0], self.tcap)
+        if t <= 0:
+            return
+        buf[step, :t].copy_(
+            tensor[:t].reshape(t, -1).sum(dim=-1, dtype=torch.float32)
         )
 
     def debug_capture_draft_kv_hist(
@@ -1895,6 +1966,11 @@ class NPUSelectiveHiSparseCoordinator:
                     # Round-7 draft KV history content + seq_lens
                     "dkvh": self._dbg_dkvh[:_n_st].cpu(),
                     "dseql": self._dbg_dseql[:_n_st].cpu(),
+                    # Round-8 draft-model sub-block bisect [S, T]
+                    "dm_emb": self._dbg_dm["emb"][:, :_n_st].cpu(),
+                    "dm_prev": self._dbg_dm["prev"][:, :_n_st].cpu(),
+                    "dm_eh": self._dbg_dm["eh"][:, :_n_st].cpu(),
+                    "dm_out": self._dbg_dm["out"][:, :_n_st].cpu(),
                 }
                 torch.save(
                     state,

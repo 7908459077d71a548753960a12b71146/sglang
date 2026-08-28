@@ -249,12 +249,15 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-7 dump 跑（dump 开 + clone 关; 含 dloc/dkvh/dseql 探针）----------
-# 判定: dkvh DIFFER -> draft KV 内容被污染(NaN 源); dseql DIFFER -> seq_lens 漂移;
-#       两者 MATCH -> 剩 draft attention metadata 图内路径, 下轮进 draft 模型内部
+# ---------- Round-8 dump 跑（dump 开 + clone 关; 新增 draft 模型内部子块探针）----------
+# 判定: dm 表中 graph 侧首个含 NaN 的子块 = draft 内部毒点:
+#   emb 坏  -> embedding 查表/图输入绑定
+#   prev 坏 -> 图内交接 hidden 读或 rot matmul（in-replay aliasing 窗口）
+#   eh 坏   -> enorm/hnorm/eh_proj
+#   out 坏  -> decoder 层（attention/indexer/FFN）或 final norm
 # graph:
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_graph10 SGLANG_SELECTIVE_DUMP_MAX_STEPS=20 bash pd_disaggregation_dram_offload.sh
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph11 SGLANG_SELECTIVE_DUMP_MAX_STEPS=20 bash pd_disaggregation_dram_offload.sh
 #
 # eager:
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager10 SGLANG_SELECTIVE_DUMP_MAX_STEPS=20 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager10 --graph-dir /root/hisparse_graph10
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager11 SGLANG_SELECTIVE_DUMP_MAX_STEPS=20 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager11 --graph-dir /root/hisparse_dump/graph11

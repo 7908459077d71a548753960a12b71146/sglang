@@ -319,13 +319,23 @@ accept_lens 首个发散 step = S
 - 不变核心：graph draft 链 step 0 起 NaN、提案退化为 0；draft 已查输入（token/hidden/topk/写址/positions）全净。
 - 剩余嫌疑（round-7 目标）：**draft KV 历史内容**（写址对内容错——垃圾 fp8 解码出 inf/NaN 完全符合症状）与 **draft attention metadata（seq_lens）**。
 
-### Round-7 探针（已埋点待跑）
+### Round-7 dump 比对结论（2026-08-28）
 
-`dkvh`（draft KV 历史内容：每请求按 req_to_token 读全部历史 slots 的字节和，链执行前）+ `dseql`（每请求 seq_lens，精确比对）。verdict 链新增两行判定；都 MATCH 则下轮进 draft 模型内部（attention 输出 vs FFN 输出二分）。
+- **dkvh MATCH（draft KV 历史内容净）、dseql MATCH（seq_lens 净）** → draft 链全部输入（token/hidden/topk/写址/KV 内容/seq_lens）证明干净，graph 侧仍 step 0 NaN → **毒在 draft 模型前向内部的计算路径**。
+- 本轮精度 eager 0.90 / graph 0.92 互换，且 eager 侧提案 token 跨 run 变动 → **eager 存在核级非确定性**（±2pt 波动为其表现）；graph 的 NaN 崩塌远超噪声、每轮复现，判读不受影响。
+- accuracy 跑法 A 已证 dump 探针无损；CLONE 主嫌未最终确认（B/C 可选）。
+
+### Round-8 探针（已埋点待跑）：draft 模型内部子块二分
+
+`deepseek_nextn.forward` 四个挂点（per 链 step 烘焙切片）：`dm_emb`（embedding 后）/ `dm_prev`（**图内交接 hidden 读 + rot matmul 后**——in-replay aliasing 窗口的直接观测）/ `dm_eh`（eh_proj 后）/ `dm_out`（final norm 后）。coordinator 经新增全局注册表 `_COORDINATORS`/`get_npu_selective_hisparse_coordinator()` 供模型文件取用（draft 的 forward_batch 不带 coordinator）。analyzer 输出 dm 表（各子块 eager/graph NaN 计数 + max rel），**graph 侧首个含 NaN 的子块 = 毒点**：
+- emb 坏 → embedding 查表/图输入绑定
+- prev 坏 → 图内交接 hidden 读被 stomped（in-replay aliasing）或 rot matmul
+- eh 坏 → enorm/hnorm/eh_proj
+- out 坏（前三净）→ decoder 层（attention/indexer/FFN）或 final norm
 
 ### 启动命令规则
 
-**每次试验后必须刷新 `pd_disaggregation_dram_offload.sh` 末尾的启动命令**（含当次 dump 目录/开关/比对命令）。当前尾部 = round-7 跑法（graph10/eager10）。
+**每次试验后必须刷新 `pd_disaggregation_dram_offload.sh` 末尾的启动命令**（含当次 dump 目录/开关/比对命令）。当前尾部 = round-8 跑法（graph11/eager11，目录统一在 /root/hisparse_dump/ 下）。
 
 ### 第六轮探针（round-6，已埋点）
 

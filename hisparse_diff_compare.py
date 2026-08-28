@@ -281,6 +281,22 @@ def compare_state(args, first_fp_div):
         if "dseql" in e and "dseql" in g:
             same = bool(torch.equal(e["dseql"][:n], g["dseql"][:n]))
             print(f"    dseql(d)      {'MATCH' if same else 'DIFFER <-- draft seq_lens drift (attention metadata candidate)'}")
+        # Round-8: draft-model sub-block bisect — first NaN/divergent block
+        # along emb -> prev(rot matmul on the in-graph handoff read) ->
+        # eh(eh_proj) -> out(final norm). NaN in the graph side at the
+        # FIRST bad block pins the draft-internal poison point.
+        if "dm_emb" in e and "dm_emb" in g:
+            print("  draft-model sub-block per chain step "
+                  "(e: eager nan n, g: graph nan n, max rel):")
+            for k, fld in (("emb", "dm_emb"), ("prev", "dm_prev"),
+                           ("eh", "dm_eh"), ("out", "dm_out")):
+                enan = int(torch.isnan(e[fld]).sum())
+                gnan = int(torch.isnan(g[fld]).sum())
+                rd = rel_diff(
+                    e[fld].flatten().float(), g[fld].flatten().float()
+                ).max().item()
+                print(f"    {k:4s}: eager nan {enan}, graph nan {gnan}, "
+                      f"max rel {rd:.4g}")
         # Root-vs-draft split: with topk=1 the verify tree is a chain and
         # in_ids[0] is the LAST ACCEPTED token of the previous round
         # (accept_lens matched there), in_ids[1:] are this round's fresh

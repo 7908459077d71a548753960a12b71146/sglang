@@ -225,11 +225,37 @@ class DeepseekModelNextN(nn.Module):
             else:
                 hidden_states = input_embeds
 
+            # D1 round-8: sub-block bisect inside the draft forward (no-op
+            # unless SGLANG_SELECTIVE_DIFF_DUMP=1). The draft graph capture
+            # runs this forward once per chain step, so per-step slices
+            # bake into the graph like the coordinator's dstep probes.
+            from sglang.srt.hardware_backend.npu.selective_hisparse import (
+                get_npu_selective_hisparse_coordinator,
+            )
+
+            _dm_coord = get_npu_selective_hisparse_coordinator(
+                input_ids.device if input_ids is not None
+                else input_embeds.device
+            )
+            _dm_step = (
+                _dm_coord.debug_draft_model_begin()
+                if _dm_coord is not None
+                else -1
+            )
+            if _dm_coord is not None:
+                _dm_coord.debug_capture_draft_inner(
+                    _dm_step, "emb", hidden_states
+                )
+
             if hidden_states.shape[0] > 0:
                 previous_hidden_states = forward_batch.spec_info.hidden_states
                 if self.rot_weight is not None:
                     previous_hidden_states = torch.matmul(
                         previous_hidden_states, self.rot_weight
+                    )
+                if _dm_coord is not None:
+                    _dm_coord.debug_capture_draft_inner(
+                        _dm_step, "prev", previous_hidden_states
                     )
                 if _is_cuda:
                     eh_input = fused_eh_norm(
@@ -251,6 +277,10 @@ class DeepseekModelNextN(nn.Module):
                     hidden_states, _ = self.eh_proj(eh_input)
                 else:
                     hidden_states = self.eh_proj(eh_input)
+                if _dm_coord is not None:
+                    _dm_coord.debug_capture_draft_inner(
+                        _dm_step, "eh", hidden_states
+                    )
 
             # CP-v2 shards/gathers hidden states at the eager-runner boundary.
             cp_v2_active = is_cp_v2_active(forward_batch)
@@ -277,6 +307,10 @@ class DeepseekModelNextN(nn.Module):
                     hidden_states, _ = self.shared_head.norm(hidden_states, residual)
                 else:
                     hidden_states = self.shared_head.norm(hidden_states)
+                if _dm_coord is not None:
+                    _dm_coord.debug_capture_draft_inner(
+                        _dm_step, "out", hidden_states
+                    )
 
                 if use_cp_v1:
                     local_num_tokens = hidden_states.shape[0]
