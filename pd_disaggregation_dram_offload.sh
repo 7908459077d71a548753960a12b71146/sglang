@@ -249,16 +249,19 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-16 b: am_qpe step0 值判定（无需重采）----------
-# Round-16: am_tik rel=0(sparse_indices 逐位一致, indexer 排除); am_qpe rel=1
-# (q_rope 有差异但 step0 值未打印); attn_raw 仍 NaN@[0-3]。
-# 重跑比对(同 graph20/eager20 dump), 看 am_qpe 逐链步数值:
-# python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager20 --graph-dir /root/hisparse_dump/graph20
-# 判定(看 step0, 即第一个元素; steps1-3 的 0 是未写入零, 忽略):
-#   am_qpe[0] 不一致 -> q_rope 在图内 RoPE 时读到脏 cos/sin cache
-#     (fix cos/sin recompute 路径) -> 探 rotary cache 内容
-#   am_qpe[0] 也一致 -> kernel 全部输入逐位一致仍输出 NaN
-#     -> captured-replay kernel bug, 升级 CANN/算子侧
+# ---------- Round-17: kernel 视角的 KV 字节（CANN 升级前的最后一块证据）----------
+# Round-16 定案: step0 时 kernel 全部可验证输入(q_nope/q_pe/sparse_indices/
+# kvlen/block_table)与 eager 逐位一致, 但 attn_raw 仍 NaN(eager -136 正常)。
+# 最后一个未直接验证的: kernel 经页表 gather 到的字节。新增 am_pgsum
+# (block_table row0 各页字节和, 纯 captured op, 冻结 kernel 真正读到的内容)。
+# graph: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph21 bash pd_disaggregation_dram_offload.sh
+# eager: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager21 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager21 --graph-dir /root/hisparse_dump/graph21
+# 判定: am_pgsum 一致 + attn_raw 仍 NaN -> kernel 对完全相同的输入在图内
+#   replay 算出 NaN = captured-replay kernel bug, 证据链完整, 升级 CANN/
+#   算子侧(附本轮全部 dump: 输入逐位一致表 + attn_raw NaN@[0-3])。
+#   临时缓解方向: 该 kernel 仅 DSA 草稿链使用, 可实验 eager attention
+#   (draft 链不走 graph)或换 non-quant kernel 路径。
 #
 # [可选实证] E3 warmup 对比: 证明 draft NaN 与 hi-sparse 无关(git 考古已证
 #   代码路径早于 hi-sparse; 此实验为运行时铁证):

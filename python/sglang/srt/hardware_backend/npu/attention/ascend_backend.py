@@ -1623,6 +1623,24 @@ class AscendAttnBackend(AttentionBackend):
                     _dbg_am.debug_capture_draft_inner(
                         _am_step, "am_qpe", q_pe
                     )
+                # Round-17: the kernel's OWN view of the KV — byte-sum of
+                # the pages block_table row 0 lists (pure captured ops, no
+                # host logic, so it freezes what the replayed kernel
+                # actually reads). dkvh verified req_to_token-logical
+                # slots; this verifies the page-table view.
+                _kn_u8 = (
+                    k_nope
+                    if k_nope.dtype == torch.uint8
+                    else k_nope.view(torch.uint8)
+                )
+                _kn_pages = _kn_u8.reshape(
+                    -1, self.page_size * _kn_u8.shape[-1]
+                ).sum(dim=1, dtype=torch.int64)
+                _bt0 = self.forward_metadata.block_tables[:1].flatten().to(
+                    torch.int64
+                )
+                _pgsum = _kn_pages[_bt0.clamp(min=0)].sum().reshape(1)
+                _dbg_am.debug_capture_draft_inner(_am_step, "am_pgsum", _pgsum)
 
         if (
             is_prefill

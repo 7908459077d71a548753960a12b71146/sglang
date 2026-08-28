@@ -418,6 +418,16 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 - attn hook 的 [0,2,3] 错位确认（hook 与直捕不一致时以直捕为准），不再追。
 - 附带确认：am_seqlens graph [6,7,8,9] = seq+step+1 逐后端独立刷新 ✓（round-12 修复的旁证）。
 
+### Round-16 b 重跑判读（2026-08-29）— q_pe 排除
+
+**`am_qpe[0]` = 459.94 两侧一致** → q_rope 排除。至此 attention kernel 输入全部验证一致：q_nope ✓、q_pe ✓、sparse_indices（-2033 sentinel，两侧一致）✓、kvlen ✓、block_tables ✓——**kernel 对相同输入在 graph 仍输出 NaN**（eager step0 = -136 正常量级；eager step3 已见 1.24e38 临界值，warmup 垃圾内容本就数值极端）。
+
+### Round-17：kernel 视角 KV 字节 + CANN 升级证据（已埋点待跑）
+
+最后一个未直接验证项：kernel 经页表 gather 的字节（此前验证的是 req_to_token 逻辑槽位视角）。`am_pgsum` = block_table row0 各页字节和（纯 captured op，冻结 kernel 真正读到的内容）。
+- `am_pgsum` 一致 + `attn_raw` 仍 NaN → **captured-replay kernel bug 证据链完整**（全部输入逐位一致 + 输出 NaN），升级 CANN/算子侧，附全部 dump。
+- 临时缓解方向：该 kernel 仅 DSA 草稿链使用 → 实验 draft 链 eager attention / non-quant kernel 路径。
+
 ### Round-16 重采判读（2026-08-29）
 
 - **`am_tik` rel=0**：sparse_indices 与 eager 逐位一致 → **indexer 排除**。

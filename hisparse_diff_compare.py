@@ -294,8 +294,8 @@ def compare_state(args, first_fp_div):
         if dm_keys:
             order = ("ids", "pos", "bt", "topk", "prevraw", "prev",
                      "emb", "eh", "am_q", "am_qpe", "am_tik", "am_kvlen",
-                     "am_seqlens", "am_bt", "attn_raw", "attn", "mlp",
-                     "out", "lmin", "lmw", "lmout")
+                     "am_seqlens", "am_bt", "am_pgsum", "attn_raw",
+                     "attn", "mlp", "out", "lmin", "lmw", "lmout")
             dm_keys.sort(key=lambda k: order.index(k)
                          if k in order else len(order))
             print("  draft-model sub-block fingerprints "
@@ -324,7 +324,7 @@ def compare_state(args, first_fp_div):
         # Attention metadata probes: print ALL chain steps — the kvlen the
         # graph attention sees vs eager is the round-11 poison candidate.
         for k in ("am_kvlen", "am_seqlens", "am_q", "am_qpe", "am_tik",
-                  "am_bt", "attn_raw"):
+                  "am_bt", "am_pgsum", "attn_raw"):
             if f"dm_{k}" in e and f"dm_{k}" in g:
                 ev, gv = e[f"dm_{k}"], g[f"dm_{k}"]
                 print(f"    {k:8s}: {ev.flatten().tolist()} | "
