@@ -249,21 +249,23 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-13: 刷新为什么没生效——host 侧打印直接看（只需 graph 侧）----------
-# am_seqlens 数值: eager [5,5,5,5](原始 seq_lens, 偏移走 cpu_int 分支) |
-# graph [15,15,15,15] -> replay 刷新(metadata.seq_lens.copy_)没达到
-# baked kernel 读的对象。已加 [DBG-META] host 打印: 刷新是否执行/写的什么值。
-# 操作(只起 graph 侧, warmup 即触发, 无需请求; 打印进 decode 日志):
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph16 bash pd_disaggregation_dram_offload.sh
-# 然后在 decode 日志里 grep:
-#   grep DBG-META logs/decode_*.log | head -40
-# 判读(每 replay 应有 4 行, 对应 4 个 per-step 后端):
-#   打印 seq_lens=[6,7,8,9] 类正确值 -> 刷新在跑且值对, 15 是 baked probe 引用
-#     了别的张量 -> 修 forward_sparse 的取值来源/forward_metadata 重绑定
-#   打印 [15,...] 或没打印 -> 刷新没跑或输入错: 查 wrapper 分发
-#     (AscendAttnMultiStepDraftBackend.init_forward_metadata_out_graph)
-#     与 A5 replay 打包路径是否绕过了它
-# eager 侧不需要(不走该路径)。
+# ---------- Round-14: 真根因修复（张量别名链式污染）——验证跑 ----------
+# DBG-META 取证定案: input_seq_lens 恒等于 seq_lens -> _apply 的读写是同一
+# buffer。机制: metadata.seq_lens 别名了 draft runner 的静态 buffers.seq_lens,
+# 四个 per-step 后端 replay 前的逐个刷新 (seq+offset 写回原 buffer) 变成链式
+# 累加, 最后一步的值 (5+Σoff=15) 被四步共享 -> 全部越界读 -> NaN。
+# 修复: _init_cuda_graph_metadata 给每个后端分配独立 seq_lens buffer (clone),
+# 切断别名; 同时消除对 runner 输入 buffer 的原地污染。
+# 验证(只起 graph 侧, warmup 即可):
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph18 bash pd_disaggregation_dram_offload.sh
+#   1) grep DBG-META logs/decode_*.log | tail -12
+#      预期: 同一轮内 step=0..3 的 seq_lens 各不相同(=真实seq+各自偏移,
+#      对齐 eager 的 6/7/8/9 模式), 且 input_seq_lens 不再被改写
+#   2) 完整对比(eager 也跑一次):
+#      SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager18 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+#      python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager18 --graph-dir /root/hisparse_dump/graph18
+#      预期: dstep_toks 不再全 0, dstep_logits 无 NaN, attn/out 不再 NaN
+#   3) 通过后: gsm8k 200 题精度对齐复核 + accept_len(接受率)恢复观察
 # 修复确认后: 跑 gsm8k 200 题复核精度对齐(50 题噪声 ±2pt, 今日两模式
 #   全部落在 0.88~0.94 交叠带, 垃圾提案不影响贪心精度)。
 #

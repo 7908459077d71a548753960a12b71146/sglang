@@ -923,7 +923,14 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        metadata.seq_lens = seq_lens
+        # D1 fix: own buffer, NOT an alias of forward_batch.seq_lens. All
+        # per-step draft backends receive the SAME runner static buffer;
+        # aliasing it made the replay-time per-backend refresh (seq_lens +
+        # step_offset, copied back in place) chain-add across backends, so
+        # every draft step read the LAST backend's shifted value (observed:
+        # constant 15 vs eager's 6/7/8/9) and attended past the valid KV
+        # into uninitialized slots -> NaN draft chain.
+        metadata.seq_lens = seq_lens.clone()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,

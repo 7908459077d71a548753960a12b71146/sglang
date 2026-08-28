@@ -375,6 +375,19 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 - `am_kvlen` 仍 15 且新增 `am_seqlens`（metadata.seq_lens）正确（6/7/8/9）→ 15 在别的字段，找 DSA 路径把 actual_seq_lengths_kv 设成 baked 张量的赋值点改为 buffer+refresh
 - `am_seqlens` 也 15 → replay 刷新路径本身没跑/写错，查 wrapper 分发
 
+### Round-14：真根因定案 + 修复（2026-08-29）
+
+**DBG-META 取证：`input_seq_lens` 恒等于 `seq_lens`** → `_apply_cuda_graph_metadata` 读写的同一 buffer。
+
+**真根因（张量别名链式污染）**：`_init_cuda_graph_metadata` 的 `metadata.seq_lens = seq_lens` 直接**别名**了 draft runner 的静态 `buffers.seq_lens`；四个 per-step 后端共享同一个 forward_batch → 同一 buffer。replay 前的逐后端刷新（读 buffer、加本步偏移、**写回原 buffer**）变成链式累加：backend0 写 5+off0 → backend1 读到 5+off0 再加 off1 → … → backend3 最后写 **5+Σoff = 15**；四个 step 的图内 attention 全绑定该 buffer → 全部读到 15 → 越界读未初始化 KV → NaN。附带污染：runner 输入 buffer 本身被累加改写（decode 打印 row0 随轮次漂移 6→17）。
+
+**修复（一行）**：`_init_cuda_graph_metadata` 改为 `metadata.seq_lens = seq_lens.clone()`——每个后端独立 buffer，刷新不再互相踩、也不再污染 runner 输入。
+
+**验证（warmup 级，脚本尾部）**：
+1. graph 侧 `grep DBG-META`：同一轮内 step=0..3 的 seq_lens 应各不相同（=真实 seq+各自偏移，对齐 eager 的 6/7/8/9 模式），且 input 不再被改写
+2. 完整 dump 对比：`dstep_toks` 不再全 0、`dstep_logits`/`attn`/`out` 无 NaN
+3. 通过后：gsm8k 200 题精度对齐复核 + accept_len 恢复观察（该 bug 偷走的是 spec 加速）
+
 ### Round-13：am_seqlens 数值 + 刷新路径取证（2026-08-28）
 
 - `am_seqlens`（metadata.seq_lens）：eager [5,5,5,5]（原始 seq_lens，per-step 偏移在 eager 走 `seq_lens_cpu_int` 分支）| **graph [15,15,15,15]** → replay 刷新（`_apply_cuda_graph_metadata` 的 `metadata.seq_lens.copy_`）没有达到 baked kernel 读的对象。
