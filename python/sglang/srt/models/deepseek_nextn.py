@@ -462,9 +462,41 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                     )
         hidden_states = self.model(input_ids, positions, forward_batch)
-        return self.logits_processor(
+        # D1 round-9: the bisect proved the NaN enters between the clean
+        # model output (dm_out, no NaN in graph) and next_token_logits
+        # (NaN in graph) — i.e. inside logits_processor / lm_head. Split:
+        #   lmin  — hidden entering the processor (bit-same tensor as
+        #           dm_out; a mismatch would mean an in-replay stomp of
+        #           the hidden before the matmul)
+        #   lmw   — lm_head weight rowsum (a stomped fp8 weight/scale
+        #           buffer yields exactly clean-input -> NaN-output)
+        #   lmout — logits right after the processor (dstep_logits reads
+        #           the same value later in draft_forward)
+        from sglang.srt.hardware_backend.npu.selective_hisparse import (
+            get_npu_selective_hisparse_coordinator,
+        )
+
+        _lm_coord = get_npu_selective_hisparse_coordinator(
+            input_ids.device
+        )
+        _lm_step = (
+            _lm_coord.debug_draft_model_begin()
+            if _lm_coord is not None
+            else -1
+        )
+        if _lm_coord is not None:
+            _lm_coord.debug_capture_draft_inner(_lm_step, "lmin", hidden_states)
+            _lm_w = getattr(self.lm_head, "weight", None)
+            if _lm_w is not None:
+                _lm_coord.debug_capture_draft_inner(_lm_step, "lmw", _lm_w)
+        logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+        if _lm_coord is not None:
+            _lm_coord.debug_capture_draft_inner(
+                _lm_step, "lmout", logits_output.next_token_logits
+            )
+        return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)

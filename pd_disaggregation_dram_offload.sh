@@ -249,17 +249,20 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-8 dump 跑（快采; 已修真实行比对——本轮 dump 需重采）----------
-# 上轮快采的 dm/dstep 天文数字是桶填充伪影(bs8 桶 vs eager bs1, 填充行是静态
-# buffer 陈旧值)。已修: state 记录 dchain_real, dstep/dm 只落真实行。
-# 真实信号: 短 prompt 下 round 1 即发散(此前长 prompt round 1 总是吻合)。
-# dm 表按管线顺序: ids/pos(图静态输入) -> bt/topk -> prevraw/prev -> emb
-#   -> eh -> attn/mlp -> out; graph 侧首个 NaN/发散键 = 毒点。
+# ---------- Round-9 dump 跑（NaN 已定位到 lm_head 段; 拆 processor 内部）----------
+# 上轮定案: draft 模型本体输出 dm_out 全程无 NaN, 而 next_token_logits 每步 NaN
+# -> NaN 产生在 logits_processor/lm_head 内。新增探针:
+#   lmin  — 进 processor 的 hidden(与 dm_out 同一张量, 异常=回放中被踩)
+#   lmw   — lm_head 权重 rowsum(精确比对; fp8 权重/scale buffer 被踩 ->
+#           干净输入出 NaN logits 的首要嫌疑)
+#   lmout — processor 出口的 logits
+# 判定: lmin 坏 -> hidden 在 model 返回与 matmul 之间被踩; lmin 净+lmw 坏 ->
+# 权重 buffer 被踩(aliasing); lmw 净+lmout NaN -> matmul/gather 本身(查 DP gather)。
 #
 # 快速采集(不跑精度, 单请求短输出):
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph12 bash pd_disaggregation_dram_offload.sh
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager12 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph13 bash pd_disaggregation_dram_offload.sh
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager13 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
 #   采集请求(路由节点发一次即可; 同一 prompt 两侧各发一次):
 # curl http://141.61.49.195:31000/generate -H 'Content-Type: application/json' \
 #   -d '{"text": "The capital of France is", "sampling_params": {"max_new_tokens": 64, "temperature": 0}}'
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager12 --graph-dir /root/hisparse_dump/graph12
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager13 --graph-dir /root/hisparse_dump/graph13

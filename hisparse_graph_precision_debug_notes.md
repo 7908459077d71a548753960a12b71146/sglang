@@ -325,12 +325,22 @@ accept_lens 首个发散 step = S
 - 本轮精度 eager 0.90 / graph 0.92 互换，且 eager 侧提案 token 跨 run 变动 → **eager 存在核级非确定性**（±2pt 波动为其表现）；graph 的 NaN 崩塌远超噪声、每轮复现，判读不受影响。
 - accuracy 跑法 A 已证 dump 探针无损；CLONE 主嫌未最终确认（B/C 可选）。
 
-### Round-8 首采判读（2026-08-28，快采 curl 单请求）
+### Round-8 重采判读（2026-08-28，真实行修复后）— NaN 定位到 lm_head 段
 
-- **dm/dstep 表的天文数字（1e8~1e11）大部分是桶填充伪影**：本跑未设 CUDA_GRAPH_BS（默认桶 bs=8），graph 链每步 8 行（1 真 + 7 填充，填充行是静态 buffer 陈旧值），eager 每步 1 行；按 verify token 数切片把两者比到了一起。bt/topk 双侧 0 = 未写（NPU 无 block_tables 属性、无 topk 种子），非吻合。
-- **已修**：state 记录 `dchain_real`（真实行数，draft 时按 `batch.batch_size*topk` 传入），dstep/dm 只落真实行；旧 dump 不可回溯修，需重采。
-- **真实信号**：短 prompt 下 **round 1 即发散**（in_ids slot[4]: eager 997 vs graph 0）——此前 gsm8k 长 prompt 全部 round 1 吻合、round 2-3 才发散。毒**不需要暖机轮次**，且对 prompt 长度/首链路径敏感（bootstrap 后首条 draft 链就坏）。
-- 注意：快采跑法未带 `SGLANG_SELECTIVE_DUMP_MAX_STEPS`，默认已降为 6。
+**决定性事实**：dm 表（draft 模型内部 11 点）**graph 侧 NaN 全部为 0**——embedding、图内交接 hidden 读、rot、eh_proj、attention、MLP、final norm 全程无 NaN；而 dstep_logits/dstep_hidden **graph 侧每步 NaN**。
+
+=> **NaN 产生在 `dm_out`（模型输出，喂 lm_head 的 hidden）与 `next_token_logits` 之间——即 logits_processor/lm_head 段**。dm 表其余大数（ids/pos/emb/eh/attn/mlp/out 的 1e5~1e9 rel）是 step0 logits NaN → argmax 垃圾 token → 逐步级联的下游污染（含 prevraw，step1+ 读的 hidden 已是 NaN 后的 dstep_hidden），非根因。
+
+另证：真实行修复后 round 1 恢复吻合（此前"round1 即发散"是首采请求流未对齐的假象），发散仍在 round 2。
+
+### Round-9 探针（已埋点待跑）：拆 logits_processor/lm_head 段
+
+`DeepseekV3ForCausalLMNextN.forward` 内三个新 dm 键（inner/outer 两次 begin 交错占片，两侧模式一致，各 key 独立比对）：
+- `lmin`：进 processor 的 hidden（与 dm_out 同一张量；异常 = 回放中 model 返回后、matmul 前被踩）
+- `lmw`：**lm_head 权重 rowsum（精确比对）——fp8 权重/scale buffer 在图内被踩是"干净输入→NaN logits"的首要嫌疑**
+- `lmout`：processor 出口 logits
+
+判定：lmin 坏 → hidden 返回后被踩；lmin 净 + lmw 坏 → 权重 buffer aliasing；lmw 净 + lmout NaN → matmul/DP gather 本身（enable_dp_lm_head 路径）。
 
 ### Round-8 全量探针 + 采集降本（2026-08-28，已埋点）
 
