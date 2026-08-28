@@ -294,7 +294,8 @@ def compare_state(args, first_fp_div):
         if dm_keys:
             order = ("ids", "pos", "bt", "topk", "prevraw", "prev",
                      "emb", "eh", "am_q", "am_kvlen", "am_seqlens",
-                     "attn", "mlp", "out", "lmin", "lmw", "lmout")
+                     "am_bt", "attn_raw", "attn", "mlp", "out", "lmin",
+                     "lmw", "lmout")
             dm_keys.sort(key=lambda k: order.index(k)
                          if k in order else len(order))
             print("  draft-model sub-block fingerprints "

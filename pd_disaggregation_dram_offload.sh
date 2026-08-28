@@ -249,25 +249,21 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-14: 真根因修复（张量别名链式污染）——验证跑 ----------
-# DBG-META 取证定案: input_seq_lens 恒等于 seq_lens -> _apply 的读写是同一
-# buffer。机制: metadata.seq_lens 别名了 draft runner 的静态 buffers.seq_lens,
-# 四个 per-step 后端 replay 前的逐个刷新 (seq+offset 写回原 buffer) 变成链式
-# 累加, 最后一步的值 (5+Σoff=15) 被四步共享 -> 全部越界读 -> NaN。
-# 修复: _init_cuda_graph_metadata 给每个后端分配独立 seq_lens buffer (clone),
-# 切断别名; 同时消除对 runner 输入 buffer 的原地污染。
-# 验证(只起 graph 侧, warmup 即可):
-# 第 1 步(最小命令, 只看 DBG-META 打印):
-# SGLANG_SELECTIVE_DIFF_DUMP=1 bash pd_disaggregation_dram_offload.sh
-#   grep DBG-META logs/decode_*.log | tail -12
-#   预期: 同一轮内 step=0..3 的 seq_lens 各不相同(=真实seq+各自偏移,
-#   对齐 eager 的 6/7/8/9 模式), 且 input_seq_lens 不再被改写
-# 第 2 步(完整 dump 对比, 确认 NaN 消失):
-# graph: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph18 bash pd_disaggregation_dram_offload.sh
-# eager: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager18 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-# python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager18 --graph-dir /root/hisparse_dump/graph18
-#   预期: dstep_toks 不再全 0, dstep_logits/attn/out 无 NaN
-# 第 3 步(通过后): gsm8k 200 题精度对齐复核 + accept_len(接受率)恢复观察
+# ---------- Round-15: attention 内部收口（kvlen 已修好, 但 attn@0 仍 NaN）----------
+# 上轮定案: am_kvlen 修复生效([6,7,8,9] 两侧一致), 但 attn NaN@[0,2,3]:
+#   step0 的 q/kvlen 全对却 NaN -> kernel 还有别的脏输入;
+#   step1 的输入(eh)是 NaN 而 attn 干净 -> hook 切片可能有错位, 以显式
+#   step 的直捕为准。
+# 新增探针(显式 step, forward_sparse 内):
+#   am_bt    — kernel 实际读的页表(block_tables, 精确比对)
+#   attn_raw — attention kernel 的原始输出(NaN 是否诞生于 kernel 内部)
+# 判定: am_bt 不一致 -> 页表 stale(修 _apply 的 block_tables 刷新);
+#   am_bt 一致 + attn_raw NaN -> kernel 内部(fp8 KV 内联 scale / indexer
+#   sparse_indices) -> 下轮探 get_kv_buffer 的 scale 路径;
+#   attn_raw 干净 -> NaN 在 kernel 之后的处理(hook 错位也一并可见)。
+# graph: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph19 bash pd_disaggregation_dram_offload.sh
+# eager: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager19 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager19 --graph-dir /root/hisparse_dump/graph19
 #
 # [可选实证] E3 warmup 对比: 证明 draft NaN 与 hi-sparse 无关(git 考古已证
 #   代码路径早于 hi-sparse; 此实验为运行时铁证):

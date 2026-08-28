@@ -1605,6 +1605,10 @@ class AscendAttnBackend(AttentionBackend):
                 _dbg_am.debug_capture_draft_inner(
                     _am_step, "am_seqlens", self.forward_metadata.seq_lens
                 )
+                if self.forward_metadata.block_tables is not None:
+                    _dbg_am.debug_capture_draft_inner(
+                        _am_step, "am_bt", self.forward_metadata.block_tables
+                    )
 
         if (
             is_prefill
@@ -1717,6 +1721,15 @@ class AscendAttnBackend(AttentionBackend):
                     sparse_mode=3,
                     attention_mode=2,
                     return_softmax_lse=False,
+                )
+
+            # D1 round-15: the attention kernel's own output, before any
+            # downstream processing — with q/kvlen verified correct at
+            # step 0, a NaN HERE means the kernel consumes yet another
+            # stale input (page table / fp8 scales inside the packed KV).
+            if _dbg_am is not None and _am_step >= 0:
+                _dbg_am.debug_capture_draft_inner(
+                    _am_step, "attn_raw", attn_out
                 )
 
         if (

@@ -411,6 +411,15 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 - 待消歧：attn 的 3 个 NaN 是 {1,2,3}（级联，预期）还是别的——analyzer 已加逐 step NaN 位置打印（nan@steps），同 dump 重跑比对即得。
 - 若确认 MLP@0 NaN：下一轮探针进 MoE（router 输出 / dispatch 后 token 数 / expert 输出三切片）。
 
+### Round-15：attention 内部收口（2026-08-29，已埋点待跑）
+
+nan@steps 消歧：`attn nan@[0,2,3]`——step0 的 q/kvlen 均已正确却仍 NaN（kernel 还有别的脏输入）；step1 输入 NaN 而 attn 干净（hook 切片错位嫌疑，以显式 step 直捕为准）。
+
+新增探针（forward_sparse 内，显式 step）：`am_bt`（kernel 实际读的 block_tables，精确比对）+ `attn_raw`（attention kernel 原始输出，NaN 诞生点判定）。判定：
+- `am_bt` 不一致 → 页表 stale（修 `_apply` 的 block_tables 刷新）
+- `am_bt` 一致 + `attn_raw` NaN → kernel 内部（fp8 KV 内联 scale / sparse_indices）→ 下轮探 get_kv_buffer 的 scale 路径
+- `attn_raw` 干净 → NaN 在 kernel 之后的处理（hook 错位一并可见）
+
 ### 归属结论：该 bug 与 hi-sparse 无关（2026-08-28）
 
 - **Git 考古**：问题路径（`AscendAttnMultiStepDraftBackend` + `_apply_cuda_graph_metadata` 缺失 `actual_seq_lengths_kv` replay 刷新）源自 2025-12-04 / 2026-06-02 的提交；本分支触及 ascend_backend.py 的仅 3 个提交——hi-sparse 功能（36 行，纯 forward_sparse selected 层路由）+ 调试探针/修复。
