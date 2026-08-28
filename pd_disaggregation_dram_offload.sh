@@ -249,21 +249,20 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-11 dump 跑（毒点已收窄到 draft self-attention 内部）----------
-# Round-10 定案(索引修复后可信): 链 step0 输入全净(emb/eh/交接 hidden/KV/
-# seq_lens 全吻合), NaN 在 draft decoder self-attention 内部产生(attn 键
-# step0 即 NaN); lm_head 权重逐位一致(排除)。round1 不 NaN、round2 起才 NaN
-# -> 与轮次间变化的状态相关(KV 页数增长/backend metadata replay 更新)。
-# 新增探针(仅 draft 链生效): am_q(attention 的 q)、am_kvlen(attention 实际
-# 读到的 KV 长度 metadata)。
-# 判定: am_kvlen graph 侧异常(=0/巨大/与 eager 不一致) -> metadata replay
-# 更新缺失实锤; am_kvlen 一致而 attn 仍 NaN -> 量化 KV scale/页表索引, 下轮
-# 探 get_kv_buffer 的页表路径。
+# ---------- Round-11 判读推进 + E3 warmup 决定性实验 ----------
+# 重要观察: 本轮 dump 全部来自 warmup(未发请求)! 两个推论:
+#  1) NaN 是纯 warmup 流量的确定性行为(round1 净, round2 起 NaN, 随 dummy
+#     请求 seq_len 增长出现), 采集不再需要发请求/跑精度——起两个服务即得。
+#  2) 新探针命中: am_kvlen rel=1.5 / am_q rel=1.0 -> draft attention 在
+#     graph 里读到的 KV 长度 metadata 与 eager 不同(NaN 的直接候选机制)。
 #
-# 快速采集(不跑精度, 单请求短输出):
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph15 bash pd_disaggregation_dram_offload.sh
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager15 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-#   采集请求(路由节点发一次即可; 同一 prompt 两侧各发一次):
-# curl http://141.61.49.195:31000/generate -H 'Content-Type: application/json' \
-#   -d '{"text": "The capital of France is", "sampling_params": {"max_new_tokens": 64, "temperature": 0}}'
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager15 --graph-dir /root/hisparse_dump/graph15
+# 第一步(无需重采): 重跑比对, 看 am_kvlen/am_q 具体数值(eager|graph 逐链步):
+# python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager15 --graph-dir /root/hisparse_dump/graph15
+#
+# 第二步 E3 决定性实验(纯 warmup, 几乎零成本; SELECTIVE_LAYER_IDS 置空关 hisparse):
+# graph: SELECTIVE_LAYER_IDS="" SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph16e3 bash pd_disaggregation_dram_offload.sh
+# eager: SELECTIVE_LAYER_IDS="" SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager16e3 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager16e3 --graph-dir /root/hisparse_dump/graph16e3
+# 判定: 无 hisparse 时 draft NaN 仍在 -> draft graph replay 基础设施 bug
+# (hisparse 无关; 垃圾提案不伤贪心精度, 与 E3 0.94 不矛盾); 消失 -> hisparse 相关。
+# 注意: E3 下 selective 探针大部分不触发, 属预期; 看 dstep_logits 的 graph NaN 即可。

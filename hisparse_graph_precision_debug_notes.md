@@ -362,6 +362,17 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 - round 1 整链不 NaN、round 2 起才 NaN → 与轮次间变化的状态相关（KV 页数增长 / backend metadata 的 replay 更新）。
 - **精度带重估**：今日所有跑 eager/graph 交叠于 0.88~0.94（gsm8k 50 题，1 题=2pt）——0.90 vs 0.94 的差距很可能主要是统计噪声；确定性 bug 是 draft NaN（伤接受率/性能）；精度对齐待 NaN 修复后用 200+ 题复核。
 
+### Round-11 重采判读（2026-08-28，warmup-only dump）— 两个关键进展
+
+1. **dump 全部来自 warmup（未发任何请求）**：
+   - NaN 是纯 warmup 流量的确定性行为（round 1 净、round 2 起 NaN，随 dummy 请求 seq_len 增长出现）；
+   - **采集成本崩塌**：起两个服务即得 dump，无需发请求/跑精度。
+2. **新探针命中**：`am_kvlen` rel=1.5、`am_q` rel=1.0（无 NaN 但值不同）→ **draft attention 在 graph 里读到的 KV 长度 metadata 与 eager 不同**——NaN 的直接候选机制（kvlen 错 → SFA 读错范围 → NaN）。
+
+待办：
+- 重跑比对（同 dump）：analyzer 已加 am_kvlen/am_q 逐链步数值打印，看 graph 侧 kvlen 具体值（=capture 常数？偏移常数？）→ 定位是哪个更新环节缺失；
+- **E3 warmup 决定性实验**（SELECTIVE_LAYER_IDS="" 置空，纯 warmup 采集，几乎零成本）：draft NaN 若在无 hisparse 时仍在 → draft graph replay 基础设施 bug（hisparse 无关；垃圾提案不伤贪心精度，与 E3 0.94 不矛盾——hisparse 只是让这个老 bug 显形于 dump 视野）；若消失 → hisparse 相关。
+
 ### Round-11 探针（已埋点待跑）：draft attention 的 metadata
 
 `ascend_backend.forward_sparse` 的 metadata 消费点（actual_seq_lengths_kv 解析处）加探针（仅 draft 链生效，`debug_draft_current_step()>=0` 门控）：`am_q`（attention 的 q rowsum）+ `am_kvlen`（attention 实际读到的 KV 长度 metadata，精确比对）。
