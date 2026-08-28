@@ -229,26 +229,50 @@ class DeepseekModelNextN(nn.Module):
             # unless SGLANG_SELECTIVE_DIFF_DUMP=1). The draft graph capture
             # runs this forward once per chain step, so per-step slices
             # bake into the graph like the coordinator's dstep probes.
-            from sglang.srt.hardware_backend.npu.selective_hisparse import (
-                get_npu_selective_hisparse_coordinator,
-            )
-
-            _dm_coord = get_npu_selective_hisparse_coordinator(
-                input_ids.device if input_ids is not None
-                else input_embeds.device
-            )
-            _dm_step = (
-                _dm_coord.debug_draft_model_begin()
-                if _dm_coord is not None
-                else -1
-            )
-            if _dm_coord is not None:
-                _dm_coord.debug_capture_draft_inner(
-                    _dm_step, "emb", hidden_states
+            # Draft-EXTEND forwards (which reuse this model class) are
+            # skipped so chain slices 0..3 stay owned by the chain.
+            _dm_coord = None
+            _dm_step = -1
+            if type(forward_batch.spec_info).__name__ != (
+                "EagleDraftExtendInput"
+            ):
+                from sglang.srt.hardware_backend.npu.selective_hisparse import (
+                    get_npu_selective_hisparse_coordinator,
                 )
+
+                _dm_coord = get_npu_selective_hisparse_coordinator(
+                    input_ids.device if input_ids is not None
+                    else input_embeds.device
+                )
+                if _dm_coord is not None:
+                    _dm_step = _dm_coord.debug_draft_model_begin()
+                    _dm_coord.debug_capture_draft_inner(
+                        _dm_step, "ids", input_ids
+                    )
+                    _dm_coord.debug_capture_draft_inner(
+                        _dm_step, "pos", positions
+                    )
+                    _bt = getattr(forward_batch, "block_tables", None)
+                    if _bt is not None:
+                        _dm_coord.debug_capture_draft_inner(
+                            _dm_step, "bt", _bt
+                        )
+                    if _dm_step == 0:
+                        # once per process: decoder sub-module hooks
+                        _dm_coord.debug_register_draft_layer_hooks(
+                            self.decoder
+                        )
+                if _dm_coord is not None:
+                    _dm_coord.debug_capture_draft_inner(
+                        _dm_step, "emb", hidden_states
+                    )
 
             if hidden_states.shape[0] > 0:
                 previous_hidden_states = forward_batch.spec_info.hidden_states
+                if _dm_coord is not None:
+                    _dm_coord.debug_capture_draft_inner(
+                        _dm_step, "prevraw", previous_hidden_states
+                    )
                 if self.rot_weight is not None:
                     previous_hidden_states = torch.matmul(
                         previous_hidden_states, self.rot_weight
@@ -293,6 +317,10 @@ class DeepseekModelNextN(nn.Module):
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
             index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
+            if _dm_coord is not None and index_topk_share.topk_indices is not None:
+                _dm_coord.debug_capture_draft_inner(
+                    _dm_step, "topk", index_topk_share.topk_indices
+                )
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states, residual, topk_indices = self.decoder(
                     positions,

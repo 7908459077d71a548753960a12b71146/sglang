@@ -619,7 +619,7 @@ class NPUSelectiveHiSparseCoordinator:
             )
             os.makedirs(self._dbg_dir, exist_ok=True)
             self._dbg_max_steps = int(
-                os.getenv("SGLANG_SELECTIVE_DUMP_MAX_STEPS", "20")
+                os.getenv("SGLANG_SELECTIVE_DUMP_MAX_STEPS", "6")
             )
             self._dbg_step = 0
             self._dbg_replay_step = 0
@@ -820,19 +820,37 @@ class NPUSelectiveHiSparseCoordinator:
             )
             # Round-8: sub-block bisect INSIDE the draft model forward
             # (per chain step; slices baked per step at draft-graph
-            # capture like _dbg_dstep_*). Points along the NEXTN path:
-            #   emb  — post token-embedding hidden
-            #   prev — spec_info.hidden after the rot_weight matmul (the
-            #          actual in-graph read of the handoff tensor)
-            #   eh   — post eh_proj (decoder-layer input)
-            #   out  — final normed output (feeds lm_head)
+            # capture like _dbg_dstep_*). Covers EVERY remaining suspect
+            # so a single run localizes:
+            #   ids/pos — in-graph reads of the draft graph's STATIC input
+            #             buffers (graph input-binding test)
+            #   bt      — in-graph read of forward_batch.block_tables (the
+            #             attention KV index source)
+            #   topk    — DSA indexer seed (IndexTopKShareState carry)
+            #   prevraw — raw in-graph read of spec_info.hidden_states
+            #             (BEFORE rot matmul)
+            #   prev    — after the rot_weight matmul
+            #   emb     — post token-embedding hidden
+            #   eh      — post eh_proj (decoder-layer input)
+            #   attn/mlp— draft decoder sub-module outputs (forward hooks)
+            #   out     — final normed output (feeds lm_head)
             _n_dm = max(self.verify_width, 8)
+            _dm_f32 = ("prevraw", "prev", "emb", "eh", "attn", "mlp", "out")
+            _dm_i64 = ("ids", "pos", "bt", "topk")
             self._dbg_dm = {
-                k: torch.zeros(_n_dm, T, dtype=torch.float32,
-                               device=self.device)
-                for k in ("emb", "prev", "eh", "out")
+                **{
+                    k: torch.zeros(_n_dm, T, dtype=torch.float32,
+                                   device=self.device)
+                    for k in _dm_f32
+                },
+                **{
+                    k: torch.zeros(_n_dm, T, dtype=torch.int64,
+                                   device=self.device)
+                    for k in _dm_i64
+                },
             }
             self._dbg_dm_step = 0
+            self._dbg_dm_hooks_done = False
             logger.info(
                 f"[DIFF-DUMP] enabled: dir={self._dbg_dir} "
                 f"max_steps={self._dbg_max_steps} layers={_n_dbg} "
@@ -1506,12 +1524,17 @@ class NPUSelectiveHiSparseCoordinator:
             return -1
         s = self._dbg_dm_step
         self._dbg_dm_step += 1
+        # current-invocation slice for the layer forward hooks (they fire
+        # between begin() and the next begin, after the increment)
+        self._dbg_dm_cur = s
         return s
 
     def debug_capture_draft_inner(
         self, step: int, which: str, tensor: Optional[torch.Tensor]
     ):
-        """Round-8: freeze a sub-block rowsum inside the draft forward."""
+        """Round-8: freeze a sub-block fingerprint inside the draft
+        forward. Integer keys (ids/pos/bt/topk) store rowsums (exact
+        compare); float keys store float32 rowsums."""
         if not self._dbg_dump or tensor is None or step < 0:
             return
         buf = self._dbg_dm.get(which)
@@ -1520,9 +1543,39 @@ class NPUSelectiveHiSparseCoordinator:
         t = min(tensor.shape[0], self.tcap)
         if t <= 0:
             return
-        buf[step, :t].copy_(
-            tensor[:t].reshape(t, -1).sum(dim=-1, dtype=torch.float32)
-        )
+        if buf.dtype == torch.int64:
+            buf[step, :t].copy_(
+                tensor[:t].reshape(t, -1).sum(dim=-1, dtype=torch.int64)
+            )
+        else:
+            buf[step, :t].copy_(
+                tensor[:t].reshape(t, -1).sum(dim=-1, dtype=torch.float32)
+            )
+
+    def debug_register_draft_layer_hooks(self, decoder_module):
+        """Round-8: forward hooks on the draft decoder's attention/MLP.
+
+        The hooks enqueue capture ops when the modules run — during
+        draft-graph capture these bake per step (same slice trick as the
+        other dm probes); during eager they run live.
+        """
+        if not self._dbg_dump or self._dbg_dm_hooks_done:
+            return
+        self._dbg_dm_hooks_done = True
+
+        def _hook(which):
+            def fn(mod, inputs, output):
+                t = output[0] if isinstance(output, tuple) else output
+                if torch.is_tensor(t):
+                    self.debug_capture_draft_inner(
+                        getattr(self, "_dbg_dm_cur", -1), which, t
+                    )
+            return fn
+
+        for attr, which in (("self_attn", "attn"), ("mlp", "mlp")):
+            sub = getattr(decoder_module, attr, None)
+            if sub is not None:
+                sub.register_forward_hook(_hook(which))
 
     def debug_capture_draft_kv_hist(
         self,
@@ -1660,18 +1713,22 @@ class NPUSelectiveHiSparseCoordinator:
         # kernel on the compute queue, so its writes are visible. Eager
         # mode: D2H is async on backup_stream — drain first or the readback
         # races the in-flight copy.
-        if mode == "eager":
-            self.drain_all()
-        d2h_rows = self._dbg_d2h_locs_all[:, :n].cpu()
-        d2h_rb = torch.zeros(
-            len(self.selected_layer_ids_sorted), n, dtype=torch.int64
-        )
-        for _rb_i, _rb_lid in enumerate(self.selected_layer_ids_sorted):
-            _rb_view = self.pool.get_host_tensor(_rb_lid)
-            d2h_rb[_rb_i] = _rb_view[d2h_rows[_rb_i]].sum(
-                dim=-1, dtype=torch.int64
+        # Host-pool readback is opt-in (SGLANG_SELECTIVE_DUMP_READBACK=1):
+        # the host-pool poisoning hypothesis is retired, and the per-layer
+        # host gathers + syncs dominate dump collection time.
+        if os.getenv("SGLANG_SELECTIVE_DUMP_READBACK", "0") == "1":
+            if mode == "eager":
+                self.drain_all()
+            d2h_rows = self._dbg_d2h_locs_all[:, :n].cpu()
+            d2h_rb = torch.zeros(
+                len(self.selected_layer_ids_sorted), n, dtype=torch.int64
             )
-        snap["d2h_rb"] = d2h_rb
+            for _rb_i, _rb_lid in enumerate(self.selected_layer_ids_sorted):
+                _rb_view = self.pool.get_host_tensor(_rb_lid)
+                d2h_rb[_rb_i] = _rb_view[d2h_rows[_rb_i]].sum(
+                    dim=-1, dtype=torch.int64
+                )
+            snap["d2h_rb"] = d2h_rb
         path = os.path.join(
             self._dbg_dir, f"{mode}_dev{dev}_step{step:04d}.pt"
         )
@@ -1966,11 +2023,11 @@ class NPUSelectiveHiSparseCoordinator:
                     # Round-7 draft KV history content + seq_lens
                     "dkvh": self._dbg_dkvh[:_n_st].cpu(),
                     "dseql": self._dbg_dseql[:_n_st].cpu(),
-                    # Round-8 draft-model sub-block bisect [S, T]
-                    "dm_emb": self._dbg_dm["emb"][:, :_n_st].cpu(),
-                    "dm_prev": self._dbg_dm["prev"][:, :_n_st].cpu(),
-                    "dm_eh": self._dbg_dm["eh"][:, :_n_st].cpu(),
-                    "dm_out": self._dbg_dm["out"][:, :_n_st].cpu(),
+                    # Round-8 draft-model sub-block bisect [S, T] (all keys)
+                    **{
+                        f"dm_{k}": v[:, :_n_st].cpu()
+                        for k, v in self._dbg_dm.items()
+                    },
                 }
                 torch.save(
                     state,

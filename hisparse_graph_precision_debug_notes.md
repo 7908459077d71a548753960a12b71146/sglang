@@ -325,17 +325,31 @@ accept_lens 首个发散 step = S
 - 本轮精度 eager 0.90 / graph 0.92 互换，且 eager 侧提案 token 跨 run 变动 → **eager 存在核级非确定性**（±2pt 波动为其表现）；graph 的 NaN 崩塌远超噪声、每轮复现，判读不受影响。
 - accuracy 跑法 A 已证 dump 探针无损；CLONE 主嫌未最终确认（B/C 可选）。
 
-### Round-8 探针（已埋点待跑）：draft 模型内部子块二分
+### Round-8 全量探针 + 采集降本（2026-08-28，已埋点待跑）
 
-`deepseek_nextn.forward` 四个挂点（per 链 step 烘焙切片）：`dm_emb`（embedding 后）/ `dm_prev`（**图内交接 hidden 读 + rot matmul 后**——in-replay aliasing 窗口的直接观测）/ `dm_eh`（eh_proj 后）/ `dm_out`（final norm 后）。coordinator 经新增全局注册表 `_COORDINATORS`/`get_npu_selective_hisparse_coordinator()` 供模型文件取用（draft 的 forward_batch 不带 coordinator）。analyzer 输出 dm 表（各子块 eager/graph NaN 计数 + max rel），**graph 侧首个含 NaN 的子块 = 毒点**：
-- emb 坏 → embedding 查表/图输入绑定
-- prev 坏 → 图内交接 hidden 读被 stomped（in-replay aliasing）或 rot matmul
-- eh 坏 → enorm/hnorm/eh_proj
-- out 坏（前三净）→ decoder 层（attention/indexer/FFN）或 final norm
+**目标：一跑定案。** 剩余全部可疑点一次埋全（`deepseek_nextn.forward` 内 11 个 dm 键，按管线顺序）：
+
+| 键 | 内容 | 坏时指向 |
+|---|---|---|
+| ids/pos | draft 图静态输入 buffer 的图内读 | 图输入绑定错 |
+| bt | forward_batch.block_tables 图内读 | attention KV 索引源错 |
+| topk | DSA indexer 种子（from_mtp_carry） | indexer 读错位置 |
+| prevraw | spec_info.hidden 图内原始读（rot 前） | in-replay aliasing（pre-draft 读净 ≠ 图内读净） |
+| prev | rot matmul 后 | rot matmul |
+| emb | embedding 后 | embedding 查表 |
+| eh | eh_proj 后 | enorm/hnorm/eh_proj |
+| attn/mlp | decoder 子模块输出（forward hook，烘焙切片） | attention / FFN(MoE) |
+| out | final norm 后 | norm/lm_head 前 |
+
+实现要点：coordinator 全局注册表 `_COORDINATORS`；`debug_draft_model_begin()` 记录 `_dbg_dm_cur` 供层 hook 用（避免 off-by-one）；draft-extend 前向按 spec_info 类型跳过（链独占 slice 0-3）。
+
+**采集降本**：`SGLANG_SELECTIVE_DUMP_MAX_STEPS` 默认 20→**6**（首发散总在 step 2-3）；host-pool 回读改 `SGLANG_SELECTIVE_DUMP_READBACK=1` 选开（毒化假设已退役，回读+同步是采集时间大头）；**快速采集 = 单请求 64 token 短输出替代 50 题 gsm8k**（命令在脚本尾部）。
+
+判定：analyzer dm 表按管线顺序输出（eager/graph NaN 计数 + max rel），**graph 侧首个 NaN/发散键 = 毒点**。
 
 ### 启动命令规则
 
-**每次试验后必须刷新 `pd_disaggregation_dram_offload.sh` 末尾的启动命令**（含当次 dump 目录/开关/比对命令）。当前尾部 = round-8 跑法（graph11/eager11，目录统一在 /root/hisparse_dump/ 下）。
+**每次试验后必须刷新 `pd_disaggregation_dram_offload.sh` 末尾的启动命令**（含当次 dump 目录/开关/比对命令）。当前尾部 = round-8 快速采集（graph11/eager11 + curl 单请求）。
 
 ### 第六轮探针（round-6，已埋点）
 

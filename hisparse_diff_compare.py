@@ -285,18 +285,27 @@ def compare_state(args, first_fp_div):
         # along emb -> prev(rot matmul on the in-graph handoff read) ->
         # eh(eh_proj) -> out(final norm). NaN in the graph side at the
         # FIRST bad block pins the draft-internal poison point.
-        if "dm_emb" in e and "dm_emb" in g:
-            print("  draft-model sub-block per chain step "
-                  "(e: eager nan n, g: graph nan n, max rel):")
-            for k, fld in (("emb", "dm_emb"), ("prev", "dm_prev"),
-                           ("eh", "dm_eh"), ("out", "dm_out")):
-                enan = int(torch.isnan(e[fld]).sum())
-                gnan = int(torch.isnan(g[fld]).sum())
+        # Round-8: draft-model sub-block bisect. Keys print in pipeline
+        # order: ids/pos (graph static inputs) -> bt/topk (attention index
+        # sources) -> prevraw/prev (in-graph handoff read, pre/post rot)
+        # -> emb -> eh -> attn/mlp (decoder internals) -> out. The FIRST
+        # graph-side NaN / divergence in this order is the poison point.
+        dm_keys = [k[3:] for k in e.keys() if k.startswith("dm_")]
+        if dm_keys:
+            order = ("ids", "pos", "bt", "topk", "prevraw", "prev",
+                     "emb", "eh", "attn", "mlp", "out")
+            dm_keys.sort(key=lambda k: order.index(k)
+                         if k in order else len(order))
+            print("  draft-model sub-block fingerprints "
+                  "(eager nan, graph nan, max rel):")
+            for k in dm_keys:
+                ev, gv = e[f"dm_{k}"], g[f"dm_{k}"]
+                enan = int(torch.isnan(ev.float()).sum())
+                gnan = int(torch.isnan(gv.float()).sum())
                 rd = rel_diff(
-                    e[fld].flatten().float(), g[fld].flatten().float()
-                ).max().item()
-                print(f"    {k:4s}: eager nan {enan}, graph nan {gnan}, "
-                      f"max rel {rd:.4g}")
+                    ev.flatten().float(), gv.flatten().float()
+                ).max().item() if ev.numel() else 0.0
+                print(f"    {k:8s}: {enan}, {gnan}, {rd:.4g}")
         # Root-vs-draft split: with topk=1 the verify tree is a chain and
         # in_ids[0] is the LAST ACCEPTED token of the previous round
         # (accept_lens matched there), in_ids[1:] are this round's fresh
