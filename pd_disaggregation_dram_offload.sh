@@ -249,21 +249,19 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-15: attention 内部收口（kvlen 已修好, 但 attn@0 仍 NaN）----------
-# 上轮定案: am_kvlen 修复生效([6,7,8,9] 两侧一致), 但 attn NaN@[0,2,3]:
-#   step0 的 q/kvlen 全对却 NaN -> kernel 还有别的脏输入;
-#   step1 的输入(eh)是 NaN 而 attn 干净 -> hook 切片可能有错位, 以显式
-#   step 的直捕为准。
-# 新增探针(显式 step, forward_sparse 内):
-#   am_bt    — kernel 实际读的页表(block_tables, 精确比对)
-#   attn_raw — attention kernel 的原始输出(NaN 是否诞生于 kernel 内部)
-# 判定: am_bt 不一致 -> 页表 stale(修 _apply 的 block_tables 刷新);
-#   am_bt 一致 + attn_raw NaN -> kernel 内部(fp8 KV 内联 scale / indexer
-#   sparse_indices) -> 下轮探 get_kv_buffer 的 scale 路径;
-#   attn_raw 干净 -> NaN 在 kernel 之后的处理(hook 错位也一并可见)。
-# graph: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph19 bash pd_disaggregation_dram_offload.sh
-# eager: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager19 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager19 --graph-dir /root/hisparse_dump/graph19
+# ---------- Round-16: kernel 内部最后一层未验证输入 ----------
+# Round-15 定案: attn_raw NaN@[0,1,2,3] —— NaN 诞生于 attention kernel 内部;
+# 而其已验证输入 q/kvlen/block_tables 全部与 eager 逐位一致。
+# 剩余两个未验证输入, 新增探针(显式 step):
+#   am_tik — sparse_indices (DSA indexer 的 KV 位置选择; 垃圾索引 = OOB 读)
+#   am_qpe — q_rope (query 的另一半)
+# 判定: am_tik 不一致 -> indexer 在图内读到脏 index_k cache(与主 KV 同类,
+#   dkvh 未覆盖) -> 下轮探 set_index_k_buffer 的 cache 内容;
+#   am_tik 一致 + am_qpe 一致但 kernel 仍 NaN -> kernel 自身对相同输入在
+#   图内算出 NaN(captured-replay bug) -> 升级给 CANN/算子侧
+# graph: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph20 bash pd_disaggregation_dram_offload.sh
+# eager: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager20 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager20 --graph-dir /root/hisparse_dump/graph20
 #
 # [可选实证] E3 warmup 对比: 证明 draft NaN 与 hi-sparse 无关(git 考古已证
 #   代码路径早于 hi-sparse; 此实验为运行时铁证):

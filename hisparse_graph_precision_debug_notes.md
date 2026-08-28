@@ -411,7 +411,20 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 - 待消歧：attn 的 3 个 NaN 是 {1,2,3}（级联，预期）还是别的——analyzer 已加逐 step NaN 位置打印（nan@steps），同 dump 重跑比对即得。
 - 若确认 MLP@0 NaN：下一轮探针进 MoE（router 输出 / dispatch 后 token 数 / expert 输出三切片）。
 
-### Round-15：attention 内部收口（2026-08-29，已埋点待跑）
+### Round-15 重采判读（2026-08-29）— NaN 诞生于 attention kernel 内部
+
+- **`am_bt` rel=0**：kernel 读的 block_tables 与 eager 逐位一致 → 页表排除。
+- **`attn_raw` NaN@[0,1,2,3]**（直捕、显式 step，权威）：NaN 诞生于 `npu_kv_quant_sparse_flash_attention` kernel 内部，且四步全 NaN。q（am_q step0 逐位一致）、kvlen（am_kvlen 逐位一致）、block_tables（am_bt 逐位一致）全部干净。
+- attn hook 的 [0,2,3] 错位确认（hook 与直捕不一致时以直捕为准），不再追。
+- 附带确认：am_seqlens graph [6,7,8,9] = seq+step+1 逐后端独立刷新 ✓（round-12 修复的旁证）。
+
+### Round-16 探针（已埋点待跑）：kernel 最后两个未验证输入
+
+`am_tik`（sparse_indices——DSA indexer 的 KV 位置选择）+ `am_qpe`（q_rope）。判定：
+- `am_tik` 不一致 → indexer 在图内读到脏 **index_k cache**（DSA indexer 自己的 cache，dkvh 未覆盖；与主 KV 同类的图内状态问题）→ 下轮探 set_index_k_buffer 路径
+- `am_tik`/`am_qpe` 一致但 kernel 仍 NaN → kernel 对相同输入在图内算出 NaN（captured-replay 语义）→ 升级 CANN/算子侧
+
+### Round-15 探针（2026-08-28，已埋点；历史记录）
 
 nan@steps 消歧：`attn nan@[0,2,3]`——step0 的 q/kvlen 均已正确却仍 NaN（kernel 还有别的脏输入）；step1 输入 NaN 而 attn 干净（hook 切片错位嫌疑，以显式 step 直捕为准）。
 

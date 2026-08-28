@@ -836,9 +836,9 @@ class NPUSelectiveHiSparseCoordinator:
             #   out     — final normed output (feeds lm_head)
             _n_dm = max(self.verify_width, 8)
             _dm_f32 = ("prevraw", "prev", "emb", "eh", "attn", "mlp", "out",
-                       "lmin", "lmout", "am_q", "attn_raw")
+                       "lmin", "lmout", "am_q", "attn_raw", "am_qpe")
             _dm_i64 = ("ids", "pos", "bt", "topk", "lmw", "am_kvlen",
-                       "am_seqlens", "am_bt")
+                       "am_seqlens", "am_bt", "am_tik")
             self._dbg_dm = {
                 **{
                     k: torch.zeros(_n_dm, T, dtype=torch.float32,

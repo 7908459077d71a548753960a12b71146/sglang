@@ -1609,6 +1609,20 @@ class AscendAttnBackend(AttentionBackend):
                     _dbg_am.debug_capture_draft_inner(
                         _am_step, "am_bt", self.forward_metadata.block_tables
                     )
+                # Round-16: the kernel inputs not yet verified. The kernel
+                # NaNs at all 4 chain steps while q/kvlen/block_table are
+                # bit-identical to eager — remaining suspects:
+                #   am_tik — sparse_indices (the DSA indexer's KV position
+                #            selection; garbage indices = OOB KV reads)
+                #   am_qpe — q_rope (the other half of the query)
+                if topk_indices is not None:
+                    _dbg_am.debug_capture_draft_inner(
+                        _am_step, "am_tik", topk_indices
+                    )
+                if q_pe is not None:
+                    _dbg_am.debug_capture_draft_inner(
+                        _am_step, "am_qpe", q_pe
+                    )
 
         if (
             is_prefill
