@@ -1036,6 +1036,17 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
+        # D1 fix: refresh actual_seq_lengths_kv together with seq_lens.
+        # The DSA path bakes this tensor at capture; without a per-replay
+        # refresh the drafted graph's attention reads the capture-time KV
+        # length forever (observed: constant 15 while the eager chain used
+        # base+step+1 = 6/7/8/9), so it attends past the valid KV into
+        # uninitialized slots and the whole draft chain NaNs out.
+        if getattr(metadata, "actual_seq_lengths_kv", None) is not None:
+            metadata.actual_seq_lengths_kv[:bs].copy_(
+                seq_lens[:bs].to(metadata.actual_seq_lengths_kv.dtype)
+            )
+
         self.forward_metadata = metadata
 
         self.graph_mode = True
@@ -1568,6 +1579,9 @@ class AscendAttnBackend(AttentionBackend):
                 _dbg_am.debug_capture_draft_inner(_am_step, "am_q", q_nope)
                 _dbg_am.debug_capture_draft_inner(
                     _am_step, "am_kvlen", actual_seq_lengths_kv
+                )
+                _dbg_am.debug_capture_draft_inner(
+                    _am_step, "am_seqlens", self.forward_metadata.seq_lens
                 )
 
         if (

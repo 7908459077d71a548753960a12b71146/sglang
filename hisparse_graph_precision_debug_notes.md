@@ -362,7 +362,20 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 - round 1 整链不 NaN、round 2 起才 NaN → 与轮次间变化的状态相关（KV 页数增长 / backend metadata 的 replay 更新）。
 - **精度带重估**：今日所有跑 eager/graph 交叠于 0.88~0.94（gsm8k 50 题，1 题=2pt）——0.90 vs 0.94 的差距很可能主要是统计噪声；确定性 bug 是 draft NaN（伤接受率/性能）；精度对齐待 NaN 修复后用 200+ 题复核。
 
-### Round-11 重采判读（2026-08-28，warmup-only dump）— 两个关键进展
+### Round-12：根因定案 + 修复（2026-08-28）
+
+**根因**：graph 下 draft 链 attention 读到的 KV 长度是 **capture 烘焙常数**——`am_kvlen: eager [6,7,8,9]（=seq_len+step+1，正确链式增量）vs graph [15,15,15,15]`；step 0 的 q 两侧逐位一致（587.8）→ 唯一差异就是 kvlen。**attention 越过真实 KV 末尾读到未初始化槽位 → NaN → 提案退化 token 0 → 整链报废**。graph 模式下 draft 链从第一轮起就是坏的（round 1 verify 吻合只是因为垃圾提案不影响贪心 verify 输出）。
+
+**影响重估**：垃圾提案不改变贪心精度（accept 只收匹配 token，输出由 target argmax 决定）→ 这是**性能 bug**（接受率塌到 1，spec 加速失效），与今日 0.88~0.94 两模式交叠的精度带自洽；0.90 vs 0.94 的原始"精度差距"大概率是 50 题的统计噪声。此 bug 在 draft graph replay 基础设施层，与 hisparse 无关（E3 warmup 对比可实证，可选）。
+
+**已实施修复**：`ascend_backend._apply_cuda_graph_metadata` 在随 replay 刷新 `seq_lens` 时一并原地刷新 `actual_seq_lengths_kv`（DSA 路径烘焙的张量，forward_sparse 取值优先级最高）。
+
+**验证（warmup 采集，脚本尾部命令）**：
+- `dstep_toks` graph 侧不再全 0 / `dstep_logits` 无 NaN → 修复生效；随后 gsm8k 200 题复核精度对齐 + 观察接受率恢复
+- `am_kvlen` 仍 15 且新增 `am_seqlens`（metadata.seq_lens）正确（6/7/8/9）→ 15 在别的字段，找 DSA 路径把 actual_seq_lengths_kv 设成 baked 张量的赋值点改为 buffer+refresh
+- `am_seqlens` 也 15 → replay 刷新路径本身没跑/写错，查 wrapper 分发
+
+### Round-11 重采判读（2026-08-28，warmup-only dump）
 
 1. **dump 全部来自 warmup（未发任何请求）**：
    - NaN 是纯 warmup 流量的确定性行为（round 1 净、round 2 起 NaN，随 dummy 请求 seq_len 增长出现）；
