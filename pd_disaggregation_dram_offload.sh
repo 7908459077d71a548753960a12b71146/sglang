@@ -249,19 +249,21 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-10 dump 跑（修复 dm 切片索引——本轮必须重采）----------
-# 上轮 step-0 表暴露: inner/outer 双 begin 计数器基线在 eager(每轮经 draft()
-# 重置)与 graph(capture 时基线任意)之间错位, dm 全表跨 run 比对不可信。
-# 已修: draft_forward 循环内 debug_draft_mark_step(i) 显式标记链 step,
-# 模型文件全部改读 current step; 链尾 mark(-1) 防 draft-extend 污染。
-# 重采后 dm 表(按管线序 ids/pos -> prevraw/prev -> emb -> eh -> attn/mlp
-# -> out -> lmin -> lmw -> lmout)首次完全可信: graph 侧首个 NaN/发散键 = 毒点。
-# 已知可靠事实: dstep_logits graph 侧 4 个已执行链步(0-3)全部 NaN, 链输入全净。
+# ---------- Round-11 dump 跑（毒点已收窄到 draft self-attention 内部）----------
+# Round-10 定案(索引修复后可信): 链 step0 输入全净(emb/eh/交接 hidden/KV/
+# seq_lens 全吻合), NaN 在 draft decoder self-attention 内部产生(attn 键
+# step0 即 NaN); lm_head 权重逐位一致(排除)。round1 不 NaN、round2 起才 NaN
+# -> 与轮次间变化的状态相关(KV 页数增长/backend metadata replay 更新)。
+# 新增探针(仅 draft 链生效): am_q(attention 的 q)、am_kvlen(attention 实际
+# 读到的 KV 长度 metadata)。
+# 判定: am_kvlen graph 侧异常(=0/巨大/与 eager 不一致) -> metadata replay
+# 更新缺失实锤; am_kvlen 一致而 attn 仍 NaN -> 量化 KV scale/页表索引, 下轮
+# 探 get_kv_buffer 的页表路径。
 #
 # 快速采集(不跑精度, 单请求短输出):
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph14 bash pd_disaggregation_dram_offload.sh
-# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager14 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph15 bash pd_disaggregation_dram_offload.sh
+# SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager15 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
 #   采集请求(路由节点发一次即可; 同一 prompt 两侧各发一次):
 # curl http://141.61.49.195:31000/generate -H 'Content-Type: application/json' \
 #   -d '{"text": "The capital of France is", "sampling_params": {"max_new_tokens": 64, "temperature": 0}}'
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager14 --graph-dir /root/hisparse_dump/graph14
+# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager15 --graph-dir /root/hisparse_dump/graph15

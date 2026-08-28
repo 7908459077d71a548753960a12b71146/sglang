@@ -1551,6 +1551,25 @@ class AscendAttnBackend(AttentionBackend):
         else:
             actual_seq_lengths_kv = self.forward_metadata.seq_lens
 
+        # D1 round-11: draft-chain attention metadata probe (no-op outside
+        # the draft chain — debug_draft_current_step() is -1 for target
+        # verify / draft-extend / prefill). Round-10's properly-indexed
+        # bisect pinned the draft NaN to self-attention at chain step 0
+        # with verified-clean inputs; this captures the q and the KV-length
+        # metadata the attention kernel actually sees at replay.
+        from sglang.srt.hardware_backend.npu.selective_hisparse import (
+            get_npu_selective_hisparse_coordinator,
+        )
+
+        _dbg_am = get_npu_selective_hisparse_coordinator(q_nope.device)
+        if _dbg_am is not None:
+            _am_step = _dbg_am.debug_draft_current_step()
+            if _am_step >= 0:
+                _dbg_am.debug_capture_draft_inner(_am_step, "am_q", q_nope)
+                _dbg_am.debug_capture_draft_inner(
+                    _am_step, "am_kvlen", actual_seq_lengths_kv
+                )
+
         if (
             is_prefill
             and is_dsa_enable_prefill_cp()

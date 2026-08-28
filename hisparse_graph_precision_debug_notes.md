@@ -354,9 +354,25 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 
 判读（重采后）：按管线序 ids/pos → prevraw/prev → emb → eh → attn/mlp → out → lmin → lmw → lmout，**graph 侧首个 NaN/发散键 = 毒点**；若直到 lmw 全净而 lmout NaN → processor 内部 matmul/DP-gather；若 attn/mlp 先坏 → draft decoder 内部（其 KV 读已证净，怀疑 attention metadata 图内路径）。
 
-### Round-8 全量探针 + 采集降本（2026-08-28，已埋点）
+### Round-10 重采判读（2026-08-28）— 毒点命中 draft self-attention 内部
 
-**目标：一跑定案。** 剩余全部可疑点一次埋全（`deepseek_nextn.forward` 内 11 个 dm 键，按管线顺序）：
+索引修复后 dm 表首次完全可信（out==lmin 交叉验证通过）。链 step 0：输入全净（ids/pos/topk 种子/prevraw/交接 hidden/KV 内容/seq_lens 全吻合），emb 无 NaN、eh 无 NaN（eh 的 3 个 NaN 是 step1-3 读到 NaN 交接态的级联），**attn 键 step 0 即 NaN（4 步全 NaN）**→ **NaN 产生于 draft decoder self-attention 内部**（mlp/out/lmin/lmout 的 NaN 全为其下游）。
+
+- **lmw = 0（这次可信）→ lm_head 权重排除**（round-9 结论维持）。
+- round 1 整链不 NaN、round 2 起才 NaN → 与轮次间变化的状态相关（KV 页数增长 / backend metadata 的 replay 更新）。
+- **精度带重估**：今日所有跑 eager/graph 交叠于 0.88~0.94（gsm8k 50 题，1 题=2pt）——0.90 vs 0.94 的差距很可能主要是统计噪声；确定性 bug 是 draft NaN（伤接受率/性能）；精度对齐待 NaN 修复后用 200+ 题复核。
+
+### Round-11 探针（已埋点待跑）：draft attention 的 metadata
+
+`ascend_backend.forward_sparse` 的 metadata 消费点（actual_seq_lengths_kv 解析处）加探针（仅 draft 链生效，`debug_draft_current_step()>=0` 门控）：`am_q`（attention 的 q rowsum）+ `am_kvlen`（attention 实际读到的 KV 长度 metadata，精确比对）。
+
+判定：
+- `am_kvlen` graph 侧 =0/巨大/与 eager 不一致 → **metadata replay 更新缺失实锤**（capture 时烘焙的 seq_lens 未随 replay 更新）→ 修复方向：draft graph runner 的 replay 输入更新补上 attention metadata
+- `am_kvlen` 一致而 attn 仍 NaN → 下一轮探 get_kv_buffer 的页表/量化 scale 路径
+
+### Round-8 全量探针（2026-08-28，已埋点；历史记录）
+
+剩余可疑点一次埋全（`deepseek_nextn.forward` 内 dm 键，按管线顺序）：
 
 | 键 | 内容 | 坏时指向 |
 |---|---|---|
@@ -375,6 +391,8 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 **采集降本**：`SGLANG_SELECTIVE_DUMP_MAX_STEPS` 默认 20→**6**（首发散总在 step 2-3）；host-pool 回读改 `SGLANG_SELECTIVE_DUMP_READBACK=1` 选开（毒化假设已退役，回读+同步是采集时间大头）；**快速采集 = 单请求 64 token 短输出替代 50 题 gsm8k**（命令在脚本尾部）。
 
 判定：analyzer dm 表按管线顺序输出（eager/graph NaN 计数 + max rel），**graph 侧首个 NaN/发散键 = 毒点**。
+
+（历史注：round-8 的 begin 计数器索引方案已在 round-10 被 mark_step 显式索引取代。）
 
 ### 启动命令规则
 
