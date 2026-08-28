@@ -422,6 +422,14 @@ step-0 链值：`out=-63.9 | 7.37`、`lmin=37.5 | 0.0`——out 与 lmin 本应�
 
 **`am_qpe[0]` = 459.94 两侧一致** → q_rope 排除。至此 attention kernel 输入全部验证一致：q_nope ✓、q_pe ✓、sparse_indices（-2033 sentinel，两侧一致）✓、kvlen ✓、block_tables ✓——**kernel 对相同输入在 graph 仍输出 NaN**（eager step0 = -136 正常量级；eager step3 已见 1.24e38 临界值，warmup 垃圾内容本就数值极端）。
 
+### Round-17 b：am_pgsum 探针修正（2026-08-29，需重采）
+
+上轮 `am_pgsum` 628K vs 8.76 亿是**探针伪影**：整行页表求和 + `clamp(0)` 把 page 0 重复计入，而 eager（动态宽）/graph（固定宽）行宽不同，page 0 累加次数不同 → 差异来自聚合方式，非 kernel 读到的内容差异。
+
+已修：只对 kernel 实际读的第一个页（`block_table[0,0]`=page 1，本链 kvlen≤page_size 只占一页）求字节和。重采后判定：
+- `am_pgsum`（page 1 字节和）一致 + `attn_raw` 仍 NaN → **captured-replay kernel bug 证据链完整**（q/q_pe/sparse_indices/kvlen/block_table 逐位一致 + kernel 输出 NaN），升级 CANN/算子侧；临时缓解：draft 链 eager attention / non-quant kernel
+- 不一致 → 页表指向的页内容在 graph 里被污染 → 回到图内写路径排查
+
 ### Round-17：kernel 视角 KV 字节 + CANN 升级证据（已埋点待跑）
 
 最后一个未直接验证项：kernel 经页表 gather 的字节（此前验证的是 req_to_token 逻辑槽位视角）。`am_pgsum` = block_table row0 各页字节和（纯 captured op，冻结 kernel 真正读到的内容）。

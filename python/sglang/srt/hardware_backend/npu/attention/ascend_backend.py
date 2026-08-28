@@ -1624,10 +1624,13 @@ class AscendAttnBackend(AttentionBackend):
                         _am_step, "am_qpe", q_pe
                     )
                 # Round-17: the kernel's OWN view of the KV — byte-sum of
-                # the pages block_table row 0 lists (pure captured ops, no
-                # host logic, so it freezes what the replayed kernel
-                # actually reads). dkvh verified req_to_token-logical
-                # slots; this verifies the page-table view.
+                # the page block_table[0,0] points to (kvlen <= page_size
+                # in this chain, so the kernel reads exactly one page; pure
+                # captured ops, no host logic, so it freezes what the
+                # replayed kernel actually reads). NOTE: summing the whole
+                # padded block_table row was an artifact — eager and graph
+                # rows have different widths, so page-0 clamp terms
+                # dominated the sum.
                 _kn_u8 = (
                     k_nope
                     if k_nope.dtype == torch.uint8
@@ -1636,10 +1639,10 @@ class AscendAttnBackend(AttentionBackend):
                 _kn_pages = _kn_u8.reshape(
                     -1, self.page_size * _kn_u8.shape[-1]
                 ).sum(dim=1, dtype=torch.int64)
-                _bt0 = self.forward_metadata.block_tables[:1].flatten().to(
-                    torch.int64
-                )
-                _pgsum = _kn_pages[_bt0.clamp(min=0)].sum().reshape(1)
+                _bt00 = self.forward_metadata.block_tables[0, 0].clamp(
+                    min=0
+                ).to(torch.int64)
+                _pgsum = _kn_pages[_bt00].reshape(1)
                 _dbg_am.debug_capture_draft_inner(_am_step, "am_pgsum", _pgsum)
 
         if (
