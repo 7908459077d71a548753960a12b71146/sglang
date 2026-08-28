@@ -1056,7 +1056,7 @@ class AscendAttnBackend(AttentionBackend):
         if _os.getenv("SGLANG_SELECTIVE_DIFF_DUMP", "0") == "1":
             print(
                 f"[DBG-META] step={getattr(self, 'speculative_step_id', '?')} "
-                f"in_capture={in_capture} bs={bs} "
+                f"bs={bs} "
                 f"seq_lens={metadata.seq_lens[:bs].tolist()} "
                 f"input_seq_lens={seq_lens[:bs].tolist()}",
                 flush=True,
