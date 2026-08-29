@@ -54,7 +54,7 @@ class NPUSelectiveACLCallback:
     """ACL host-callback thread for async H2D under NPUGraph.
 
     A daemon thread per device loops on ``acl.rt.process_report(100)`` so that
-    ``sparse_copy`` H2D async copies work correctly inside captured
+    ``varlen_copy`` H2D async copies work correctly inside captured
     NPU graphs.
     """
 
@@ -157,7 +157,7 @@ class SelectiveHostKVPool:
     in Host DRAM.  The region is registered with memfabric's offload URMA pool
     so that it has both a Host Virtual Address (HVA) and a Device-Visible
     Address (DVA).  The DVA allows NPU DMA to read/write Host memory directly
-    via ``mf_offload.sparse_copy`` (DVA scatter-copy).
+    via ``mf_offload.varlen_copy`` (DVA scatter-copy).
     """
 
     def __init__(
@@ -549,13 +549,13 @@ class NPUSelectiveHiSparseCoordinator:
             T, dtype=torch.int32, device=self.device
         )
 
-        # Pre-allocated pointer arrays for mf_offload.sparse_copy.
+        # Pre-allocated pointer arrays for mf_offload.varlen_copy.
         # H2D and D2H run on separate streams (prefetch_stream / backup_stream)
         # and MUST have independent pointer buffers to avoid races when both
         # are in flight simultaneously.
         # PER-LAYER (debug R6): every selected layer used to write the SAME
         # descriptor buffers (h2d_src_ptrs[:N] = ... torch ops) while the
-        # previous layer's captured sparse_copy kernel may still be reading
+        # previous layer's captured copy kernel may still be reading
         # them in-flight — a per-layer cross-layer window that scales with
         # layer count (matches the dose-response: 1-2 layers clean, 10
         # layers 0.80, 19 layers 0.72). One descriptor set per layer removes
@@ -867,7 +867,7 @@ class NPUSelectiveHiSparseCoordinator:
         # Step-2 (flag-mechanism retirement): the completion-flag protocol
         # (sparse_copy_notify + wait_flag) is fully retired from this
         # coordinator — graph-mode H2D/D2H both use the plain MIX
-        # sparse_copy, ordered before consumers by the compute-queue FIFO.
+        # varlen_copy, ordered before consumers by the compute-queue FIFO.
         # Buffers removed with the protocol.
 
         persistent_buffers = (
@@ -1124,7 +1124,9 @@ class NPUSelectiveHiSparseCoordinator:
                 # run_selected_attention) — the all-MIX compute-queue FIFO
                 # orders the copy kernel before patch/SFA. A/B against the
                 # 0.90 baseline (step-1 D2H plain already band-preserving).
-                ret = mf_offload.sparse_copy(
+                # varlen_copy shares the sparse_copy C++ entry (flag=1) and
+                # its MIX_AIV_1_0 task type, so queue ordering is unchanged.
+                ret = mf_offload.varlen_copy(
                     h2d_src[:N],
                     h2d_dst[:N],
                     h2d_lens[:N],
@@ -1133,7 +1135,7 @@ class NPUSelectiveHiSparseCoordinator:
                 )
                 if ret != 0:
                     raise RuntimeError(
-                        f"sparse_copy H2D failed: ret={ret}"
+                        f"varlen_copy H2D failed: ret={ret}"
                     )
             except ImportError:
                 host_tensor = self.pool.get_host_tensor(selected)
@@ -1302,7 +1304,9 @@ class NPUSelectiveHiSparseCoordinator:
                 # overhead (38 kernels x 64 cores per replay at 19L).
                 # A/B against the 0.90 baseline: band-preserving => notify
                 # tail confirmed removable on the post-RoPE-fix code.
-                ret = mf_offload.sparse_copy(
+                # varlen_copy: same entry as sparse_copy (flag=1), MIX task
+                # type unchanged (compute-queue FIFO with the scratch writes).
+                ret = mf_offload.varlen_copy(
                     d2h_src[:N],
                     d2h_dst[:N],
                     d2h_lens[:N],
@@ -1311,7 +1315,7 @@ class NPUSelectiveHiSparseCoordinator:
                 )
                 if ret != 0:
                     raise RuntimeError(
-                        f"sparse_copy D2H failed: ret={ret}"
+                        f"varlen_copy D2H failed: ret={ret}"
                     )
             except ImportError:
                 host_tensor = self.pool.get_host_tensor(layer_id)
@@ -1803,7 +1807,7 @@ class NPUSelectiveHiSparseCoordinator:
         if st.h2d_done is not None:
             torch.npu.current_stream().wait_event(st.h2d_done)
         # Step-2 (flag-mechanism retirement): graph mode no longer waits on
-        # the H2D completion flag. The plain MIX sparse_copy shares the
+        # the H2D completion flag. The plain MIX varlen_copy shares the
         # compute queue with the patch/SFA consumers — the queue FIFO
         # orders the copy before them, so the in-graph wait_flag kernel is
         # redundant (and its device-side spin stalled the compute queue).
@@ -2167,7 +2171,7 @@ class NPUSelectiveHiSparseCoordinator:
         self._bridge_eager_to_graph()
         # Subscribe the replay-issuing stream to the ACL callback thread. The
         # original subscription covers only the capture stream, but graph
-        # replay executes on the issuing (main) stream — in-graph sparse_copy
+        # replay executes on the issuing (main) stream — in-graph varlen_copy
         # async DMA completion reports fired there would never be processed
         # by acl.rt.process_report, so H2D data may not land before the
         # in-graph SFA read. Idempotent (subscribe() skips known streams).
