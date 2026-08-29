@@ -2071,11 +2071,15 @@ class NPUSelectiveHiSparseCoordinator:
                         f"{self._dbg_accept_step:04d}.pt",
                     ),
                 )
-        B = accept_lens.shape[0]
-        logger.debug(
-            f"Selective HiSparse verify result: B={B}, "
-            f"accept_lens={accept_lens.tolist()}"
-        )
+        # accept_lens.tolist() is a D2H sync — illegal in NPU graph mode on
+        # this path. The f-string argument evaluates even when the debug
+        # record is discarded, so gate the whole log on the level check.
+        if logger.isEnabledFor(logging.DEBUG):
+            B = accept_lens.shape[0]
+            logger.debug(
+                f"Selective HiSparse verify result: B={B}, "
+                f"accept_lens={accept_lens.tolist()}"
+            )
 
     # === drain ===
 

@@ -249,32 +249,30 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
 
-# ---------- Round-24: 升级 CANN 前置核查（eager dm 探针可信度）----------
-# Round-23 结果(eager22 vs graph23, 两轮探针语义等价、可配对):
-#   1) round-22 图捕获崩溃修复生效: graph23 正常起服并产出全套 dump;
-#   2) am_pgsum 链步0 位级一致(735777==735777, 宽度伪影消除) -> 链步0 kernel
-#      全部输入(q/qpe/tik/kvlen/bt/页字节)验证完毕, graph attn 仍 NaN
-#      -> CANN 证据链补齐最后一块;
-#   3) 链步1-3 pgsum 发散, graph 侧恒定 ~-100K/步递减(634523/535069/432124),
-#      符合 "NaN hidden -> quant scale 异常 -> 量化 KV 写 0" 的级联特征,
-#      判定为链步0 NaN 的下游级联, 非独立写路径污染;
-#   4) 新疑点(升级前必须澄清):
-#      a) eager 侧 dm 表自身异常: attn_raw=[inf,466,1.37e37,nan](R16 时代
-#         为 -136 正常量级), out/lmin/lmout rowsum=0.0, am_q 步1==步3 位级
-#         重复 —— 与 eager 端到端正常矛盾, 疑探针伪影;
-#      b) graph 链步1-3 am_q=0 与 prevraw=NaN 并存, 指向图内 per-step 存储;
-#      c) am_seqlens eager[6,6,6,6] vs graph[7,8,9,10](graph 把 per-step
-#         offset 写进 seq_lens 设备张量, eager 只进 cpu_int; kernel 实际吃
-#         kvlen, 两者一致, 暂判无害, 记入证据包)。
-# 离线核查(机器上直接跑, 不起服务): eager21 vs eager22 同工具比对 —— 两轮 dm
-#   采集代码相同, 若 eager21 同样异常 = 长期探针伪影(修探针后再采);
-#   若仅 eager22 异常 = round-22 回归, 查代码。
-# python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager21 --graph-dir /root/hisparse_dump/eager22
-# 核查通过后: 按 §7.2/§10.1 组证据包(dm 表 + step-0 链值)升级 CANN/算子侧。
-# 如需重采(修探针/复查):
-# graph: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph24 bash pd_disaggregation_dram_offload.sh
-# eager: SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager24 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager24 --graph-dir /root/hisparse_dump/graph24
+# ---------- Round-26: CANN/算子侧升级（证据包定稿）+ 可选基线 ----------
+# 更正: 前次「round-24 全 match」是误将 eager24 与自身比对, 无效, 已撤回。
+# 真实 eager24 vs graph24 定案:
+#   - eager 参照干净: attn_raw=[-136.17,-345.00,-235.21,1.24e38], step0 = R16
+#     时代 -136 正常量级; round-23 的 eager 侧 dm 异常 = 该轮 0-dim 探针代码/
+#     坏运行状态的一次性伪影, 探针可信度恢复;
+#   - graph draft NaN 确定性复现: attn_raw NaN@[0,1,2,3], 提案退化 0,
+#     首发散链步 = 0;
+#   - 链步0 kernel 全部输入位级一致: am_q 587.8189697265625 /
+#     am_qpe 459.941650390625 / am_tik -2033 / am_kvlen 6 / am_bt 1 /
+#     am_pgsum 628294 (两侧全同)
+#   -> captured-replay kernel 对完全一致的输入输出 NaN, 证据链完整
+#     -> 升级 CANN/算子侧。
+# 证据包: kernel = npu_kv_quant_sparse_flash_attention (fp8 DSA,
+#   quant_scale_repo_mode=1) + dm 表 + step-0 链值(eager24/graph24) + notes §7.2。
+# 附注(入包): am_seqlens graph[6,7,8,9] vs eager[5,5,5,5] = per-step offset
+#   写入设备张量的语义差(kernel 吃 kvlen, 一致, 无涉); graph 链步1-3 am_q/qpe
+#   探针读出精确 0 与 prevraw NaN 并存 = 探针存储伪影, 不涉链步0 结论。
+# 升级期间的本地基线(量化 spec 损失, 可选):
+# graph: bash pd_disaggregation_dram_offload.sh   (标准启动, 无 dump)
+# bench: python -m sglang.test.few_shot_gsm8k --host http://141.61.49.198 --port 6688 \
+#          --num-questions 50 --num-shots 5 --data-path /home/r00648901/GSM8K.jsonl
+# 缓解实验(§10.2, 需小改代码): draft 链 eager attention / non-quant kernel 路径,
+#   先兑现 spec 加速再等 CANN。
 #
 # [可选实证] E3 warmup 对比: 证明 draft NaN 与 hi-sparse 无关(git 考古已证
 #   代码路径早于 hi-sparse; 此实验为运行时铁证):

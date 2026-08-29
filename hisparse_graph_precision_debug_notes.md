@@ -200,6 +200,7 @@ python -m sglang.test.few_shot_gsm8k --host http://141.61.49.198 --port 6688 \
   **修复生效证据**：`am_kvlen` 修复后两侧逐位一致（[6,7,8,9]）；`am_seqlens` per-backend 独立刷新值正确。
 - **残留（待闭环）——kernel 内部 NaN**：metadata 修复后，`npu_kv_quant_sparse_flash_attention`（fp8 DSA kernel，`quant_scale_repo_mode=1`）在**全部显式输入与 eager 逐位一致**（q_nope 587.82 / q_pe 459.94 / sparse_indices -2033 / kvlen [6,7,8,9] / block_table [1,1,1,1]）的情况下仍输出 NaN（eager step0 = -136 正常量级）。最后一个未直接验证项：kernel 经页表 gather 的 KV 字节（`am_pgsum` 探针，首版有聚合伪影已修正，待重采闭环）。若一致仍 NaN → captured-replay kernel 语义问题，升级 CANN/算子侧。
   **Round-23 重采闭环（eager22 vs graph23，两轮探针语义等价可配对）**：round-22 探针的 `t[0,0]` 0-dim 算子链被 NPU auto-dispatch 图捕获拒绝 → graph 启动崩溃，已修（`[:1,:1]` 切片保持全程 ≥1-D + dump 门控零开销）。结果：① 链步 0 `am_pgsum` **位级一致（735777==735777）**→ 链步 0 kernel 输入（q/qpe/tik/kvlen/bt/页字节）全部验证完毕，graph attn 仍 NaN，**CANN 证据链补齐最后一块**；② 链步 1-3 pgsum 发散且 graph 侧恒定 ~-100K/步递减（634523/535069/432124），符合「NaN hidden → quant scale 异常 → 量化 KV 写 0」级联特征，判定为链步 0 NaN 的下游级联，非独立写路径污染；③ 新疑点（升级前须澄清）：eager 侧 dm 表自身异常（attn_raw=[inf,466,1.37e37,nan]，R16 时代为 -136；out/lmin/lmout rowsum=0.0；am_q 步1==步3 位级重复）与 eager 端到端正常矛盾，疑探针伪影；graph 链步 1-3 am_q=0 与 prevraw=NaN 并存，指向图内 per-step 存储。④ 记录：am_seqlens eager[6,6,6,6] vs graph[7,8,9,10]（graph 把 per-step offset 写进 seq_lens 设备张量，eager 只进 cpu_int；kernel 实际吃 kvlen，两者一致，暂判无害，入证据包）。
+  **Round-24 定案（更正：前次「全 match」系误将 eager24 与自身比对，无效；下为真实 eager24 vs graph24）**：eager 参照本轮**干净**（attn_raw=[-136.17, -345.00, -235.21, 1.24e38]，step0 = R16 时代 -136 正常量级；round-23 的 eager 侧 dm 异常确证为该轮 0-dim 探针代码/坏运行状态的一次性伪影，探针可信度恢复）；graph 侧 draft NaN **确定性复现**（attn_raw NaN@[0,1,2,3]，提案退化 0，首发散链步=0）。链步 0 kernel 全部输入**位级一致**：am_q 587.8189697265625 / am_qpe 459.941650390625 / am_tik -2033 / am_kvlen 6 / am_bt 1 / **am_pgsum 628294（两侧全同）**——「captured-replay kernel 对完全一致的输入输出 NaN」证据链**完整定案，升级 CANN/算子侧**。附注：am_seqlens graph[6,7,8,9] vs eager[5,5,5,5]（per-step offset 写入设备张量的语义差，kernel 吃 kvlen 一致，无涉）；graph 链步 1-3 am_q/qpe 探针读出精确 0 与 prevraw NaN 并存（探针存储伪影，不涉链步 0 结论）。
 
 ### 7.3 归属：该 bug 与 hi-sparse 无关
 
@@ -237,7 +238,7 @@ python -m sglang.test.few_shot_gsm8k --host http://141.61.49.198 --port 6688 \
 
 ### 8.3 启动命令维护规则（用户 2026-08-28 确立）
 
-**每次试验后必须刷新 `pd_disaggregation_dram_offload.sh` 末尾的「启动命令速查」节**：含当次 dump 目录、全部开关变量、eager 对照命令与比对命令。当前尾部 = Round-24（eager dm 可信度离线核查 + CANN 升级前置；重采预留 graph24/eager24）。
+**每次试验后必须刷新 `pd_disaggregation_dram_offload.sh` 末尾的「启动命令速查」节**：含当次 dump 目录、全部开关变量、eager 对照命令与比对命令。当前尾部 = Round-26（CANN/算子侧升级，证据包定稿；附可选 gsm8k 基线与缓解实验方向）。
 
 ### 8.4 判读决策树（selected 层快照，graph vs eager 逐字段）
 
@@ -285,9 +286,9 @@ draft 链 dm 表判读：按管线序 `ids/pos → prevraw/prev → emb → eh �
 
 ## 10. 遗留事项
 
-1. **am_pgsum 已闭环（Round-23）**：链步 0 位级一致（735777）+ graph 仍 NaN → 整理证据包（dm 表 + step-0 链值 + §7.2）升级 CANN/算子侧。**新前置门槛**：先离线核查 eager dm 表可信度（eager21 vs eager22 同工具比对，两轮 dm 采集代码相同；命令见脚本尾部 Round-24）；顺带查 graph 链步 1-3 am_q=0/prevraw=NaN 矛盾（图内 per-step 存储）。am_seqlens eager/graph 语义差已记录（kernel 吃 kvlen，暂判无害）。
+1. **CANN/算子侧升级（Round-24 定案，证据包齐）**：kernel = `npu_kv_quant_sparse_flash_attention`（fp8 DSA，`quant_scale_repo_mode=1`）。证据：链步 0 全部输入位级一致（am_q 587.82 / am_qpe 459.94 / am_tik -2033 / am_kvlen 6 / am_bt 1 / am_pgsum 628294）+ graph attn_raw NaN@[0-3] vs eager -136，且跨 round-23/24 确定性复现；eager 参照干净。包内容：dm 表 + step-0 链值（eager24/graph24）+ §7.2。临时缓解方向（§10.2）：draft 链 eager attention 或 non-quant kernel 路径。
 2. **临时缓解**（若走 CANN 路径）：该 kernel 仅 DSA 草稿链使用 → 实验 draft 链 eager attention 或 non-quant kernel 路径，先兑现 spec 加速。
 3. **gsm8k 200 题**精度对齐复核（50 题噪声 ±2-4pt，已证两模式交叠 0.88~0.96）。
-4. **accept_len 恢复观察**：修复前恒 [1]；恢复 >1 的轮次占比即 spec 加速兑现程度。
+4. **accept_len 恢复观察**：修复前恒 [1]；恢复 >1 的轮次占比即 spec 加速兑现程度。（Round-24 真实比对中 graph 提案仍退化 token 0，NaN 未缓解前不会恢复；待 CANN 缓解/缓解实验落地后复测。）
 5. **清理**：`SGLANG_SELECTIVE_CLONE_HANDOFF` 开关已证明无用可删；全套 diff-dump 探针已 env 门控（`SGLANG_SELECTIVE_DIFF_DUMP=1`），默认零开销，可保留作回归工具；`DBG-META` 打印同门控。
 6. **可选**：E3 warmup 铁证（SELECTIVE_LAYER_IDS=""）——NaN 仍在即 hi-sparse 无关的运行时终证。
