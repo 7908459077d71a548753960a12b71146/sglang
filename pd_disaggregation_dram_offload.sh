@@ -147,33 +147,18 @@ do
         # 128 容量时需 825MB (报错日志含 NEEDED_HCCL_BUFFSIZE 算式), 留余量取 850
         export DEEPEP_HCCL_BUFFSIZE=850
 
-        # [精度调试 R3] 单层(layer 5) + 单请求 + cuda-graph-bs 8 16:
-        # 相比 0.76 基线(19层)仅减少 selected 层数 → 每步 DMA/向量算子数降 19 倍,
-        # pad 行数不变(7 行)。判读:
-        #   大幅恢复(≥0.9) → 图内时序竞态(竞争量驱动) → 转 memfabric 架构修复
-        #   仍 ~0.76       → pad 行确定性毒化 → 查 pad 路径(SFA zeroing/empty_rows)
-        # [已定案] R1: 单请求 bs8=0.76(多请求无关, N 截断正常)
-        #         E3: 无 hisparse bs8=0.94(graph 基础设施干净)
-        #         R2: replay 后 sync 无效(跨 replay 竞态排除)
-        # [精度调试 E3] 无 hisparse 对照: SELECTIVE_LAYER_IDS="" 启动可完全关闭
-        # selective hisparse (不传该参数, KV 全 resident HBM), 用于判别
-        # graph bs8 精度问题是否 hisparse 特有。判读:
-        #   0.94 → hisparse pad 路径实锤; 仍 0.7x → 分支基础图设施问题
+        # SELECTIVE_LAYER_IDS="" 启动可完全关闭 selective hisparse
+        # (不传该参数, KV 全 resident HBM)。
         if [[ -n "$SELECTIVE_LAYER_IDS" ]]; then
             HISPARSE_ARGS="--npu-selective-hisparse-layer-ids ${SELECTIVE_LAYER_IDS}"
         else
             HISPARSE_ARGS=""
-            echo "[E3] SELECTIVE_LAYER_IDS empty -> selective hisparse DISABLED"
+            echo "SELECTIVE_LAYER_IDS empty -> selective hisparse DISABLED"
         fi
 
-        # [D1 diff-dump] eager 对照开关: D_EAGER=1 加 --disable-cuda-graph(保留显式
-        # --cuda-graph-bs 供 bias 计算)。eager 19层需配 MAX_RUNNING_REQ=24 压缩
-        # bcap/tcap 以过内存关。
-        if [[ "${D_EAGER-"0"}" == "1" ]]; then
-            GRAPH_ARGS="--disable-cuda-graph --cuda-graph-bs ${CUDA_GRAPH_BS}"
-        else
-            GRAPH_ARGS="--cuda-graph-bs ${CUDA_GRAPH_BS}"
-        fi
+        # 显式 --cuda-graph-bs 必须保留: 否则 fixed bias 按默认 bs 列表
+        # max=512 计算, 内存关过不去 (见 notes §6 已知配置坑)。
+        GRAPH_ARGS="--cuda-graph-bs ${CUDA_GRAPH_BS}"
 
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
@@ -248,35 +233,17 @@ curl --location 'http://141.61.49.198:31000/flush_cache' --header 'Content-Type:
 # [启动命令速查] 每次试验刷新本节（规则: 启动方式/变量变更必须同步更新这里）
 # Prefill 节点 (141.61.49.198): bash pd_disaggregation_dram_offload.sh
 # ---------------------------------------------------------------------------
-
-# ---------- Round-26: CANN/算子侧升级（证据包定稿）+ 可选基线 ----------
-# 更正: 前次「round-24 全 match」是误将 eager24 与自身比对, 无效, 已撤回。
-# 真实 eager24 vs graph24 定案:
-#   - eager 参照干净: attn_raw=[-136.17,-345.00,-235.21,1.24e38], step0 = R16
-#     时代 -136 正常量级; round-23 的 eager 侧 dm 异常 = 该轮 0-dim 探针代码/
-#     坏运行状态的一次性伪影, 探针可信度恢复;
-#   - graph draft NaN 确定性复现: attn_raw NaN@[0,1,2,3], 提案退化 0,
-#     首发散链步 = 0;
-#   - 链步0 kernel 全部输入位级一致: am_q 587.8189697265625 /
-#     am_qpe 459.941650390625 / am_tik -2033 / am_kvlen 6 / am_bt 1 /
-#     am_pgsum 628294 (两侧全同)
-#   -> captured-replay kernel 对完全一致的输入输出 NaN, 证据链完整
-#     -> 升级 CANN/算子侧。
-# 证据包: kernel = npu_kv_quant_sparse_flash_attention (fp8 DSA,
-#   quant_scale_repo_mode=1) + dm 表 + step-0 链值(eager24/graph24) + notes §7.2。
-# 附注(入包): am_seqlens graph[6,7,8,9] vs eager[5,5,5,5] = per-step offset
-#   写入设备张量的语义差(kernel 吃 kvlen, 一致, 无涉); graph 链步1-3 am_q/qpe
-#   探针读出精确 0 与 prevraw NaN 并存 = 探针存储伪影, 不涉链步0 结论。
-# 升级期间的本地基线(量化 spec 损失, 可选):
-# graph: bash pd_disaggregation_dram_offload.sh   (标准启动, 无 dump)
-# bench: python -m sglang.test.few_shot_gsm8k --host http://141.61.49.198 --port 6688 \
-#          --num-questions 50 --num-shots 5 --data-path /home/r00648901/GSM8K.jsonl
-# 缓解实验(§10.2, 需小改代码): draft 链 eager attention / non-quant kernel 路径,
-#   先兑现 spec 加速再等 CANN。
+# Decode 节点 (141.61.49.195): bash pd_disaggregation_dram_offload.sh
+#   (默认 graph 模式 19 层标准规格; SELECTIVE_LAYER_IDS="" 可关闭 hisparse)
 #
-# [可选实证] E3 warmup 对比: 证明 draft NaN 与 hi-sparse 无关(git 考古已证
-#   代码路径早于 hi-sparse; 此实验为运行时铁证):
-# graph: SELECTIVE_LAYER_IDS="" SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/graph17e3 bash pd_disaggregation_dram_offload.sh
-# eager: SELECTIVE_LAYER_IDS="" SGLANG_SELECTIVE_DIFF_DUMP=1 SGLANG_SELECTIVE_DUMP_DIR=/root/hisparse_dump/eager17e3 D_EAGER=1 MAX_RUNNING_REQ=24 bash pd_disaggregation_dram_offload.sh
-# 比对: python hisparse_diff_compare.py --eager-dir /root/hisparse_dump/eager17e3 --graph-dir /root/hisparse_dump/graph17e3
-# (E3 下 selective 探针不触发属预期; 看 dstep_logits 的 graph NaN 是否仍在)
+# ---------- 2026-08-29: debug 探针全套已移除 ----------
+# DIFF_DUMP 探针/dump 工具/hisparse_diff_compare.py/D_EAGER 开关已全部删除,
+# 不再有 SGLANG_SELECTIVE_DIFF_DUMP / SGLANG_SELECTIVE_DUMP_* / D_EAGER 开关。
+# Round-24 定案与 CANN 证据包结论见 hisparse_graph_precision_debug_notes.md §7.2/§10.1
+# (证据 dump 文件 eager24/graph24 已在机器上留存, 不依赖已删代码)。
+# 标准启动:
+# bash pd_disaggregation_dram_offload.sh
+# bench (路由节点):
+# python -m sglang.test.few_shot_gsm8k --host http://141.61.49.198 --port 6688 \
+#     --num-questions 50 --num-shots 5 --data-path /home/r00648901/GSM8K.jsonl
+# 缓解实验方向 (notes §10.2): draft 链 eager attention / non-quant kernel 路径

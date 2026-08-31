@@ -37,8 +37,6 @@ def selective_sparse_attention(
     fp8_nope_buf: torch.Tensor = None,
     scales_buf: torch.Tensor = None,
     graph_mode: bool = False,
-    dbg_unpack_k_sum: torch.Tensor = None,
-    dbg_unpack_k_rope_sum: torch.Tensor = None,
 ) -> torch.Tensor:
     """Unpack 656B packed FP8 records and run SFA BSND attention.
 
@@ -114,19 +112,6 @@ def selective_sparse_attention(
     # Write into pre-allocated workspaces
     unpack_k_nope_bf16[:T].copy_(k_nope_bf16.view(T, K, kv_lora_rank))
     unpack_k_rope_bf16[:T].copy_(k_rope_bf16.view(T, K, qk_rope_head_dim))
-
-    # D1 diff-dump: freeze the post-dequant SFA input (graph: captured op →
-    # per-replay actual unpack result). Splits a stg_post-match/out-mismatch
-    # divergence between the unpack chain (sums differ) and the SFA kernel
-    # itself (sums match).
-    if dbg_unpack_k_sum is not None:
-        dbg_unpack_k_sum.copy_(
-            unpack_k_nope_bf16[:T].sum(dim=(1, 2), dtype=torch.float32)
-        )
-    if dbg_unpack_k_rope_sum is not None:
-        dbg_unpack_k_rope_sum.copy_(
-            unpack_k_rope_bf16[:T].sum(dim=(1, 2), dtype=torch.float32)
-        )
 
     # === Construct SFA inputs (compacted) ===
     # Valid entries must be compacted to the front of sparse_indices because

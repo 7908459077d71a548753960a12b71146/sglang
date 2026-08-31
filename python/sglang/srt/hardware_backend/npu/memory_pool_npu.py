@@ -1071,13 +1071,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
             if self.selective_coordinator is not None:
-                # D1 stage-2: pre-quant input capture (kin/kinv)
-                self.selective_coordinator.debug_capture_kin(
-                    layer_id, cache_k, cache_v
+                packed = self._pack_dsa_fp8_kv_cache(
+                    cache_k, cache_v, loc.numel()
                 )
-            packed = self._pack_dsa_fp8_kv_cache(
-                cache_k, cache_v, loc.numel()
-            )
             if self.selective_coordinator is not None:
                 self.selective_coordinator.publish_new_packed_kv(
                     layer_id=layer_id,
@@ -1092,16 +1088,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
             packed_cache = self._pack_dsa_fp8_kv_cache(cache_k, cache_v, loc.numel())
-            # D1 round-3: resident-layer write fingerprint (no-op unless
-            # diff-dump enabled). Selected layers return above, so this
-            # covers exactly the layers whose KV the step-3 divergence
-            # could be poisoned by.
-            if self.selective_coordinator is not None:
-                self.selective_coordinator.debug_capture_resident_write(
-                    layer_id,
-                    loc,
-                    packed_cache.view(-1, self.kv_cache_dim).view(torch.uint8),
-                )
             torch_npu.npu_scatter_nd_update_(
                 self.k_buffer[self._resident_slot(layer_id)].view(
                     -1, 1, self.kv_cache_dim

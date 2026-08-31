@@ -6,7 +6,7 @@
 >
 > **补注（2026-08-28）**：第二轮 diff-dump 探针扩展已落地（见 §7），作为后续任何精度回归的定位工具备用。
 >
-> **二次战役收尾（2026-08-29，见 §7-§10）**：dump 比对暴露独立于 hi-sparse 的 **draft 链图内 NaN**（A5 优化合入引入，性能 bug 非精度 bug）。已修复其一：attention metadata 张量别名链式污染（§7.2）；残留：attention kernel 内部对一致输入仍产 NaN（`am_pgsum` 重采闭环后升级 CANN）。精度结论：两模式无系统差（0.88~0.96 噪声带），精度复核需 200+ 题。方法论教训与调试基建沉淀于 §7.4/§8。
+> **二次战役收尾（2026-08-29，见 §7-§10）**：dump 比对暴露独立于 hi-sparse 的 **draft 链图内 NaN**（A5 优化合入引入，性能 bug 非精度 bug）。已修复其一：attention metadata 张量别名链式污染（§7.2）；其余定案：draft 链 DSA attention kernel（`npu_kv_quant_sparse_flash_attention`）在链步 0 六项输入位级全同下图内输出 NaN，证据包齐，升级 CANN/算子侧（§7.2 定案块、§10.1）。精度结论：两模式无系统差（0.88~0.96 噪声带），精度复核需 200+ 题。方法论教训与调试基建沉淀于 §7.4/§8。
 
 ## 1. 背景与架构
 
@@ -135,7 +135,8 @@ RoPE 修复后，completion-flag 协议（`sparse_copy_notify` + `wait_flag`）�
 
 最终形态：图内外 H2D/D2H 均为 plain MIX `sparse_copy`，无任何 flag/wait 机制；数据通路排序完全依赖计算队列 FIFO + ACL 流订阅。
 
-debug 探针清理（已完成）：`SGLANG_SELECTIVE_PLAIN_COPY/DEFER_D2H/GATE_D2H_EVENT/SKIP_H2D_WAIT/DUMP_STAGING/DISABLE_D2H/CHECK_FLAGS/DEBUG_SYNC/DEBUG_SLEEP_MS` 及 `_pending_d2h`/`_launch_deferred_d2h` 等全部删除。**保留**：DIFF_DUMP 全套（`SGLANG_SELECTIVE_DIFF_DUMP/DUMP_DIR/DUMP_MAX_STEPS`、`_dbg_*` 缓冲、`dump_diff_snapshot`、`debug_capture_kin`、npu_graph_runner replay 触发）、`D_EAGER`/`MAX_RUNNING_REQ`（eager 对照 dump 工作流）、`STAGING_SLICES`/`UNPACK_WS`（ping-pong 设计参数）、eager 诊断日志、`hisparse_diff_compare.py`。
+debug 探针清理（已完成）：`SGLANG_SELECTIVE_PLAIN_COPY/DEFER_D2H/GATE_D2H_EVENT/SKIP_H2D_WAIT/DUMP_STAGING/DISABLE_D2H/CHECK_FLAGS/DEBUG_SYNC/DEBUG_SLEEP_MS` 及 `_pending_d2h`/`_launch_deferred_d2h` 等全部删除。**保留**：`STAGING_SLICES`/`UNPACK_WS`（ping-pong 设计参数）。
+**（2026-08-29 追记）DIFF_DUMP 全套已彻底删除**：`SGLANG_SELECTIVE_DIFF_DUMP/DUMP_DIR/DUMP_MAX_STEPS/DUMP_READBACK` 开关、coordinator 全部 `_dbg_*` 缓冲与 `debug_*` 方法、`dump_diff_snapshot`、ascend_backend 的 am_*/attn_raw 探针与 `DBG-META` 打印、on_verify_result 及其调用点、deepseek_nextn/deepseek_v2/eagle_worker_v2 埋点、npu_graph_runner replay 触发、`D_EAGER` 开关、`hisparse_diff_compare.py` 工具，全部移除（Round-24 定案后证据已固定，探针使命结束）。eager24/graph24 的 dump 文件仍在机器上，CANN 证据包不依赖已删代码。
 
 ## 6. 当前代码状态与验证配置
 
@@ -190,7 +191,7 @@ python -m sglang.test.few_shot_gsm8k --host http://141.61.49.198 --port 6688 \
 原始症状"graph 精度 0.90 vs eager 0.94"经 17 轮定位，实为三个独立事实：
 
 1. **精度无系统性差距**。gsm8k 50 题（1 题 = 2pt），今日全部跑（两模式 × 各种开关组合）落在 **0.88~0.96 交叠带**；且已证 target 前向对相同输入逐位一致、accept_len=1 时提交 token 由 target argmax 决定 → 两模式文本序列应一致，分数波动为运行间噪声（含 eager 自身核级非确定性）。**精度复核需 200+ 题**。
-2. **确定性 bug 一个：draft 链图内 NaN（性能 bug，已部分修复）**。graph 下 draft 链 attention 读到的 KV 长度是 capture 烘焙常数（四步全 15，正确值 6/7/8/9），越界读未初始化 KV → NaN → 提案全退化 token 0 → 接受率塌 1 → spec 加速失效。根因 = **张量别名链式污染**（见 7.2），已修复；修复后仍有残留 NaN 诞生于 attention kernel 内部（见 7.2 残留项）。
+2. **确定性 bug 一个：draft 链图内 NaN（性能 bug 非精度 bug，已部分修复）**。graph 下 draft 链 attention 读到的 KV 长度是 capture 烘焙常数（四步全 15，正确值 6/7/8/9），越界读未初始化 KV → NaN → 提案全退化 token 0 → 接受率塌 1 → spec 加速失效。根因 = **张量别名链式污染**（见 7.2），已修复；修复后仍有 NaN 定案诞生于 DSA attention kernel 内部——链步 0 输入位级全同、图内输出 NaN（见 7.2 定案块）。
 3. **归属：与 hi-sparse 无关**（见 7.3）。hi-sparse 排查建的 diff-dump 第一次深入 draft 链内部，才让这个潜伏 bug 显形。
 
 ### 7.2 draft 链 NaN 根因链
@@ -198,9 +199,25 @@ python -m sglang.test.few_shot_gsm8k --host http://141.61.49.198 --port 6688 \
 - **已修复（真根因）——张量别名链式污染**：`_init_cuda_graph_metadata` 的 `metadata.seq_lens = seq_lens` 直接别名 draft runner 的静态 `buffers.seq_lens`；四个 per-step 后端共享同一 forward_batch → 同一 buffer。replay 前逐后端刷新（读 buffer、加本步偏移、写回原 buffer）变成链式累加：backend0 写 5+off0 → backend1 在其上加 off1 → … → backend3 最后写 5+Σoff = **15**；四步的图内 attention 全绑定该 buffer → 全读 15 → 越界读未初始化 KV → NaN。
   **修复**：`metadata.seq_lens = seq_lens.clone()`（每个后端独立 buffer）。附带消除对 runner 输入 buffer 的原地污染（decode 打印 row0 曾随轮次漂移 6→17）。
   **修复生效证据**：`am_kvlen` 修复后两侧逐位一致（[6,7,8,9]）；`am_seqlens` per-backend 独立刷新值正确。
-- **残留（待闭环）——kernel 内部 NaN**：metadata 修复后，`npu_kv_quant_sparse_flash_attention`（fp8 DSA kernel，`quant_scale_repo_mode=1`）在**全部显式输入与 eager 逐位一致**（q_nope 587.82 / q_pe 459.94 / sparse_indices -2033 / kvlen [6,7,8,9] / block_table [1,1,1,1]）的情况下仍输出 NaN（eager step0 = -136 正常量级）。最后一个未直接验证项：kernel 经页表 gather 的 KV 字节（`am_pgsum` 探针，首版有聚合伪影已修正，待重采闭环）。若一致仍 NaN → captured-replay kernel 语义问题，升级 CANN/算子侧。
-  **Round-23 重采闭环（eager22 vs graph23，两轮探针语义等价可配对）**：round-22 探针的 `t[0,0]` 0-dim 算子链被 NPU auto-dispatch 图捕获拒绝 → graph 启动崩溃，已修（`[:1,:1]` 切片保持全程 ≥1-D + dump 门控零开销）。结果：① 链步 0 `am_pgsum` **位级一致（735777==735777）**→ 链步 0 kernel 输入（q/qpe/tik/kvlen/bt/页字节）全部验证完毕，graph attn 仍 NaN，**CANN 证据链补齐最后一块**；② 链步 1-3 pgsum 发散且 graph 侧恒定 ~-100K/步递减（634523/535069/432124），符合「NaN hidden → quant scale 异常 → 量化 KV 写 0」级联特征，判定为链步 0 NaN 的下游级联，非独立写路径污染；③ 新疑点（升级前须澄清）：eager 侧 dm 表自身异常（attn_raw=[inf,466,1.37e37,nan]，R16 时代为 -136；out/lmin/lmout rowsum=0.0；am_q 步1==步3 位级重复）与 eager 端到端正常矛盾，疑探针伪影；graph 链步 1-3 am_q=0 与 prevraw=NaN 并存，指向图内 per-step 存储。④ 记录：am_seqlens eager[6,6,6,6] vs graph[7,8,9,10]（graph 把 per-step offset 写进 seq_lens 设备张量，eager 只进 cpu_int；kernel 实际吃 kvlen，两者一致，暂判无害，入证据包）。
-  **Round-24 定案（更正：前次「全 match」系误将 eager24 与自身比对，无效；下为真实 eager24 vs graph24）**：eager 参照本轮**干净**（attn_raw=[-136.17, -345.00, -235.21, 1.24e38]，step0 = R16 时代 -136 正常量级；round-23 的 eager 侧 dm 异常确证为该轮 0-dim 探针代码/坏运行状态的一次性伪影，探针可信度恢复）；graph 侧 draft NaN **确定性复现**（attn_raw NaN@[0,1,2,3]，提案退化 0，首发散链步=0）。链步 0 kernel 全部输入**位级一致**：am_q 587.8189697265625 / am_qpe 459.941650390625 / am_tik -2033 / am_kvlen 6 / am_bt 1 / **am_pgsum 628294（两侧全同）**——「captured-replay kernel 对完全一致的输入输出 NaN」证据链**完整定案，升级 CANN/算子侧**。附注：am_seqlens graph[6,7,8,9] vs eager[5,5,5,5]（per-step offset 写入设备张量的语义差，kernel 吃 kvlen 一致，无涉）；graph 链步 1-3 am_q/qpe 探针读出精确 0 与 prevraw NaN 并存（探针存储伪影，不涉链步 0 结论）。
+- **定案（2026-08-29 Round-24）——「eager 与 graph 输入完全相同、输出不同」的确切位置：draft 链链步 0 的 DSA 稀疏注意力 kernel `npu_kv_quant_sparse_flash_attention`（fp8 DSA，`quant_scale_repo_mode=1`）的图内 replay**。调用点：`ascend_backend.py` `forward_sparse`（`block_table=self.forward_metadata.block_tables` 的调用处），NEXTN draft 层 self-attention，被 eagle draft NPU graph 捕获。eager24 vs graph24 链步 0 全部显式输入位级全同、输出不同：
+
+  | 输入（captured-op 探针） | eager | graph |
+  |---|---|---|
+  | am_q（q_nope） | 587.8189697265625 | 同 |
+  | am_qpe（q_rope） | 459.941650390625 | 同 |
+  | am_tik（sparse_indices） | -2033 | 同 |
+  | am_kvlen（actual_seq_lengths_kv） | 6 | 同 |
+  | am_bt（block_table） | 1 | 同 |
+  | am_pgsum（kernel 经页表实际读到的 KV 页字节） | 628294 | 同 |
+
+  输出：eager `attn_raw` = **-136.17**（正常量级，R16 时代同款），graph = **NaN@[0,1,2,3] 全部四链步**，跨 round-23/24 确定性复现 →「captured-replay kernel 对完全一致的输入输出 NaN」定案，升级 CANN/算子侧（证据包见 §10.1）。
+
+  **证据边界（引用本结论时必须附带）**：
+  1. 「输入一致」只在**链步 0** 严格成立；链步 1-3 的 am_pgsum 发散（graph 恒 ~-100K/步递减 634523→535069→432124，eager 递增 +7.5K/步）是链步 0 NaN 的下游级联（NaN hidden → quant scale 异常 → 量化 KV 写 0），非独立写路径污染，不构成独立证据。
+  2. graph 链步 1-3 的 am_q/am_qpe 探针读出**精确 0**，而其输入 prevraw/eh 为 NaN（NaN 过 matmul 应得 NaN）——图内 per-step 探针存储伪影，不得作为输入证据；链步 0 的 am_q 位级匹配才是有效比对。
+  3. 附注（入 CANN 包）：am_seqlens graph[6,7,8,9] vs eager[5,5,5,5]，为 graph 把 per-step offset 写进 seq_lens 设备张量、eager 只进 cpu_int 的元数据语义差；kernel 实际消费 kvlen（两侧一致），无涉本结论。
+
+  **排查收口路径**：R10 定位毒点 = draft self-attention → R14 修张量别名链式污染（`metadata.seq_lens = seq_lens.clone()`，am_kvlen 修正为 6/7/8/9）→ R15 attn_raw 直捕确认 NaN 诞生于 kernel 内部 → R16 验证 q_pe/sparse_indices 一致 → R17/Round-23/Round-24 补齐最后盲区 am_pgsum（页字节和）。探针插曲：round-22 首版 `t[0,0]` 0-dim 算子链被 NPU auto-dispatch 图捕获拒绝（graph 启动即崩，改 `[:1,:1]` 切片全程 ≥1-D + dump 门控零开销后修复）；round-23 的 eager22 参照 dm 异常（attn_raw inf/1.37e37/nan、out rowsum=0、am_q 步间位级重复）为该轮 0-dim 探针代码/坏运行状态的一次性伪影，round-24 干净参照复现 -136 后排除；另有一次误将 eager24 与自身比对得出「全 match、NaN 非确定」的结论，已撤回。
 
 ### 7.3 归属：该 bug 与 hi-sparse 无关
 
@@ -217,6 +234,8 @@ python -m sglang.test.few_shot_gsm8k --host http://141.61.49.198 --port 6688 \
 5. **垃圾提案不影响贪心精度**（verify 只接受匹配 token）：draft 侧 NaN/垃圾是性能问题；精度问题必须先证 target 前向对相同输入一致。
 
 ## 8. 调试基建与输出规则
+
+> **（2026-08-29）本节所述工具链已随探针全套删除**（见 §5 追记），以下内容仅作方法论存档。
 
 ### 8.1 diff-dump 开关与产物
 
@@ -290,5 +309,5 @@ draft 链 dm 表判读：按管线序 `ids/pos → prevraw/prev → emb → eh �
 2. **临时缓解**（若走 CANN 路径）：该 kernel 仅 DSA 草稿链使用 → 实验 draft 链 eager attention 或 non-quant kernel 路径，先兑现 spec 加速。
 3. **gsm8k 200 题**精度对齐复核（50 题噪声 ±2-4pt，已证两模式交叠 0.88~0.96）。
 4. **accept_len 恢复观察**：修复前恒 [1]；恢复 >1 的轮次占比即 spec 加速兑现程度。（Round-24 真实比对中 graph 提案仍退化 token 0，NaN 未缓解前不会恢复；待 CANN 缓解/缓解实验落地后复测。）
-5. **清理**：`SGLANG_SELECTIVE_CLONE_HANDOFF` 开关已证明无用可删；全套 diff-dump 探针已 env 门控（`SGLANG_SELECTIVE_DIFF_DUMP=1`），默认零开销，可保留作回归工具；`DBG-META` 打印同门控。
-6. **可选**：E3 warmup 铁证（SELECTIVE_LAYER_IDS=""）——NaN 仍在即 hi-sparse 无关的运行时终证。
+5. **清理（2026-08-29 完成）**：`SGLANG_SELECTIVE_CLONE_HANDOFF` 已删；全套 diff-dump 探针、`DBG-META` 打印、`D_EAGER` 开关、`hisparse_diff_compare.py` 已全部删除（见 §5 追记）。
+6. **可选（已失操作载体，存档）**：E3 warmup 铁证（SELECTIVE_LAYER_IDS=""）——该开关保留在启动脚本中（设为空串即关闭 hisparse）。

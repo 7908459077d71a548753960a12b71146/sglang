@@ -542,37 +542,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        # D1 round-4/5: capture the draft input handoff BEFORE execution —
-        # a post-execution read could observe the draft graph overwriting
-        # the (graph-pool) hidden tensor, which is itself evidence of pool
-        # aliasing, not of a bad handoff. No-op unless diff-dump enabled.
-        _sel_coord = getattr(
-            self.target_worker.model_runner,
-            "npu_selective_hisparse_coordinator",
-            None,
-        )
-        if (
-            _sel_coord is not None
-            and not forward_batch.forward_mode.is_idle()
-        ):
-            _spec_in = forward_batch.spec_info
-            _sel_coord.debug_capture_draft(
-                hidden_states=getattr(_spec_in, "hidden_states", None),
-                topk_index=getattr(_spec_in, "topk_index", None),
-                out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
-                # real (non-bucket-padded) rows per chain step; topk=1
-                # chains carry one row per real request
-                real_chain_tokens=int(batch.batch_size()) * self.topk,
-            )
-            # Round-7: draft KV history content + seq_lens fingerprints
-            # (the chain's remaining unprobed inputs).
-            _sel_coord.debug_capture_draft_kv_hist(
-                draft_pool=self.draft_runner.token_to_kv_pool,
-                req_to_token_pool=self.req_to_token_pool,
-                req_pool_indices=batch.req_pool_indices,
-                seq_lens=batch.seq_lens,
-            )
-
         with canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
@@ -591,18 +560,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
                 )
-            # D1 round-4: capture the draft outputs (graph/eager converge
-            # here; inputs were captured before execution above).
-            if (
-                _sel_coord is not None
-                and not forward_batch.forward_mode.is_idle()
-            ):
-                _sel_coord.debug_capture_draft(
-                    draft_tokens=draft_tokens,
-                    parent_list=parent_list,
-                    top_scores_index=top_scores_index,
-                )
-
         return build_eagle_verify_input(
             batch,
             draft_input,
@@ -672,12 +629,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             spec_info.topk_p,
             spec_info.topk_index,
             spec_info.hidden_states,
-        )
-        # D1 round-4b handle for the per-step probes in the loop below.
-        _dbg_draft_sel = getattr(
-            self.target_worker.model_runner,
-            "npu_selective_hisparse_coordinator",
-            None,
         )
 
         maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
@@ -751,10 +702,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
                 spec_info.hidden_states = hidden_states
-                # D1 round-10: mark the true chain step for the model-file
-                # probes (slice index = i, aligned across eager/graph).
-                if _dbg_draft_sel is not None:
-                    _dbg_draft_sel.debug_draft_mark_step(i)
 
                 canary_index_ctx = (
                     c.with_active_single_forward_manager(i)
@@ -816,20 +763,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
-                # D1 round-4b: per-step draft probe (no-op unless
-                # SGLANG_SELECTIVE_DIFF_DUMP=1). The drafted-graph capture
-                # runs this same loop, so these ops bake per step.
-                if _dbg_draft_sel is not None:
-                    _dbg_draft_sel.debug_capture_draft_step(
-                        i,
-                        logits_output.next_token_logits,
-                        topk_index,
-                        hidden_states,
-                    )
-            # D1 round-10: unmark so non-chain forwards (draft-extend)
-            # never write chain slices.
-            if _dbg_draft_sel is not None:
-                _dbg_draft_sel.debug_draft_mark_step(-1)
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)
@@ -1108,21 +1041,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
-        # D1 round-5b: live read of the draft-extend output hidden right
-        # before the select_index gather (the gather produces a fresh
-        # tensor, so a dirty next-chain din means this SOURCE was dirty).
-        _sel_coord_dext = getattr(
-            self.target_worker.model_runner,
-            "npu_selective_hisparse_coordinator",
-            None,
-        )
-        if (
-            _sel_coord_dext is not None
-            and not batch.forward_mode.is_idle()
-        ):
-            _sel_coord_dext.debug_capture_dext_out(
-                draft_logits_output.hidden_states
-            )
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
         ]

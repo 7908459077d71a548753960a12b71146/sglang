@@ -225,64 +225,11 @@ class DeepseekModelNextN(nn.Module):
             else:
                 hidden_states = input_embeds
 
-            # D1 round-8: sub-block bisect inside the draft forward (no-op
-            # unless SGLANG_SELECTIVE_DIFF_DUMP=1). The draft graph capture
-            # runs this forward once per chain step, so per-step slices
-            # bake into the graph like the coordinator's dstep probes.
-            # Draft-EXTEND forwards (which reuse this model class) are
-            # skipped so chain slices 0..3 stay owned by the chain.
-            _dm_coord = None
-            _dm_step = -1
-            if type(forward_batch.spec_info).__name__ != (
-                "EagleDraftExtendInput"
-            ):
-                from sglang.srt.hardware_backend.npu.selective_hisparse import (
-                    get_npu_selective_hisparse_coordinator,
-                )
-
-                _dm_coord = get_npu_selective_hisparse_coordinator(
-                    input_ids.device if input_ids is not None
-                    else input_embeds.device
-                )
-                if _dm_coord is not None:
-                    # Round-10: slice = the chain step marked by
-                    # draft_forward (debug_draft_mark_step) — true step
-                    # index, aligned across eager/graph.
-                    _dm_step = _dm_coord.debug_draft_current_step()
-                    _dm_coord.debug_capture_draft_inner(
-                        _dm_step, "ids", input_ids
-                    )
-                    _dm_coord.debug_capture_draft_inner(
-                        _dm_step, "pos", positions
-                    )
-                    _bt = getattr(forward_batch, "block_tables", None)
-                    if _bt is not None:
-                        _dm_coord.debug_capture_draft_inner(
-                            _dm_step, "bt", _bt
-                        )
-                    if _dm_step == 0:
-                        # once per process: decoder sub-module hooks
-                        _dm_coord.debug_register_draft_layer_hooks(
-                            self.decoder
-                        )
-                if _dm_coord is not None:
-                    _dm_coord.debug_capture_draft_inner(
-                        _dm_step, "emb", hidden_states
-                    )
-
             if hidden_states.shape[0] > 0:
                 previous_hidden_states = forward_batch.spec_info.hidden_states
-                if _dm_coord is not None:
-                    _dm_coord.debug_capture_draft_inner(
-                        _dm_step, "prevraw", previous_hidden_states
-                    )
                 if self.rot_weight is not None:
                     previous_hidden_states = torch.matmul(
                         previous_hidden_states, self.rot_weight
-                    )
-                if _dm_coord is not None:
-                    _dm_coord.debug_capture_draft_inner(
-                        _dm_step, "prev", previous_hidden_states
                     )
                 if _is_cuda:
                     eh_input = fused_eh_norm(
@@ -304,10 +251,6 @@ class DeepseekModelNextN(nn.Module):
                     hidden_states, _ = self.eh_proj(eh_input)
                 else:
                     hidden_states = self.eh_proj(eh_input)
-                if _dm_coord is not None:
-                    _dm_coord.debug_capture_draft_inner(
-                        _dm_step, "eh", hidden_states
-                    )
 
             # CP-v2 shards/gathers hidden states at the eager-runner boundary.
             cp_v2_active = is_cp_v2_active(forward_batch)
@@ -320,10 +263,6 @@ class DeepseekModelNextN(nn.Module):
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
             index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
-            if _dm_coord is not None and index_topk_share.topk_indices is not None:
-                _dm_coord.debug_capture_draft_inner(
-                    _dm_step, "topk", index_topk_share.topk_indices
-                )
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states, residual, topk_indices = self.decoder(
                     positions,
@@ -338,10 +277,6 @@ class DeepseekModelNextN(nn.Module):
                     hidden_states, _ = self.shared_head.norm(hidden_states, residual)
                 else:
                     hidden_states = self.shared_head.norm(hidden_states)
-                if _dm_coord is not None:
-                    _dm_coord.debug_capture_draft_inner(
-                        _dm_step, "out", hidden_states
-                    )
 
                 if use_cp_v1:
                     local_num_tokens = hidden_states.shape[0]
@@ -465,40 +400,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                     )
         hidden_states = self.model(input_ids, positions, forward_batch)
-        # D1 round-9: the bisect proved the NaN enters between the clean
-        # model output (dm_out, no NaN in graph) and next_token_logits
-        # (NaN in graph) — i.e. inside logits_processor / lm_head. Split:
-        #   lmin  — hidden entering the processor (bit-same tensor as
-        #           dm_out; a mismatch would mean an in-replay stomp of
-        #           the hidden before the matmul)
-        #   lmw   — lm_head weight rowsum (a stomped fp8 weight/scale
-        #           buffer yields exactly clean-input -> NaN-output)
-        #   lmout — logits right after the processor (dstep_logits reads
-        #           the same value later in draft_forward)
-        from sglang.srt.hardware_backend.npu.selective_hisparse import (
-            get_npu_selective_hisparse_coordinator,
-        )
-
-        _lm_coord = get_npu_selective_hisparse_coordinator(
-            input_ids.device
-        )
-        _lm_step = (
-            _lm_coord.debug_draft_current_step()
-            if _lm_coord is not None
-            else -1
-        )
-        if _lm_coord is not None:
-            _lm_coord.debug_capture_draft_inner(_lm_step, "lmin", hidden_states)
-            _lm_w = getattr(self.lm_head, "weight", None)
-            if _lm_w is not None:
-                _lm_coord.debug_capture_draft_inner(_lm_step, "lmw", _lm_w)
         logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
-        if _lm_coord is not None:
-            _lm_coord.debug_capture_draft_inner(
-                _lm_step, "lmout", logits_output.next_token_logits
-            )
         return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

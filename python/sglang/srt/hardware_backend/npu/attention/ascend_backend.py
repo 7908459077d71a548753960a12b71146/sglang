@@ -1054,21 +1054,6 @@ class AscendAttnBackend(AttentionBackend):
                 seq_lens[:bs].to(metadata.actual_seq_lengths_kv.dtype)
             )
 
-        # D1: host-side visibility into the per-replay metadata refresh —
-        # does it run, on which backend/step, and with what values? (The
-        # draft chain's frozen dm probe showed constant 15, meaning the
-        # refresh never reaches what the baked attention reads.)
-        import os as _os
-
-        if _os.getenv("SGLANG_SELECTIVE_DIFF_DUMP", "0") == "1":
-            print(
-                f"[DBG-META] step={getattr(self, 'speculative_step_id', '?')} "
-                f"bs={bs} "
-                f"seq_lens={metadata.seq_lens[:bs].tolist()} "
-                f"input_seq_lens={seq_lens[:bs].tolist()}",
-                flush=True,
-            )
-
         self.forward_metadata = metadata
 
         self.graph_mode = True
@@ -1584,74 +1569,6 @@ class AscendAttnBackend(AttentionBackend):
         else:
             actual_seq_lengths_kv = self.forward_metadata.seq_lens
 
-        # D1 round-11: draft-chain attention metadata probe (no-op outside
-        # the draft chain — debug_draft_current_step() is -1 for target
-        # verify / draft-extend / prefill). Round-10's properly-indexed
-        # bisect pinned the draft NaN to self-attention at chain step 0
-        # with verified-clean inputs; this captures the q and the KV-length
-        # metadata the attention kernel actually sees at replay.
-        from sglang.srt.hardware_backend.npu.selective_hisparse import (
-            get_npu_selective_hisparse_coordinator,
-        )
-
-        _dbg_am = get_npu_selective_hisparse_coordinator(q_nope.device)
-        if _dbg_am is not None:
-            _am_step = _dbg_am.debug_draft_current_step()
-            if _am_step >= 0:
-                _dbg_am.debug_capture_draft_inner(_am_step, "am_q", q_nope)
-                _dbg_am.debug_capture_draft_inner(
-                    _am_step, "am_kvlen", actual_seq_lengths_kv
-                )
-                _dbg_am.debug_capture_draft_inner(
-                    _am_step, "am_seqlens", self.forward_metadata.seq_lens
-                )
-                if self.forward_metadata.block_tables is not None:
-                    _dbg_am.debug_capture_draft_inner(
-                        _am_step, "am_bt", self.forward_metadata.block_tables
-                    )
-                # Round-16: the kernel inputs not yet verified. The kernel
-                # NaNs at all 4 chain steps while q/kvlen/block_table are
-                # bit-identical to eager — remaining suspects:
-                #   am_tik — sparse_indices (the DSA indexer's KV position
-                #            selection; garbage indices = OOB KV reads)
-                #   am_qpe — q_rope (the other half of the query)
-                if topk_indices is not None:
-                    _dbg_am.debug_capture_draft_inner(
-                        _am_step, "am_tik", topk_indices
-                    )
-                if q_pe is not None:
-                    _dbg_am.debug_capture_draft_inner(
-                        _am_step, "am_qpe", q_pe
-                    )
-                # Round-17: the kernel's OWN view of the KV — byte-sum of
-                # the page block_table[0,0] points to (kvlen <= page_size
-                # in this chain, so the kernel reads exactly one page; pure
-                # captured ops, no host logic, so it freezes what the
-                # replayed kernel actually reads). NOTE: summing the whole
-                # padded block_table row was an artifact — eager and graph
-                # rows have different widths, so page-0 clamp terms
-                # dominated the sum. The [:1, :1] slice keeps every op
-                # >=1-D: t[0, 0] yields 0-dim tensors and the clamp/index
-                # chain over them is rejected by NPU auto-dispatch graph
-                # capture (draft-graph capture crashed at startup). Math
-                # only runs when diff-dump is enabled (zero cost otherwise).
-                if getattr(_dbg_am, "_dbg_dump", False) and (
-                    self.forward_metadata.block_tables is not None
-                ):
-                    _kn_u8 = (
-                        k_nope
-                        if k_nope.dtype == torch.uint8
-                        else k_nope.view(torch.uint8)
-                    )
-                    _kn_pages = _kn_u8.reshape(
-                        -1, self.page_size * _kn_u8.shape[-1]
-                    ).sum(dim=1, dtype=torch.int64)
-                    _bt0 = self.forward_metadata.block_tables[:1, :1].flatten().to(
-                        torch.int64
-                    )
-                    _pgsum = _kn_pages[_bt0.clamp(min=0)].sum().reshape(1)
-                    _dbg_am.debug_capture_draft_inner(_am_step, "am_pgsum", _pgsum)
-
         if (
             is_prefill
             and is_dsa_enable_prefill_cp()
@@ -1763,15 +1680,6 @@ class AscendAttnBackend(AttentionBackend):
                     sparse_mode=3,
                     attention_mode=2,
                     return_softmax_lse=False,
-                )
-
-            # D1 round-15: the attention kernel's own output, before any
-            # downstream processing — with q/kvlen verified correct at
-            # step 0, a NaN HERE means the kernel consumes yet another
-            # stale input (page table / fp8 scales inside the packed KV).
-            if _dbg_am is not None and _am_step >= 0:
-                _dbg_am.debug_capture_draft_inner(
-                    _am_step, "attn_raw", attn_out
                 )
 
         if (
