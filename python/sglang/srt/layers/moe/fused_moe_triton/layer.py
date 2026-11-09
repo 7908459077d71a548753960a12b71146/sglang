@@ -594,20 +594,42 @@ class FusedMoE(torch.nn.Module):
         )
         self.supports_deferred_finalize = False
 
-        self.quant_method.create_weights(
-            layer=self,
-            num_experts=self.num_local_experts,
-            hidden_size=hidden_size,
-            intermediate_size_per_partition=self.intermediate_size_per_partition,
-            params_dtype=params_dtype,
-            weight_loader=(
-                self.weight_loader
-                if not use_weight_loader_fused
-                else self.weight_loader_fused
-            ),
-            with_bias=with_bias,
-            moe_intermediate_size=intermediate_size,
-        )
+        # ZBAL DFC: 专家权重直接生在对称池里，加载阶段不再二次搬运；池外的张量仍走原生分配器。
+        # 只有显式打开 DFC 时才进池作用域，未开启走下面原生路径（两份入参需保持一致）。
+        from sglang.srt.hardware_backend.npu.moe import zbal_fuseep
+
+        self._use_zbal_fuseep = zbal_fuseep.use_zbal_fuseep()
+        if self._use_zbal_fuseep:
+            with zbal_fuseep.pool_scope(self):
+                self.quant_method.create_weights(
+                    layer=self,
+                    num_experts=self.num_local_experts,
+                    hidden_size=hidden_size,
+                    intermediate_size_per_partition=self.intermediate_size_per_partition,
+                    params_dtype=params_dtype,
+                    weight_loader=(
+                        self.weight_loader
+                        if not use_weight_loader_fused
+                        else self.weight_loader_fused
+                    ),
+                    with_bias=with_bias,
+                    moe_intermediate_size=intermediate_size,
+                )
+        else:
+            self.quant_method.create_weights(
+                layer=self,
+                num_experts=self.num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=self.intermediate_size_per_partition,
+                params_dtype=params_dtype,
+                weight_loader=(
+                    self.weight_loader
+                    if not use_weight_loader_fused
+                    else self.weight_loader_fused
+                ),
+                with_bias=with_bias,
+                moe_intermediate_size=intermediate_size,
+            )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.runner_backend = self.quant_method.get_moe_runner_backend(self)
@@ -1715,6 +1737,12 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
     ):
+        # ZBAL DFC 打开时整模型 MoE 权重都按 DFC ABI 摆进对称池, 前向整体交给
+        # dispatch_ffn_combine(dispatch+GMM+SwiGLU+GMM+combine 在 op 内完成); 未开启走原生路径。
+        if self._use_zbal_fuseep:
+            from sglang.srt.hardware_backend.npu.moe import zbal_fuseep
+
+            return zbal_fuseep.forward(self, hidden_states, topk_output)
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 

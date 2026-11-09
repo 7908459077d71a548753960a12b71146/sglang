@@ -1202,6 +1202,18 @@ class Envs:
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
+    # ZBAL DFC (pool-only): with this on, MoE expert weights and the DFC workspace live in
+    # the symmetric pool while the torch allocator stays untouched (mutually exclusive with
+    # the mix-alloc mode of SGLANG_ZBAL_LOCAL_MEM_SIZE). The pool size is not configured
+    # here: it is the MoE layer count x per-layer weight bytes + one resident workspace (see
+    # zbal_fuseep._pool_bytes), where the layer count comes from SGLANG_ZBAL_DFC_MOE_LAYERS and
+    # the workspace high-water mark follows sglang's chunked-prefill ceiling (see
+    # zbal_fuseep._max_prefill_tokens), falling back to --max-prefill-tokens when chunking is off.
+    SGLANG_ZBAL_ENABLE_DFC = EnvBool(False)
+    # Number of MoE layers the model builds, MTP/nextn layers included; every one of them must
+    # share the same expert shape. The FuseEP symmetric pool is sized before any weight exists,
+    # so the count must come from the operator; 0 means unset and the pool init fails fast.
+    SGLANG_ZBAL_DFC_MOE_LAYERS = EnvInt(0)
     # Set to 0 to allow AscendAttnBackend to set needs_cpu_seq_lens to False for dsa models.
     SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS = EnvBool(True)
 
