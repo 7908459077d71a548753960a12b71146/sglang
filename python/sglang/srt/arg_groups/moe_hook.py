@@ -434,7 +434,23 @@ def handle_a2a_moe(server_args: Any):
                     "(prefill) dispatch has no CuteDSL FP4 handler. Pass "
                     "--deepep-mode low_latency or auto."
                 )
-        if cfg.deepep_mode == "normal":
+        if cfg.deepep_mode == "normal" and envs.SGLANG_ZBAL_ENABLE_DFC.get():
+            # ZBAL FuseEP takes the whole MoE exchange (dispatch + GMM + combine) into one op, so
+            # DeepEP's normal-mode dispatch never runs in forward and its no-graph restriction
+            # does not apply. Keep the decode graph -- that is the phase worth capturing; prefill
+            # stays eager because its aggregate token count changes every step.
+            logger.warning(
+                "deepep_mode=`normal` with ZBAL FuseEP: keeping the decode CUDA graph, "
+                "disabling only the prefill graph"
+            )
+            declare_resolution(
+                server_args,
+                "_handle_a2a_moe",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
+        elif cfg.deepep_mode == "normal":
             logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
             declare_resolution(
                 server_args,
